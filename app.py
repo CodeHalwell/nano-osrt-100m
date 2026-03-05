@@ -34,7 +34,7 @@ image = (
     .env({"TORCH_LOGS": "perf_hints"})
     .pip_install(
         "torch==2.10.0+cu128",
-        "–index-url",
+        "--index-url",
         "https://download.pytorch.org/whl/cu128",
     )
     .pip_install("transformers", "datasets", "lion-pytorch", "triton")
