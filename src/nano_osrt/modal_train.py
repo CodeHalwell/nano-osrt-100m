@@ -72,6 +72,7 @@ def log_step(
     last_loop_rms: list[torch.Tensor] | None,
     model: nn.Module,
     cfg: ModalConfig,
+    total_tokens: int = 0,
 ) -> None:
     """Print a formatted log line for the current training step."""
     elapsed = time.time() - start_time
@@ -109,14 +110,40 @@ def log_step(
         else "[n/a]"
     )
 
+    loss_val = accum_loss.item()
+
     print(
-        f"step {step:>7d} | loss {accum_loss.item():.4f} | "
+        f"step {step:>7d} | loss {loss_val:.4f} | "
         f"lr {lr:.2e} | vram {vram_gb:.1f}GB | "
         f"tok/s {tok_per_sec:,.0f} | phase {current_phase}\n"
         f"           intra-block (b0: L0 vs L1..5): {intra_str}\n"
         f"           inter-block (b0 vs b1 per loop): {inter_str}\n"
         f"           loop RMS: {rms_str}"
     )
+
+    if cfg.wandb_log:
+        import wandb
+
+        log_dict: dict = {
+            "train/loss": loss_val,
+            "train/lr": lr,
+            "train/vram_gb": vram_gb,
+            "train/tok_per_sec": tok_per_sec,
+            "train/total_tokens": total_tokens,
+            "train/phase": current_phase,
+        }
+
+        if last_loop_rms:
+            for i, rms in enumerate(last_loop_rms):
+                log_dict[f"loop_rms/loop_{i}"] = rms.item()
+
+        if b_mats[0].norm() > 1e-6:
+            for i, s in enumerate(intra_sims):
+                log_dict[f"adapter/intra_block_sim_{i}"] = s
+            for i, s in enumerate(inter_sims):
+                log_dict[f"adapter/inter_block_sim_loop_{i}"] = s
+
+        wandb.log(log_dict, step=step)
 
 
 # ------------------------------------------------------------------
@@ -230,6 +257,42 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         "Precision           : FP32 master weights, BF16 compute (autocast)"
     )
     print()
+
+    # ------------------------------------------------------------------
+    # Weights & Biases
+    # ------------------------------------------------------------------
+    if cfg.wandb_log:
+        import wandb
+
+        wandb.init(
+            project=cfg.wandb_project,
+            name=cfg.wandb_run_name,
+            config={
+                "dim": cfg.dim,
+                "heads": cfg.heads,
+                "seq_len": cfg.seq_len,
+                "num_blocks": cfg.num_blocks,
+                "recursive_loops": cfg.recursive_loops,
+                "adapter_rank": cfg.adapter_rank,
+                "adapter_alpha": cfg.adapter_alpha,
+                "batch_size": cfg.batch_size,
+                "grad_accum_steps": cfg.grad_accum_steps,
+                "effective_batch": eff_batch,
+                "total_steps": cfg.total_steps,
+                "warmup_steps": cfg.warmup_steps,
+                "peak_lr": cfg.peak_lr,
+                "min_lr": cfg.min_lr,
+                "weight_decay": cfg.weight_decay,
+                "optimizer": cfg.optimizer_name,
+                "total_params": total_params,
+                "adapter_params": adapter_params,
+                "tokens_per_step": tok_per_step,
+                "vocab_size": cfg.vocab_size,
+                "real_vocab_size": cfg.real_vocab_size,
+            },
+            resume="allow",
+        )
+        print("W&B logging enabled")
 
     model = torch.compile(model, mode="max-autotune")
 
@@ -347,6 +410,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
                 last_loop_rms,
                 model,
                 cfg,
+                total_tokens=step * tok_per_step,
             )
 
         # --- Checkpoints ---
@@ -363,6 +427,10 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
                 f"\n23h boundary. Rescue checkpoint at step {step}. "
                 "Re-run to resume."
             )
+            if cfg.wandb_log:
+                import wandb
+
+                wandb.finish()
             return
 
         step += 1
@@ -375,3 +443,8 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     elapsed_total = time.time() - start_time
     print(f"\nTraining complete. {step:,} steps in {elapsed_total / 3600:.1f}h")
     print(f"Final model: {final_path}")
+
+    if cfg.wandb_log:
+        import wandb
+
+        wandb.finish()
