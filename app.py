@@ -37,7 +37,7 @@ image = (
         "--index-url",
         "https://download.pytorch.org/whl/cu128",
     )
-    .pip_install("transformers", "datasets", "lion-pytorch", "triton")
+    .pip_install("transformers", "datasets", "lion-pytorch", "triton", "wandb")
 )
 
 vol = modal.Volume.from_name("osrt-checkpoints", create_if_missing=True)
@@ -52,6 +52,7 @@ vol = modal.Volume.from_name("osrt-checkpoints", create_if_missing=True)
     gpu=modal.gpu.H100(count=1),
     image=image,
     volumes={"/vol/checkpoints": vol},
+    secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=86400,
 )
 def train():

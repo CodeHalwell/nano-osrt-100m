@@ -13,6 +13,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from nano_osrt.modal_config import ModalConfig
 from nano_osrt.modal_data import make_loader
 from nano_osrt.recursive_model import RecursiveNanoOSRT
@@ -72,14 +77,17 @@ def log_step(
     last_loop_rms: list[torch.Tensor] | None,
     model: nn.Module,
     cfg: ModalConfig,
-) -> None:
-    """Print a formatted log line for the current training step."""
+) -> dict:
+    """Print a formatted log line and return metrics dict for W&B."""
     elapsed = time.time() - start_time
     tokens_so_far = (step - start_step) * tok_per_step
     tok_per_sec = tokens_so_far / elapsed if elapsed > 0 else 0
+    total_tokens = step * tok_per_step
     vram_gb = torch.cuda.max_memory_allocated() / 1e9
     torch.cuda.reset_peak_memory_stats()
 
+    intra_sims = []
+    inter_sims = []
     with torch.no_grad():
         inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         b_mats = [b.flatten().float() for b in inner_model.adapters_b]
@@ -117,6 +125,25 @@ def log_step(
         f"           inter-block (b0 vs b1 per loop): {inter_str}\n"
         f"           loop RMS: {rms_str}"
     )
+
+    # Build metrics dict for W&B
+    metrics: dict = {
+        "train/loss": accum_loss.item(),
+        "train/lr": lr,
+        "train/vram_gb": vram_gb,
+        "train/tok_per_sec": tok_per_sec,
+        "train/total_tokens": total_tokens,
+        "train/phase": current_phase,
+    }
+    if last_loop_rms:
+        for i, r in enumerate(last_loop_rms):
+            metrics[f"loop_rms/loop_{i}"] = r.item()
+    for i, s in enumerate(intra_sims):
+        metrics[f"adapter/intra_block_sim_{i}"] = s
+    for i, s in enumerate(inter_sims):
+        metrics[f"adapter/inter_block_sim_loop_{i}"] = s
+
+    return metrics
 
 
 # ------------------------------------------------------------------
@@ -234,6 +261,42 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     model = torch.compile(model, mode="max-autotune")
 
     # ------------------------------------------------------------------
+    # Weights & Biases
+    # ------------------------------------------------------------------
+    use_wandb = cfg.wandb_log and wandb is not None
+    if use_wandb:
+        wandb.init(
+            project=cfg.wandb_project,
+            name=cfg.wandb_run_name,
+            config={
+                "dim": cfg.dim,
+                "heads": cfg.heads,
+                "head_dim": cfg.head_dim,
+                "seq_len": cfg.seq_len,
+                "vocab_size": cfg.vocab_size,
+                "real_vocab_size": cfg.real_vocab_size,
+                "num_blocks": cfg.num_blocks,
+                "recursive_loops": cfg.recursive_loops,
+                "adapter_rank": cfg.adapter_rank,
+                "adapter_alpha": cfg.adapter_alpha,
+                "batch_size": cfg.batch_size,
+                "grad_accum_steps": cfg.grad_accum_steps,
+                "total_steps": cfg.total_steps,
+                "warmup_steps": cfg.warmup_steps,
+                "peak_lr": cfg.peak_lr,
+                "min_lr": cfg.min_lr,
+                "weight_decay": cfg.weight_decay,
+                "grad_clip": cfg.grad_clip,
+                "optimizer": cfg.optimizer_name,
+                "total_params": total_params,
+                "adapter_params": adapter_params,
+                "tok_per_step": tok_per_step,
+            },
+            resume="allow",
+        )
+        print("W&B logging enabled.")
+
+    # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
     if cfg.optimizer_name.lower() == "adamw":
@@ -336,7 +399,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
 
         # --- Logging ---
         if step % cfg.log_interval == 0:
-            log_step(
+            metrics = log_step(
                 step,
                 accum_loss,
                 lr,
@@ -348,6 +411,8 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
                 model,
                 cfg,
             )
+            if use_wandb:
+                wandb.log(metrics, step=step)
 
         # --- Checkpoints ---
         if step > 0 and step % cfg.ckpt_interval == 0:
@@ -363,6 +428,8 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
                 f"\n23h boundary. Rescue checkpoint at step {step}. "
                 "Re-run to resume."
             )
+            if use_wandb:
+                wandb.finish()
             return
 
         step += 1
@@ -375,3 +442,5 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     elapsed_total = time.time() - start_time
     print(f"\nTraining complete. {step:,} steps in {elapsed_total / 3600:.1f}h")
     print(f"Final model: {final_path}")
+    if use_wandb:
+        wandb.finish()
