@@ -7,6 +7,7 @@ be unit-tested independently of Modal infrastructure.
 
 import math
 import os
+import sys
 import time
 
 import torch
@@ -45,7 +46,7 @@ def get_lr(step: int, cfg: ModalConfig) -> float:
     )
 
 
-def get_phase(step: int, cfg: ModalConfig) -> tuple[str, str]:
+def get_phase(step: int, cfg: ModalConfig) -> tuple[str, str, str | None]:
     """Determine the curriculum phase for a given *step*.
 
     Args:
@@ -53,12 +54,12 @@ def get_phase(step: int, cfg: ModalConfig) -> tuple[str, str]:
         cfg: Training configuration.
 
     Returns:
-        ``(phase_name, dataset_name)`` tuple.
+        ``(phase_name, dataset_name, dataset_config)`` tuple.
     """
     for name, p in cfg.phases.items():
         if p["start"] <= step < p["end"]:
-            return name, p["dataset"]
-    return "fineweb", cfg.phases["fineweb"]["dataset"]
+            return name, p["dataset"], p.get("config")
+    return "fineweb", cfg.phases["fineweb"]["dataset"], cfg.phases["fineweb"].get("config")
 
 
 # ------------------------------------------------------------------
@@ -189,8 +190,14 @@ def load_checkpoint(
     print(f"Resuming from {path}...")
     ckpt = torch.load(path, map_location=device, weights_only=False)
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    inner.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    inner.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # If checkpoint predates norm_loop, it's already initialized as identity
+    missing = set(inner.state_dict().keys()) - set(ckpt["model_state_dict"].keys())
+    if missing:
+        print(f"  New parameters (initialized to defaults): {missing}")
+        print("  Skipping optimizer state (parameter count changed)")
+    else:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_step = ckpt["step"] + 1
     print(f"Resumed at step {start_step}")
     return start_step
@@ -258,7 +265,10 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     )
     print()
 
-    model = torch.compile(model, mode="max-autotune")
+    print("Compiling model with torch.compile...")
+    compile_start = time.time()
+    model = torch.compile(model)
+    print(f"Model compile setup done in {time.time() - compile_start:.1f}s")
 
     # ------------------------------------------------------------------
     # Weights & Biases
@@ -268,6 +278,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         wandb.init(
             project=cfg.wandb_project,
             name=cfg.wandb_run_name,
+            id=cfg.wandb_run_id,
             config={
                 "dim": cfg.dim,
                 "heads": cfg.heads,
@@ -319,10 +330,29 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         print(f"Using Lion (sign-based, wd={cfg.weight_decay})")
 
     # ------------------------------------------------------------------
-    # Resume from checkpoint
+    # Resume from checkpoint (prefer latest numbered, fallback to rescue)
     # ------------------------------------------------------------------
     rescue_path = "/vol/checkpoints/osrt100m_rescue.pt"
-    start_step = load_checkpoint(model, optimizer, rescue_path, device)
+    ckpt_dir = "/vol/checkpoints"
+    best_ckpt = rescue_path
+    best_step = -1
+
+    if os.path.isdir(ckpt_dir):
+        import glob
+
+        for f in glob.glob(os.path.join(ckpt_dir, "osrt100m_step_*.pt")):
+            try:
+                s = int(f.rsplit("_", 1)[1].split(".")[0])
+                if s > best_step:
+                    best_step = s
+                    best_ckpt = f
+            except (ValueError, IndexError):
+                continue
+
+    if best_step > 0:
+        print(f"Found checkpoint at step {best_step}: {best_ckpt}")
+
+    start_step = load_checkpoint(model, optimizer, best_ckpt, device)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -333,8 +363,31 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     start_time = time.time()
     step = start_step
 
+    # --- Preflight: verify dataset access in main process ---
+    first_phase, first_ds, first_ds_cfg = get_phase(start_step, cfg)
+    print(f"\n[Preflight] Testing dataset access: {first_ds}")
+    preflight_t = time.time()
+    try:
+        from datasets import load_dataset as _ld
+
+        _preflight_kwargs = {"split": "train", "streaming": True}
+        if first_ds_cfg:
+            _preflight_kwargs["name"] = first_ds_cfg
+        _test_ds = _ld(first_ds, **_preflight_kwargs)
+        _test_iter = iter(_test_ds)
+        print(f"[Preflight] Stream connected in {time.time() - preflight_t:.1f}s")
+        _row = next(_test_iter)
+        print(
+            f"[Preflight] First example fetched in {time.time() - preflight_t:.1f}s "
+            f"(keys: {list(_row.keys())[:5]})"
+        )
+        del _test_ds, _test_iter, _row
+    except Exception as e:
+        print(f"[Preflight] WARNING: dataset test failed: {e}")
+    print(f"[Preflight] Done in {time.time() - preflight_t:.1f}s\n")
+
     while step < cfg.total_steps:
-        phase_name, dataset_name = get_phase(step, cfg)
+        phase_name, dataset_name, ds_config = get_phase(step, cfg)
 
         if phase_name != current_phase:
             current_phase = phase_name
@@ -344,10 +397,14 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
             )
             if current_loader is not None:
                 del current_loader
+            print(f"Loading dataset {dataset_name} (streaming)...")
+            load_t = time.time()
             current_loader = make_loader(
-                dataset_name, cfg.seq_len, tokenizer_name, cfg.batch_size, step
+                dataset_name, cfg.seq_len, tokenizer_name, cfg.batch_size, step,
+                dataset_config=ds_config,
             )
             loader_iter = iter(current_loader)
+            print(f"DataLoader ready in {time.time() - load_t:.1f}s")
 
         lr = get_lr(step, cfg)
         for pg in optimizer.param_groups:
@@ -357,11 +414,15 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         accum_loss = torch.tensor(0.0, device=device)
         last_loop_rms = None
 
+        if step == start_step:
+            print("Fetching first batch...")
+            batch_t = time.time()
+
         for micro in range(cfg.grad_accum_steps):
             try:
                 input_ids, labels = next(loader_iter)
             except StopIteration:
-                _, ds_name = get_phase(step, cfg)
+                _, ds_name, ds_cfg = get_phase(step, cfg)
                 if current_loader is not None:
                     del current_loader
                 current_loader = make_loader(
@@ -370,12 +431,18 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
                     tokenizer_name,
                     cfg.batch_size,
                     step,
+                    dataset_config=ds_cfg,
                 )
                 loader_iter = iter(current_loader)
                 input_ids, labels = next(loader_iter)
 
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+
+            if step == start_step and micro == 0:
+                print(f"First batch fetched in {time.time() - batch_t:.1f}s")
+                print("Running first forward pass (torch.compile tracing)...")
+                fwd_t = time.time()
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits, loop_rms_tensors = model(input_ids)
@@ -394,11 +461,24 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
             if micro == cfg.grad_accum_steps - 1:
                 last_loop_rms = [r.detach() for r in loop_rms_tensors]
 
+        if step == start_step:
+            print(
+                f"First step complete in {time.time() - fwd_t:.1f}s "
+                f"(includes compile + forward + backward)"
+            )
+            print("Training is running!\n")
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
         # --- Logging ---
-        if step % cfg.log_interval == 0:
+        # Log frequently during warmup so progress is visible immediately
+        should_log = (
+            step % cfg.log_interval == 0
+            or step == 1
+            or (step < 100 and step % 10 == 0)
+        )
+        if should_log:
             metrics = log_step(
                 step,
                 accum_loss,
@@ -413,6 +493,13 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
             )
             if use_wandb:
                 wandb.log(metrics, step=step)
+        elif step < 200:
+            # Print a dot every step so the user sees activity
+            sys.stdout.write(".")
+            sys.stdout.flush()
+            if step % 50 == 49:
+                sys.stdout.write(f" [step {step}]\n")
+                sys.stdout.flush()
 
         # --- Checkpoints ---
         if step > 0 and step % cfg.ckpt_interval == 0:

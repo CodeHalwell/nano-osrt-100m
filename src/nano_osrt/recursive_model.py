@@ -131,6 +131,7 @@ class RecursiveNanoOSRT(nn.Module):
             ]
         )
         self.adapter_scale = cfg.adapter_alpha / cfg.adapter_rank
+        self.norm_loop = nn.RMSNorm(cfg.dim)
         self.norm_out = nn.RMSNorm(cfg.dim)
 
         # GPT-standard init: N(0, 0.02) prevents logit variance explosion
@@ -175,6 +176,8 @@ class RecursiveNanoOSRT(nn.Module):
                     sin,
                 )
             loop_rms.append(x.float().pow(2).mean().sqrt())
+            if loop < self.cfg.recursive_loops - 1:
+                x = self.norm_loop(x)
 
         x = self.norm_out(x)
         logits = F.linear(x, self.embedding.weight)

@@ -64,6 +64,7 @@ class ModalConfig:
     wandb_log: bool = True
     wandb_project: str = "nano-osrt-100m"
     wandb_run_name: str = "osrt-v3.2"
+    wandb_run_id: str = "24jxp6go"
 
     # Tokens/step = batch_size * seq_len * grad_accum = 16 * 2048 * 4 = 131,072
     phases: dict = {  # noqa: RUF012
@@ -81,5 +82,6 @@ class ModalConfig:
             "start": 140_000,
             "end": 150_000,
             "dataset": "HuggingFaceTB/smoltalk",
+            "config": "all",
         },
     }

@@ -31,11 +31,13 @@ class TokenStream(IterableDataset):
         seq_len: int,
         tok_name: str,
         seed: int,
+        dataset_config: str | None = None,
     ) -> None:
         self.dataset_name = dataset_name
         self.seq_len = seq_len
         self.tok_name = tok_name
         self.seed = seed
+        self.dataset_config = dataset_config
 
     def __iter__(self):  # noqa: ANN204
         from datasets import load_dataset
@@ -44,8 +46,13 @@ class TokenStream(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed if worker_info is None else self.seed + worker_info.id
 
-        ds = load_dataset(self.dataset_name, split="train", streaming=True)
-        ds = ds.shuffle(buffer_size=10_000, seed=seed)
+        print(f"[DataWorker] Connecting to {self.dataset_name}...")
+        load_kwargs = {"split": "train", "streaming": True}
+        if self.dataset_config:
+            load_kwargs["name"] = self.dataset_config
+        ds = load_dataset(self.dataset_name, **load_kwargs)
+        ds = ds.shuffle(buffer_size=5_000, seed=seed)
+        print(f"[DataWorker] Stream ready for {self.dataset_name}")
 
         if worker_info is not None:
             try:
@@ -101,6 +108,7 @@ def make_loader(
     tokenizer_name: str,
     batch_size: int,
     step_num: int,
+    dataset_config: str | None = None,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     """Build a streaming :class:`DataLoader` for a training phase.
 
@@ -110,17 +118,16 @@ def make_loader(
         tokenizer_name: HuggingFace tokenizer identifier.
         batch_size: Micro-batch size.
         step_num: Current training step (used to vary the shuffle seed).
+        dataset_config: Optional dataset config name (e.g. 'all' for smoltalk).
 
     Returns:
         A :class:`DataLoader` yielding ``(input_ids, labels)`` batches.
     """
-    ds = TokenStream(dataset_name, seq_len, tokenizer_name, seed=42 + step_num)
+    ds = TokenStream(dataset_name, seq_len, tokenizer_name, seed=42 + step_num, dataset_config=dataset_config)
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
-        prefetch_factor=4,
         drop_last=True,
-        persistent_workers=True,
     )
