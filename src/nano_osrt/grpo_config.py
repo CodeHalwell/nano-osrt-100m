@@ -74,7 +74,10 @@ class GRPOConfig:
     # Reward weights
     correctness_reward: float = 1.0  # correct final answer
     format_reward: float = 0.2  # used <think>...</think> correctly
-    length_penalty: float = -0.001  # per-token penalty to encourage conciseness
+    length_penalty: float = 0.0  # disabled — reasoning needs room to think
+    reasoning_bonus: float = 0.3  # bonus for multi-step thinking when correct
+    truncation_penalty: float = -0.5  # penalty for hitting 90% of max_gen_len
+    empty_think_penalty: float = -0.1  # penalty for <think></think> with no content
 
     # Prompt source
     prompt_dataset: str = "openai/gsm8k"

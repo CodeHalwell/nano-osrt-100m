@@ -366,6 +366,7 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
                 comp_text = tokenizer.decode(
                     comp_ids[prompt_len:].tolist(), skip_special_tokens=True
                 )
+                comp_tokens = len(comp_ids) - prompt_len
                 reward, breakdown = compute_reward(
                     comp_text,
                     ground_truth,
@@ -374,6 +375,11 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
                     length_penalty=cfg.length_penalty,
                     think_open=cfg.think_open,
                     think_close=cfg.think_close,
+                    max_tokens=cfg.max_gen_len,
+                    completion_tokens=comp_tokens,
+                    reasoning_bonus=cfg.reasoning_bonus,
+                    truncation_penalty=cfg.truncation_penalty,
+                    empty_think_penalty=cfg.empty_think_penalty,
                 )
                 rewards.append(reward)
                 if breakdown["correct"]:

@@ -250,6 +250,86 @@ def format_slimorca(
     return question, assistant
 
 
+def format_evol_code(
+    example: dict, think_open: str, think_close: str
+) -> tuple[str, str]:
+    """Format an Evol-Instruct-Code example.
+
+    Has 'instruction' and 'output' columns. The output typically contains
+    code with explanation — we split into reasoning (approach) and code.
+    """
+    question = example.get("instruction", "")
+    output = example.get("output", "")
+
+    if not question or not output:
+        return "", ""
+
+    # Look for code blocks to separate reasoning from code
+    parts = output.split("```")
+    if len(parts) >= 3:
+        # Has code block: before is reasoning, code block is answer
+        reasoning = parts[0].strip()
+        code_and_rest = "```" + "```".join(parts[1:])
+        if reasoning:
+            assistant = f"{think_open}{reasoning}{think_close}\n{code_and_rest}"
+        else:
+            assistant = f"{think_open}Let me write the code for this.{think_close}\n{code_and_rest}"
+    else:
+        # No code block — treat first paragraph as reasoning
+        paragraphs = output.strip().split("\n\n")
+        if len(paragraphs) > 1:
+            reasoning = paragraphs[0].strip()
+            code = "\n\n".join(paragraphs[1:]).strip()
+            assistant = f"{think_open}{reasoning}{think_close}\n{code}"
+        else:
+            assistant = f"{think_open}Let me solve this step by step.{think_close}\n{output}"
+
+    return question, assistant
+
+
+def format_alpaca_code(
+    example: dict, think_open: str, think_close: str
+) -> tuple[str, str]:
+    """Format an Alpaca-style code instruction example.
+
+    Has 'instruction', optional 'input', and 'output' columns.
+    """
+    instruction = example.get("instruction", "")
+    inp = example.get("input", "")
+    output = example.get("output", "")
+
+    if not instruction or not output:
+        return "", ""
+
+    question = f"{instruction}\n{inp}".strip() if inp else instruction
+
+    # Look for code blocks
+    parts = output.split("```")
+    if len(parts) >= 3:
+        reasoning = parts[0].strip()
+        code_and_rest = "```" + "```".join(parts[1:])
+        if reasoning:
+            assistant = f"{think_open}{reasoning}{think_close}\n{code_and_rest}"
+        else:
+            assistant = f"{think_open}I'll write the code to solve this.{think_close}\n{code_and_rest}"
+    else:
+        # Many code outputs don't use ``` blocks — check for common code patterns
+        lines = output.strip().split("\n")
+        # If output looks like code (starts with def, class, import, #, etc.)
+        code_indicators = ("def ", "class ", "import ", "from ", "#", "if __name__")
+        if any(lines[0].strip().startswith(ind) for ind in code_indicators):
+            assistant = f"{think_open}Let me write the solution.{think_close}\n{output}"
+        elif len(lines) > 3:
+            # First line as reasoning, rest as code
+            reasoning = lines[0].strip()
+            code = "\n".join(lines[1:]).strip()
+            assistant = f"{think_open}{reasoning}{think_close}\n{code}"
+        else:
+            assistant = f"{think_open}Here's my approach.{think_close}\n{output}"
+
+    return question, assistant
+
+
 FORMAT_FN = {
     "gsm8k": format_gsm8k,
     "orca_math": format_orca_math,
@@ -260,6 +340,8 @@ FORMAT_FN = {
     "openhermes": format_openhermes,
     "slimorca": format_slimorca,
     "ifeval": format_ifeval,
+    "evol_code": format_evol_code,
+    "alpaca_code": format_alpaca_code,
 }
 
 

@@ -128,13 +128,24 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     print(f"Chat format         : user/assistant with <think>...</think>")
     print()
 
-    load_pretrained(model, cfg.pretrained_checkpoint, device)
-
     # ------------------------------------------------------------------
     # High Rank Adaptation (HRA) — expand model capacity
     # ------------------------------------------------------------------
     hra_params = []
-    if cfg.hra_enabled:
+    if cfg.hra_enabled and getattr(cfg, "hra_before_load", False):
+        # Inject HRA BEFORE loading — needed when checkpoint already has HRA keys
+        print(f"\nInjecting HRA adapters before load (rank={cfg.hra_rank})...")
+        hra_params = inject_hra(
+            model,
+            rank=cfg.hra_rank,
+            scale=cfg.hra_scale,
+            freeze_pretrained=cfg.hra_freeze_pretrained,
+        )
+
+    load_pretrained(model, cfg.pretrained_checkpoint, device)
+
+    if cfg.hra_enabled and not getattr(cfg, "hra_before_load", False):
+        # Inject HRA AFTER loading — for fresh pretrained checkpoints
         print(f"\nInjecting HRA adapters (rank={cfg.hra_rank})...")
         hra_params = inject_hra(
             model,
@@ -142,6 +153,8 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
             scale=cfg.hra_scale,
             freeze_pretrained=cfg.hra_freeze_pretrained,
         )
+
+    if cfg.hra_enabled:
         total_params = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)")
@@ -219,13 +232,14 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     # ------------------------------------------------------------------
     # Resume from SFT checkpoint if available
     # ------------------------------------------------------------------
-    sft_rescue_path = "/vol/checkpoints/osrt100m_sft_rescue.pt"
+    prefix = getattr(cfg, "stage_prefix", "sft")
+    sft_rescue_path = f"/vol/checkpoints/osrt100m_{prefix}_rescue.pt"
     ckpt_dir = "/vol/checkpoints"
     best_ckpt = sft_rescue_path
     best_step = -1
 
     if os.path.isdir(ckpt_dir):
-        for f in glob.glob(os.path.join(ckpt_dir, "osrt100m_sft_step_*.pt")):
+        for f in glob.glob(os.path.join(ckpt_dir, f"osrt100m_{prefix}_step_*.pt")):
             try:
                 s = int(f.rsplit("_", 1)[1].split(".")[0])
                 if s > best_step:
@@ -363,7 +377,7 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
 
         # --- Checkpoints ---
         if step > 0 and step % cfg.ckpt_interval == 0:
-            path = f"/vol/checkpoints/osrt100m_sft_step_{step}.pt"
+            path = f"/vol/checkpoints/osrt100m_{prefix}_step_{step}.pt"
             save_sft_checkpoint(model, optimizer, step, path)
             vol.commit()
 
@@ -380,7 +394,7 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
 
     # --- Final ---
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    final_path = "/vol/checkpoints/osrt100m_sft_final.pt"
+    final_path = f"/vol/checkpoints/osrt100m_{prefix}_final.pt"
     torch.save(
         {
             "model_state_dict": inner.state_dict(),

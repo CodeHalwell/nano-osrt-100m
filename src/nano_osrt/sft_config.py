@@ -32,6 +32,8 @@ class SFTConfig:
     hra_scale: float = 1.0
     hra_lr: float = 1e-4  # 5x base LR for fresh adapter params
     hra_freeze_pretrained: bool = False  # train everything, differential LR
+    hra_before_load: bool = False  # inject HRA before loading checkpoint
+    stage_prefix: str = "sft"  # checkpoint naming prefix
 
     # SFT training hyperparameters
     batch_size: int = 8
@@ -105,16 +107,11 @@ class SFTConfig:
 
 
 class GeneralSFTConfig(SFTConfig):
-    """Stage 4: General instruction following after GRPO.
-
-    Teaches the model to apply reasoning to broad tasks — Q&A,
-    summarization, explanation, creative writing — not just math.
-    Uses a lower LR to preserve GRPO-trained reasoning patterns.
+    """General instruction following after GRPO.
 
     Pipeline: pretrain -> SFT (math) -> GRPO -> GeneralSFT (this)
     """
 
-    # Lower LR to preserve reasoning from GRPO
     total_steps: int = 2_000
     warmup_steps: int = 100
     peak_lr: float = 1e-5
@@ -122,15 +119,13 @@ class GeneralSFTConfig(SFTConfig):
     batch_size: int = 8
     grad_accum_steps: int = 4
 
-    # Weights & Biases
     wandb_run_name: str = "osrt-general-sft-v1"
     wandb_run_id: str = ""
 
-    # Load from GRPO checkpoint
     pretrained_checkpoint: str = "/vol/checkpoints/osrt100m_grpo_final.pt"
+    hra_before_load: bool = True
+    stage_prefix: str = "general"
 
-    # Broad instruction datasets with <think> reasoning
-    # Includes ifeval-like-data for instruction following capability
     datasets: list = [  # noqa: RUF012
         {
             "name": "alpaca-cleaned",
@@ -175,5 +170,72 @@ class GeneralSFTConfig(SFTConfig):
             "split": "train",
             "weight": 0.10,
             "format": "gsm8k",
+        },
+    ]
+
+
+class CodeSFTConfig(SFTConfig):
+    """Stage 4: Code fine-tuning after GRPO.
+
+    Teaches the model to reason about code using <think>...</think> format.
+    Focused on Python and general programming with math retention.
+
+    Pipeline: pretrain -> SFT (math) -> GRPO -> CodeSFT (this)
+    """
+
+    total_steps: int = 7_000  # ~2 epochs over 220K examples
+    warmup_steps: int = 200
+    peak_lr: float = 1.5e-5
+    min_lr: float = 1.5e-6
+    batch_size: int = 8
+    grad_accum_steps: int = 8
+    hra_lr: float = 7.5e-5  # 5x base LR
+
+    # Weights & Biases
+    wandb_run_name: str = "osrt-code-sft-v1"
+    wandb_run_id: str = ""
+
+    # Load from GRPO checkpoint (has HRA structure)
+    pretrained_checkpoint: str = "/vol/checkpoints/osrt100m_grpo_final.pt"
+    hra_before_load: bool = True
+    stage_prefix: str = "code"
+
+    # Code-focused datasets with math retention
+    datasets: list = [  # noqa: RUF012
+        {
+            "name": "evol-instruct-code",
+            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
+            "split": "train",
+            "weight": 0.30,
+            "format": "evol_code",
+        },
+        {
+            "name": "code-instructions-122k",
+            "hf_id": "TokenBender/code_instructions_122k_alpaca_style",
+            "split": "train",
+            "weight": 0.30,
+            "format": "alpaca_code",
+        },
+        {
+            "name": "python-code-instructions",
+            "hf_id": "iamtarun/python_code_instructions_18k_alpaca",
+            "split": "train",
+            "weight": 0.20,
+            "format": "alpaca_code",
+        },
+        {
+            "name": "gsm8k",
+            "hf_id": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "train",
+            "weight": 0.10,
+            "format": "gsm8k",
+        },
+        {
+            "name": "longform",
+            "hf_id": "akoksal/LongForm",
+            "split": "train",
+            "weight": 0.10,
+            "format": "longform",
         },
     ]
