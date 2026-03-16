@@ -304,7 +304,7 @@ High Rank Adaptation (rank 256-512) for SFT/GRPO is well-suited to this architec
 | **Total Physical** | **~305M** | |
 | **Active per token** | **~155M** | ~51% sparsity |
 
-**Observation:** The embedding layer dominates at 64.6% of parameters. This is typical for small models with large vocabularies. Consider whether 128K vocabulary is necessary — a 32K vocabulary would save ~147M parameters that could be reallocated to more experts or a larger hidden dim.
+**Observation:** This parameter budget assumes a 128,256-token vocabulary, which yields a ~196.9M-parameter embedding layer and a total of ~305M parameters. The embedding layer dominates at 64.6% of parameters, which is typical for small models with large vocabularies. In contrast, the current v4 default configs use a 65,536-token vocabulary and are ~208M parameters in total (primarily due to a smaller embedding matrix). Consider whether a 128K vocabulary is necessary — e.g., dropping to a 32K vocabulary in this regime would save on the order of ~147M parameters that could be reallocated to more experts or a larger hidden dim.
 
 ---
 
