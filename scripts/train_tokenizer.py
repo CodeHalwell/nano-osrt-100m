@@ -66,9 +66,8 @@ def sample_training_data(sample_size: int = 50_000_000, seed: int = 42) -> str:
             "text_key": "text",
         },
         {
-            "name": "StarCoder Python",
-            "hf_id": "bigcode/starcoderdata",
-            "hf_config": "python",
+            "name": "CodeParrot Clean",
+            "hf_id": "codeparrot/codeparrot-clean",
             "fraction": 0.30,
             "text_key": "content",
         },

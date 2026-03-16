@@ -70,9 +70,8 @@ class V4PretrainConfig:
                     "weight": 0.55,
                 },
                 {
-                    "name": "starcoder-data",
-                    "hf_id": "bigcode/starcoderdata",
-                    "hf_config": "python",
+                    "name": "codeparrot-clean",
+                    "hf_id": "codeparrot/codeparrot-clean",
                     "weight": 0.30,
                 },
                 {

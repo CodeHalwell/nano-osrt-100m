@@ -57,23 +57,23 @@ tokenizer_vol = modal.Volume.from_name("osrt-v4-tokenizer", create_if_missing=Tr
     timeout=14400,  # 4 hours
 )
 def train_tokenizer():
-    """Train custom 128K SuperBPE/BPE tokenizer on pre-training data mix."""
+    """Train custom 64K BPE tokenizer on pre-training data mix."""
     import sys
     sys.path.insert(0, "/root")
 
     from scripts.train_tokenizer import sample_training_data, train_with_hf_tokenizers, _verify_tokenizer
 
     print("=" * 60)
-    print("NanoOSRT v4 — Custom 128K Tokenizer Training")
+    print("NanoOSRT v4 — Custom 64K Tokenizer Training")
     print("=" * 60)
 
-    # Sample 100MB of training data (proportional to pre-training mix)
+    # Sample 10GB of training data (proportional to pre-training mix)
     print("\nSampling training data...")
-    data_path = sample_training_data(sample_size=100_000_000)
+    data_path = sample_training_data(sample_size=10_000_000_000)
 
     # Train tokenizer
     output_dir = "/vol/tokenizer"
-    train_with_hf_tokenizers(data_path, vocab_size=128256, output_dir=output_dir)
+    train_with_hf_tokenizers(data_path, vocab_size=65536, output_dir=output_dir)
 
     # Cleanup temp file
     import os

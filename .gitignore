@@ -72,3 +72,5 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+nano-osrt-model/
+checkpoints/
