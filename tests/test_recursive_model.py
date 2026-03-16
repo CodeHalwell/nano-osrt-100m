@@ -186,26 +186,34 @@ class TestTrainHelpers:
         from nano_osrt.modal_train import get_phase
 
         cfg = ModalConfig()
-        name, dataset = get_phase(0, cfg)
+        name, dataset, dataset_config = get_phase(0, cfg)
         assert name == "tinystories"
+        assert dataset == "roneneldan/TinyStories"
+        assert dataset_config is None
 
     def test_get_phase_fineweb(self) -> None:
         from nano_osrt.modal_train import get_phase
 
         cfg = ModalConfig()
-        name, dataset = get_phase(10_000, cfg)
+        name, dataset, dataset_config = get_phase(10_000, cfg)
         assert name == "fineweb"
+        assert dataset == "HuggingFaceFW/fineweb-edu"
+        assert dataset_config is None
 
     def test_get_phase_smoltalk(self) -> None:
         from nano_osrt.modal_train import get_phase
 
         cfg = ModalConfig()
-        name, dataset = get_phase(145_000, cfg)
+        name, dataset, dataset_config = get_phase(145_000, cfg)
         assert name == "smoltalk"
+        assert dataset == "HuggingFaceTB/smoltalk"
+        assert dataset_config == "all"
 
     def test_get_phase_fallback(self) -> None:
         from nano_osrt.modal_train import get_phase
 
         cfg = ModalConfig()
-        name, dataset = get_phase(999_999, cfg)
+        name, dataset, dataset_config = get_phase(999_999, cfg)
         assert name == "fineweb"
+        assert dataset == "HuggingFaceFW/fineweb-edu"
+        assert dataset_config is None
