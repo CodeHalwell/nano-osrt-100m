@@ -255,19 +255,13 @@ With `num_workers=0`, all data loading happens in the main process, blocking the
 
 **Caveat:** With streaming HF datasets, multi-worker can cause duplication. Use `num_workers=2` with proper worker sharding (already partially handled by the seed logic).
 
-### 3.4 No Gradient Checkpointing Implementation
+### 3.4 Gradient Checkpointing Configuration & Tradeoffs
 
 **File:** `v4_model.py:268`
 
-The config declares `supports_gradient_checkpointing = True`, but no gradient checkpointing is actually implemented. For a 305M parameter model with 8192 seq_len, activation memory will be substantial.
+The config declares `supports_gradient_checkpointing = True`, and `v4_model.py` now includes gradient checkpointing logic that wraps the recursive block when this flag is enabled. This is appropriate for a 305M parameter model with 8192 seq_len, where activation memory would otherwise be substantial.
 
-**Recommendation:** Add checkpoint wrapping to the recursive loop:
-```python
-from torch.utils.checkpoint import checkpoint
-
-if self.gradient_checkpointing and self.training:
-    x = checkpoint(block, x, adapters_a[idx], adapters_b[idx], ...)
-```
+**Recommendation:** Keep gradient checkpointing enabled for long-context training runs, and ensure tests cover both configurations (with and without gradient checkpointing) so that any future refactors do not silently break the checkpointed path.
 
 ---
 
