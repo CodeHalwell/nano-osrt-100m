@@ -55,49 +55,298 @@
 
 ## Architecture
 
-### Recursive Weight Sharing
+### v3: Recursive Transformer
 
-The core innovation: physical transformer blocks are reused across multiple loops, simulating a much deeper network. Each loop gets unique per-pass residual adapters to prevent representational collapse.
-
-```
-Input -> Embedding -> [Block0, Block1, ...] x N loops -> RMSNorm -> LM Head
-                           ^          ^
-                      adapter_a[i]  adapter_b[i]   (unique per virtual layer)
-```
-
-**v3:** 2 blocks x 6 loops = 12 effective layers
-**v4:** 3 blocks x 6 loops = 18 effective layers + MoE
-
-### v4 Block Structure
-
-Each v4 block contains attention + parallel dense/MoE FFN:
+2 physical blocks are looped 6 times, producing 12 effective layers. Each virtual layer gets a unique per-pass residual adapter to prevent representational collapse.
 
 ```
-x = x + attention(norm(x))           # causal attention with RoPE
-x = x + gate_d * dense(norm(x))      # dense SwiGLU FFN
-      + gate_m * moe(norm(x), loop)  # MoE: shared expert + top-2 routed
+          Input Token IDs (B, S)
+                   |
+          +--------v--------+
+          |  Token Embedding |  (50304 x 1280, weight-tied with LM head)
+          +---------+-------+
+                    |
+                    |     +-------------------------------------------+
+                    |     |  RoPE Buffers (precomputed, non-persistent) |
+                    |     |  cos, sin: (1, seq_len, 1, head_dim=64)    |
+                    |     +---------------------+---------------------+
+                    |                           |
+   +================v===========================v======================+
+   ||                 Recursive Loop (x6)                              ||
+   ||                                                                  ||
+   ||  +------------------------------------------------------------+  ||
+   ||  |  Block 0 (physical)                                        |  ||
+   ||  |                                                            |  ||
+   ||  |  x_mod = x + scale * (x @ adapter_a[i] @ adapter_b[i])    |  ||
+   ||  |                    ^-- unique per (block, loop) pair       |  ||
+   ||  |                                                            |  ||
+   ||  |  +-- RMSNorm --> QKV Proj --> RoPE --> Causal SDPA --+     |  ||
+   ||  |  |                        (FlashAttention-2 backend)  |     |  ||
+   ||  |  +-- Out Proj + Residual (connects to x_mod) --------+     |  ||
+   ||  |                                                            |  ||
+   ||  |  +-- RMSNorm --> SwiGLU FFN (dim=1280, hidden=3456) -+     |  ||
+   ||  |  +-- Residual ----------------------------------------+     |  ||
+   ||  +------------------------------+-----------------------------+  ||
+   ||                                 |                                ||
+   ||  +------------------------------v-----------------------------+  ||
+   ||  |  Block 1 (physical)                                        |  ||
+   ||  |  (same structure as Block 0, different adapter pair)       |  ||
+   ||  +------------------------------+-----------------------------+  ||
+   ||                                 |                                ||
+   ||                          Loop RMS measurement                    ||
+   ||                          Inter-loop RMSNorm (loops 0-4)         ||
+   +==================================+===============================+
+                                      |  (x6 = 12 effective layers)
+                    +-----------------v-----------------+
+                    |            RMSNorm (final)         |
+                    +-----------------+-----------------+
+                                      |
+                    +-----------------v-----------------+
+                    |   LM Head (weight-tied embedding)  |
+                    +-----------------+-----------------+
+                                      |
+                              Logits (B, S, vocab)
+```
+
+**Parameter budget (v3):**
+
+```
+  Token Embedding    64.4M  [=====================================]  61.6%
+  SwiGLU FFN x2     26.5M  [===============]                        25.4%
+  QKV Proj x2        9.8M  [=====]                                   9.4%
+  Out Proj x2        3.3M  [==]                                      3.1%
+  Adapters x12       0.5M  []                                        0.5%
+  ─────────────────────────────────────────────────────────────────
+  Total            104.5M   Physical params
+                   302M     Effective (recursive x6)
+```
+
+### v4: Recursive MoE
+
+3 physical blocks x 6 loops = 18 effective layers. Each block has causal attention + parallel dense FFN and MoE FFN with learnable gating.
+
+```
+          Input Token IDs (B, S)
+                   |
+          +--------v--------+
+          |  Token Embedding |  (65536 x 1536)
+          +---------+-------+
+                    |
+                    |     +-------------------------------------------+
+                    |     |  RoPE Buffers (max 8192 positions)         |
+                    |     |  NTK-aware scaling for inference >8K      |
+                    |     +---------------------+---------------------+
+                    |                           |
+   +================v===========================v======================+
+   ||                 Recursive Loop (x6)                              ||
+   ||                                                                  ||
+   ||  For each of 3 physical blocks:                                  ||
+   ||                                                                  ||
+   ||  +------------------------------------------------------------+  ||
+   ||  |  RecursiveBlockV4                                          |  ||
+   ||  |                                                            |  ||
+   ||  |  x_mod = x + scale * (x @ adapter_a[i] @ adapter_b[i])    |  ||
+   ||  |                                                            |  ||
+   ||  |  +== ATTENTION ========================================+   |  ||
+   ||  |  | RMSNorm -> QKV (1536->4608) -> RoPE -> Causal SDPA |   |  ||
+   ||  |  | -> Out Proj (1536->1536) + Residual                 |   |  ||
+   ||  |  +=====================================================+   |  ||
+   ||  |                          |                                 |  ||
+   ||  |           +--------------+---------------+                 |  ||
+   ||  |           |                              |                 |  ||
+   ||  |  +========v==========+  +================v==============+  |  ||
+   ||  |  | DENSE FFN         |  | MoE FFN                      |  |  ||
+   ||  |  |                   |  |                               |  |  ||
+   ||  |  | RMSNorm           |  | RMSNorm                      |  |  ||
+   ||  |  | SwiGLU            |  |     +---------------------+  |  |  ||
+   ||  |  | (1536->4096->1536)|  |     |  Loop-Aware Router   |  |  |  ||
+   ||  |  |                   |  |     |  h + loop_emb -> sig  |  |  |  ||
+   ||  |  |                   |  |     +----------+----------+  |  |  ||
+   ||  |  |                   |  |                |             |  |  ||
+   ||  |  |                   |  |         top-2 selection      |  |  ||
+   ||  |  |                   |  |        /       |       \     |  |  ||
+   ||  |  |                   |  |  +--------+ +-----+ +-----+ |  |  ||
+   ||  |  |                   |  |  | Shared | | E_i | | E_j | |  |  ||
+   ||  |  |                   |  |  | Expert | | (r) | | (r) | |  |  ||
+   ||  |  |                   |  |  | (1024) | |(1024)| |(1024)||  |  ||
+   ||  |  |                   |  |  +---+----+ +--+--+ +--+--+ |  |  ||
+   ||  |  |                   |  |      |         |       |     |  |  ||
+   ||  |  |                   |  |      +----+----+-------+     |  |  ||
+   ||  |  |                   |  |           | weighted sum      |  |  ||
+   ||  |  +=========+=========+  +===========+=================+  |  ||
+   ||  |            |                        |                     |  ||
+   ||  |            |    gate_d              |    gate_m           |  ||
+   ||  |            +--------+    +----------+                     |  ||
+   ||  |                     |    |                                |  ||
+   ||  |           x = x + gate_d * dense + gate_m * moe          |  ||
+   ||  |                                                            |  ||
+   ||  +------------------------------------------------------------+  ||
+   ||                                                                  ||
+   ||  (repeated for all 3 blocks per loop)                            ||
+   ||                                                                  ||
+   ||  Loop RMS measurement + Inter-loop RMSNorm                       ||
+   +===================================================================+
+                                      |  (x6 = 18 effective layers)
+                    +-----------------v-----------------+
+                    |            RMSNorm (final)         |
+                    +-----------------+-----------------+
+                                      |
+                    +-----------------v-----------------+
+                    |   LM Head (weight-tied embedding)  |
+                    +-----------------+-----------------+
+                                      |
+                              Logits (B, S, vocab)
+```
+
+**MoE routing detail:**
+
+```
+  Hidden state (B, S, 1536)
+         |
+         +---> concat with loop_embedding[loop_idx]  --> (B, S, 3072)
+         |
+         +---> Router linear (3072 -> 11)  --> sigmoid --> top-2 selection
+         |
+         |     Expert 0: SwiGLU(1536 -> 1024 -> 1536)  [always active = shared]
+         |     Expert 1: SwiGLU(1536 -> 1024 -> 1536)  \
+         |     Expert 2: SwiGLU(1536 -> 1024 -> 1536)   |
+         |     ...                                       +-- top-2 selected
+         |     Expert 11: SwiGLU(1536 -> 1024 -> 1536)  /
+         |
+         +---> output = shared_out + weighted_sum(selected_expert_outputs)
+```
+
+**Parameter budget (v4):**
+
+```
+  Token Embedding       101M  [===========================]             32.3%
+  MoE Routed (11)       119M  [================================]        38.1%
+  Dense FFN x3           57M  [===============]                         18.2%
+  Attention x3           28M  [========]                                 9.0%
+  Shared Expert x3        5M  [=]                                        1.5%
+  Adapters x18            1M  []                                         0.3%
+  Router + Loop Emb      <1M  []                                         0.1%
+  ─────────────────────────────────────────────────────────────────
+  Total Physical       ~208M
+  Active / Token       ~131M   (shared + 2 of 11 routed)
+  Effective            ~790M   (recursive x6)
 ```
 
 ### Per-Pass Residual Adapters
 
-Not weight-LoRA -- modulates hidden states directly:
+Not weight-LoRA (Hu et al.) -- modulates hidden states directly:
 
-```python
-x_mod = x + scale * (x @ A @ B)   # A: (dim, rank), B: (rank, dim)
 ```
+                      +---------------------------------------------+
+                      |        Per-Pass Residual Adapter              |
+                      |                                               |
+   x ────────+────────v────────+                                      |
+             |     x @ A       |   A: (dim, rank) -- N(0, 0.01) init  |
+             |       |         |   B: (rank, dim) -- zero init        |
+             |     x @ A @ B   |   scale = alpha / rank = 1.0        |
+             |       |         |                                      |
+             |   scale * (...) |                                      |
+             |       |         |                                      |
+             +-------+---------+                                      |
+             |                                                        |
+   x_mod  <--+  x_mod = x + scale * (x @ A @ B)                      |
+                      |                                               |
+                      |  v3: 12 pairs (rank 16), v4: 18 pairs         |
+                      +---------------------------------------------+
 
-- Zero-initialized B: adapter starts as no-op, differentiation emerges through training
-- Each (block, loop) pair gets a unique adapter
+  At step 0, B=0 so adapter is no-op. All loops start identical.
+  Differentiation emerges organically through gradient flow.
+```
 
 ### High Rank Adaptation (HRA)
 
-Post-training capacity expansion. Injects rank-256 adapter matrices alongside linear layers:
+Post-training capacity expansion. Injected alongside each linear layer after loading pretrained weights:
 
-```python
-y = Linear(x) + scale * (x @ A @ B)   # A: (in, 256), B: (256, out)
+```
+                  +------------------------------------------+
+                  |        HRA Linear Wrapper                 |
+                  |                                           |
+   x ─────+──────v──────+                                    |
+           |  Original   |                                    |
+           |  Linear(x)  |   W: (in, out) -- pretrained       |
+           |      |       |                                    |
+           +------+       |   A: (in, 256) -- Kaiming init    |
+           |              |   B: (256, out) -- zero init       |
+           |  (x @ A @ B) |   scale = 1.0                     |
+           |      |       |                                    |
+           +------+-------+                                    |
+           |                                                   |
+   y  <----+  y = Linear(x) + scale * (x @ A @ B)             |
+                  |                                           |
+                  |  +11.2M params (v3) / +15-20M (v4)        |
+                  +------------------------------------------+
+
+  Differential LR: pretrained weights at 2e-5, HRA at 1e-4 (5x)
 ```
 
-Adds ~11-20M trainable parameters for SFT without disrupting pretrained weights.
+### v4 Chat Format (Native Token Tags)
+
+Each tag is a single token in the v4 tokenizer -- no multi-token string matching:
+
+```
+  +---------------------------------------------------------------------+
+  |  <|begin_of_text|>                                                  |
+  |  <|system|> You are a helpful coding assistant.                     |
+  |  <|user|> Write a function to check if a number is prime.          |
+  |  <|assistant|>                                                      |
+  |  <|think|>                                                          |
+  |  I need to check divisibility from 2 to sqrt(n).                   |
+  |  For each potential divisor, if n is evenly divisible, it's not     |
+  |  prime. Otherwise, after checking all divisors, it is prime.        |
+  |  <|/think|>                                                         |
+  |  <|answer|>                                                         |
+  |  def is_prime(n):                                                   |
+  |      if n < 2:                                                      |
+  |          return False                                               |
+  |      for i in range(2, int(n**0.5) + 1):                           |
+  |          if n % i == 0:                                             |
+  |              return False                                           |
+  |      return True                                                    |
+  |  <|/answer|>                                                        |
+  |  <|end_of_text|>                                                    |
+  +---------------------------------------------------------------------+
+
+  Loss masking (SFT):
+    IGNORE: <|begin_of_text|> ... <|assistant|>  (system + user prompt)
+    TRAIN:  <|think|> ... <|/answer|>            (reasoning + answer)
+    IGNORE: <|end_of_text|> padding              (EOS + pad)
+```
+
+### Progressive Context Length (v4)
+
+```
+  seq_len
+    8192 |                                              +============+
+         |                                              |  Phase 3   |
+    4096 |                     +========================+  Instruct  |
+         |                     |       Phase 2          |   8192     |
+    2048 |  +=================+   Knowledge             |            |
+         |  |    Phase 1      |     4096                |            |
+         |  |   Foundation    |                         |            |
+         |  |     2048        |                         |            |
+    ─────+--+-----------------+-------------------------+------------+---> steps
+         0              15K                        250K          300K
+```
+
+### Training Pipeline Overview
+
+```
+  +===========+     +==========+     +========+     +==========+     +======+
+  | Tokenizer |---->| Pretrain |---->|  SFT   |---->|  GRPO    |---->| Eval |
+  | (64K BPE) |     | (300K    |     | (5K    |     | (2K      |     |      |
+  |  10GB     |     |  steps)  |     |  steps)|     |  steps)  |     |      |
+  +===========+     +==========+     +========+     +==========+     +======+
+       |                 |               |               |               |
+    Custom          Progressive      Balanced        Verifiable      IFEval
+    vocab           2048->8192       math+code       math rewards    GSM8K
+    code+text       Lion optimizer   +STEM+general   group_size=16   HumanEval
+    +wiki           50B tokens       HRA adapters    KL penalty      HellaSwag
+```
 
 ---
 
