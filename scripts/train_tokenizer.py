@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a custom 128K SuperBPE tokenizer for NanoOSRT v4.
+"""Train a custom 64K SuperBPE tokenizer for NanoOSRT v4.
 
 Uses the SuperBPE two-stage process:
   Stage 1: Standard BPE with whitespace pretokenization (learns subwords)
@@ -23,6 +23,8 @@ Usage:
 
 import argparse
 import os
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -195,32 +197,35 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
     t0 = time.time()
 
     os.makedirs(output_dir, exist_ok=True)
-    os.system(
-        f"python -m superbpe.train "
-        f"--input {data_path} "
-        f"--vocab_size {subword_vocab} "
-        f"--output {output_dir}/stage1 "
-        f"--pretokenize"
+    subprocess.run(
+        [sys.executable, "-m", "superbpe.train",
+         "--input", data_path,
+         "--vocab_size", str(subword_vocab),
+         "--output", f"{output_dir}/stage1",
+         "--pretokenize"],
+        check=True,
     )
     print(f"  Stage 1 done in {time.time() - t0:.0f}s")
 
     # Stage 2: Continue without pretokenization (superwords)
     print(f"  Stage 2: SuperBPE extension to {vocab_size:,}...")
     t0 = time.time()
-    os.system(
-        f"python -m superbpe.extend "
-        f"--input {data_path} "
-        f"--base_tokenizer {output_dir}/stage1 "
-        f"--vocab_size {vocab_size} "
-        f"--output {output_dir}/final"
+    subprocess.run(
+        [sys.executable, "-m", "superbpe.extend",
+         "--input", data_path,
+         "--base_tokenizer", f"{output_dir}/stage1",
+         "--vocab_size", str(vocab_size),
+         "--output", f"{output_dir}/final"],
+        check=True,
     )
     print(f"  Stage 2 done in {time.time() - t0:.0f}s")
 
     # Convert to HF format
-    os.system(
-        f"python -m superbpe.construct_hf_tokenizer "
-        f"--tokenizer_path {output_dir}/final "
-        f"--output_path {output_dir}"
+    subprocess.run(
+        [sys.executable, "-m", "superbpe.construct_hf_tokenizer",
+         "--tokenizer_path", f"{output_dir}/final",
+         "--output_path", output_dir],
+        check=True,
     )
 
     _verify_tokenizer(output_dir)
@@ -292,8 +297,8 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train custom 128K tokenizer for NanoOSRT v4")
-    parser.add_argument("--vocab-size", type=int, default=128256, help="Target vocabulary size")
+    parser = argparse.ArgumentParser(description="Train custom 64K tokenizer for NanoOSRT v4")
+    parser.add_argument("--vocab-size", type=int, default=65536, help="Target vocabulary size (64K default, TC-aligned)")
     parser.add_argument("--sample-size", type=int, default=50_000_000, help="Training text size in chars (~50MB default)")
     parser.add_argument("--output", type=str, default="./tokenizer-v4", help="Output directory")
     parser.add_argument("--data-path", type=str, default=None, help="Pre-existing training text file (skip download)")
