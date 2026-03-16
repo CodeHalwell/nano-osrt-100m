@@ -26,13 +26,13 @@
 
 ### v4: Recursive MoE (In Development)
 
-208M+ physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
+356M physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
 
 | Property | Value |
 |----------|-------|
-| Physical params | ~208M |
-| Active params/token | ~131M |
-| Effective params | ~790M+ |
+| Physical params | ~356M |
+| Active params/token | ~180M |
+| Effective params | ~2.1B |
 | Architecture | 3 blocks x 6 loops = 18 effective layers |
 | MoE | 12 experts (1 shared + 11 routed, top-2) |
 | Hidden dim | 1536 |
@@ -219,17 +219,17 @@
 **Parameter budget (v4):**
 
 ```
-  Token Embedding       101M  [===========================]             32.3%
-  MoE Routed (11)       119M  [================================]        38.1%
-  Dense FFN x3           57M  [===============]                         18.2%
-  Attention x3           28M  [========]                                 9.0%
-  Shared Expert x3        5M  [=]                                        1.5%
-  Adapters x18            1M  []                                         0.3%
-  Router + Loop Emb      <1M  []                                         0.1%
+  Token Embedding       101M  [====================]                    28.3%
+  MoE Routed (11)       156M  [================================]        43.7%
+  Dense FFN x3           57M  [============]                            15.9%
+  Attention x3           28M  [======]                                   7.9%
+  Shared Expert x3       14M  [===]                                      3.9%
+  Adapters x18            1M  []                                         0.2%
+  Router + Loop Emb      <1M  []                                         0.0%
   ─────────────────────────────────────────────────────────────────
-  Total Physical       ~208M
-  Active / Token       ~131M   (shared + 2 of 11 routed)
-  Effective            ~790M   (recursive x6)
+  Total Physical       ~356M
+  Active / Token       ~180M   (shared + 2 of 11 routed)
+  Effective            ~2.1B   (recursive x6)
 ```
 
 ### Per-Pass Residual Adapters

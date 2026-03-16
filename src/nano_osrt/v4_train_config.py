@@ -24,6 +24,8 @@ class V4PretrainConfig:
     weight_decay: float = 0.3
     grad_clip: float = 1.0
     log_interval: int = 50
+    eval_interval: int = 1_000
+    eval_steps: int = 20  # number of batches per eval
     ckpt_interval: int = 5_000
     optimizer_name: str = "lion"
 
@@ -53,7 +55,6 @@ class V4PretrainConfig:
                 {
                     "name": "codeparrot-clean",
                     "hf_id": "codeparrot/codeparrot-clean",
-                    "hf_config": "train",
                     "weight": 0.5,
                 },
             ],
@@ -67,12 +68,18 @@ class V4PretrainConfig:
                 {
                     "name": "fineweb-edu",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.55,
+                    "weight": 0.40,
                 },
                 {
                     "name": "codeparrot-clean",
                     "hf_id": "codeparrot/codeparrot-clean",
-                    "weight": 0.30,
+                    "weight": 0.25,
+                },
+                {
+                    "name": "peS2o",
+                    "hf_id": "allenai/peS2o",
+                    "hf_config": "v2",
+                    "weight": 0.20,
                 },
                 {
                     "name": "wikipedia",

@@ -111,6 +111,61 @@ def load_checkpoint(
     return start_step
 
 
+@torch.no_grad()
+def run_eval(
+    model: nn.Module,
+    tokenizer_name: str,
+    seq_len: int,
+    batch_size: int,
+    eval_steps: int,
+    device: torch.device,
+    real_vocab_size: int,
+) -> dict:
+    """Run evaluation on held-out data. Returns dict of metrics.
+
+    Uses a fixed-seed FineWeb-Edu stream so the same data is evaluated
+    every time, never overlapping with training data (different seed).
+    """
+    model.eval()
+
+    eval_loader = make_v4_loader(
+        dataset_configs=[
+            {"name": "fineweb-edu-eval", "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 1.0},
+        ],
+        seq_len=seq_len,
+        tokenizer_name=tokenizer_name,
+        batch_size=batch_size,
+        step_num=999999,  # fixed seed, never matches training seeds
+    )
+    eval_iter = iter(eval_loader)
+
+    total_loss = 0.0
+    total_tokens = 0
+
+    for _ in range(eval_steps):
+        try:
+            input_ids, labels = next(eval_iter)
+        except StopIteration:
+            break
+
+        input_ids = input_ids.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids, labels=labels)
+
+        n_tokens = (labels != -100).sum().item()
+        total_loss += outputs.loss.item() * n_tokens
+        total_tokens += n_tokens
+
+    model.train()
+
+    eval_loss = total_loss / max(total_tokens, 1)
+    perplexity = math.exp(min(eval_loss, 20.0))  # cap to avoid overflow
+
+    return {"eval/loss": eval_loss, "eval/perplexity": perplexity, "eval/tokens": total_tokens}
+
+
 def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig, vol, tokenizer_name: str) -> None:
     """Execute the v4 pre-training loop."""
     device = torch.device("cuda")
@@ -356,6 +411,21 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             if step % 25 == 24:
                 sys.stdout.write(f" [step {step}]\n")
                 sys.stdout.flush()
+
+        # --- Eval on held-out data ---
+        if step > 0 and step % train_cfg.eval_interval == 0:
+            eval_metrics = run_eval(
+                model, tokenizer_name, current_seq_len,
+                train_cfg.batch_size, train_cfg.eval_steps,
+                device, model_config.real_vocab_size,
+            )
+            print(
+                f"  EVAL step {step} | "
+                f"loss {eval_metrics['eval/loss']:.4f} | "
+                f"ppl {eval_metrics['eval/perplexity']:.1f}"
+            )
+            if use_wandb:
+                wandb.log(eval_metrics, step=step)
 
         # --- Checkpoints ---
         if step > 0 and step % train_cfg.ckpt_interval == 0:

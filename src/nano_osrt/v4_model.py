@@ -7,9 +7,9 @@ Loop-aware router with learned loop embeddings.
 
 HuggingFace-compatible from day one via PreTrainedModel.
 
-Physical params: ~208M (with 64K vocab)
-Active params/token: ~131M
-Effective params (recursive): ~790M
+Physical params: ~356M (with 64K vocab)
+Active params/token: ~180M
+Effective params (recursive): ~2.1B
 """
 
 import torch
@@ -374,6 +374,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         # Inter-loop normalization
         self.norm_loop = nn.RMSNorm(config.dim)
         self.norm_out = nn.RMSNorm(config.dim)
+
+        # Gradient checkpointing (disabled by default, enable for long sequences)
+        self.gradient_checkpointing = False
 
         self.post_init()
 

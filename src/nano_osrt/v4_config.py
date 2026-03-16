@@ -11,15 +11,12 @@ from transformers import PretrainedConfig
 class NanoOSRTv4Config(PretrainedConfig):
     """HuggingFace-compatible config for NanoOSRT v4.
 
-    Architecture: ~208M physical params, ~131M active per token,
-    ~790M effective via recursive weight sharing.
+    Architecture: ~356M physical params, ~180M active per token,
+    ~2.1B effective via recursive weight sharing.
 
-    Vocab reduced from 128K to 64K to rebalance parameter budget:
-    128K vocab with dim=1536 consumed 197M params (64% of model) in
-    embeddings alone. 64K vocab uses ~101M, freeing ~96M params
-    worth of capacity for transformer blocks and MoE experts.
-    Trade-off: slightly more tokens per sequence vs 128K, but far
-    better allocation of the overall parameter budget.
+    64K vocab with dim=1536 uses ~101M params for embeddings (28%
+    of model). The remaining 255M powers the transformer body
+    including attention, dense FFN, and MoE experts.
     """
 
     model_type = "nano-osrt-v4"

@@ -12,14 +12,14 @@ to dramatically increase model capacity while keeping active compute manageable.
 | Effective layers | 12 | 18 |
 | Dense FFN | Yes | Yes (kept) |
 | MoE FFN | No | 12 experts (1 shared + 11 routed, top-2) |
-| Physical params | 104.5M | ~220M |
-| Active params/token | 104.5M | ~140M |
-| Effective params (recursive) | ~302M | ~800M+ |
+| Physical params | 104.5M | ~356M |
+| Active params/token | 104.5M | ~180M |
+| Effective params (recursive) | ~302M | ~2.1B |
 | HRA (post-training) | +11M | +15-20M |
 | Hidden dim | 1280 | 1536 |
 | Attention heads | 20 | 24 |
 | Head dim | 64 | 64 |
-| Tokenizer | GPT-NeoX (50K) | Llama 3 style (32K) |
+| Tokenizer | GPT-NeoX (50K) | Custom 64K BPE |
 | Seq len (training) | 2048 → 4096 | 2048 → 4096 → 8192 |
 | Seq len (inference) | 4096 | 16K+ (RoPE scaling) |
 

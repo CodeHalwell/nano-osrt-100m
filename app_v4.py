@@ -105,10 +105,27 @@ def pretrain():
     from nano_osrt.v4_train import run_v4_training
     from nano_osrt.v4_train_config import V4PretrainConfig
 
+    # Force reload volume to avoid stale cache
+    import modal as _modal
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
     # Load custom tokenizer
     tokenizer_path = "/vol/tokenizer"
     tokenizer_name = tokenizer_path
+
+    # Debug: list what's on the volume
+    import os
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    # Sanity check — if tokenizer is wrong size, warn loudly
+    expected_vocab = 65536
+    if len(tok) != expected_vocab:
+        print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
+        print(f"  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
 
     model_config = NanoOSRTv4Config(
         vocab_size=len(tok),
