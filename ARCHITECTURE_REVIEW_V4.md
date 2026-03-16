@@ -20,9 +20,9 @@ The v4 architecture is a **well-designed novel model** that combines recursive w
 
 **File:** `v4_model.py:146-155`
 
-The current expert dispatch uses a nested Python loop over `top_k` × `num_routed` experts. For 11 experts with top-2 routing, this is **22 sequential expert forward passes per token**, each with masking overhead. This is the single biggest performance bottleneck and will make training extremely slow.
+In the pre-optimization baseline, the expert dispatch used a nested Python loop over `top_k` × `num_routed` experts. For 11 experts with top-2 routing, this is **22 sequential expert forward passes per token**, each with masking overhead. This was the single biggest performance bottleneck and would make training extremely slow.
 
-**Current (slow):**
+**Baseline (pre-optimization, slow):**
 ```python
 for k in range(self.top_k):           # 2 iterations
     for expert_idx in range(self.num_routed):  # 11 iterations
@@ -31,7 +31,7 @@ for k in range(self.top_k):           # 2 iterations
             expert_output = self.experts[expert_idx](expert_input)
 ```
 
-**Recommended — use grouped GEMM or at minimum batch by expert:**
+**Current in `v4_model.py` — batched scatter/gather dispatch (replaces nested-loop baseline):**
 ```python
 # Option A: Megablocks / grouped GEMM (fastest, requires triton kernel)
 # Option B: Scatter-gather pattern (no external dependency)
@@ -72,7 +72,7 @@ def _dispatch_experts(self, x_flat, indices, weights):
     return result
 ```
 
-This runs each expert exactly **once** per forward pass (batching all its assigned tokens), versus the current 22-iteration loop.
+This batched scatter/gather implementation runs each expert exactly **once** per forward pass (batching all its assigned tokens), instead of the 22-iteration nested-loop baseline.
 
 ### 1.2 `torch.tensor(loop_idx)` Creates a CPU Tensor Every Forward Pass
 
