@@ -181,12 +181,13 @@ class MoELayer(nn.Module):
 
         # Find token counts per expert
         expert_counts = torch.bincount(sorted_experts, minlength=self.num_routed)
+        expert_counts_list = expert_counts.tolist()
 
         # Run each expert once on its batch of tokens
         sorted_out = torch.empty_like(sorted_x)
         offset = 0
         for eid in range(self.num_routed):
-            count = expert_counts[eid].item()
+            count = expert_counts_list[eid]
             if count == 0:
                 continue
             expert_in = sorted_x[offset : offset + count]
