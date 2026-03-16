@@ -7,9 +7,9 @@ Loop-aware router with learned loop embeddings.
 
 HuggingFace-compatible from day one via PreTrainedModel.
 
-Physical params: ~157M (with 32K vocab)
-Active params/token: ~107M
-Effective params (recursive): ~640M
+Physical params: ~208M (with 64K vocab)
+Active params/token: ~131M
+Effective params (recursive): ~790M
 """
 
 import torch

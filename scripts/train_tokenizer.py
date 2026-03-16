@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a custom 32K SuperBPE tokenizer for NanoOSRT v4.
+"""Train a custom 64K SuperBPE tokenizer for NanoOSRT v4.
 
 Uses the SuperBPE two-stage process:
   Stage 1: Standard BPE with whitespace pretokenization (learns subwords)
@@ -296,8 +296,8 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train custom 32K tokenizer for NanoOSRT v4")
-    parser.add_argument("--vocab-size", type=int, default=32064, help="Target vocabulary size (32K default, padded to 64 for TC alignment)")
+    parser = argparse.ArgumentParser(description="Train custom 64K tokenizer for NanoOSRT v4")
+    parser.add_argument("--vocab-size", type=int, default=65536, help="Target vocabulary size (64K default, TC-aligned)")
     parser.add_argument("--sample-size", type=int, default=50_000_000, help="Training text size in chars (~50MB default)")
     parser.add_argument("--output", type=str, default="./tokenizer-v4", help="Output directory")
     parser.add_argument("--data-path", type=str, default=None, help="Pre-existing training text file (skip download)")
