@@ -172,23 +172,45 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         print("W&B logging enabled.")
 
     # ------------------------------------------------------------------
-    # Optimizer
+    # Optimizer — differential weight decay (router params get wd=0)
     # ------------------------------------------------------------------
+    # Router weights are sensitive to weight decay — too much decay pushes
+    # them toward zero, causing uniform routing (defeating MoE purpose).
+    # Separate into router params (wd=0) and everything else (full wd).
+    inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    router_params = []
+    other_params = []
+    for name, param in inner_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "router" in name or "loop_embeddings" in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    print(f"Param groups: {len(other_params)} standard, {len(router_params)} router (wd=0)")
+
     if train_cfg.optimizer_name.lower() == "lion":
         from lion_pytorch import Lion
         optimizer = Lion(
-            model.parameters(), lr=train_cfg.peak_lr, weight_decay=train_cfg.weight_decay
+            [
+                {"params": other_params, "weight_decay": train_cfg.weight_decay},
+                {"params": router_params, "weight_decay": 0.0},
+            ],
+            lr=train_cfg.peak_lr,
         )
-        print(f"Using Lion (wd={train_cfg.weight_decay})")
+        print(f"Using Lion (wd={train_cfg.weight_decay}, router_wd=0.0)")
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            [
+                {"params": other_params, "weight_decay": train_cfg.weight_decay},
+                {"params": router_params, "weight_decay": 0.0},
+            ],
             lr=train_cfg.peak_lr,
-            weight_decay=train_cfg.weight_decay,
             betas=(0.9, 0.95),
             eps=1e-8,
         )
-        print(f"Using AdamW (wd={train_cfg.weight_decay})")
+        print(f"Using AdamW (wd={train_cfg.weight_decay}, router_wd=0.0)")
 
     # ------------------------------------------------------------------
     # Checkpoint resume

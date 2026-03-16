@@ -11,8 +11,13 @@ from transformers import PretrainedConfig
 class NanoOSRTv4Config(PretrainedConfig):
     """HuggingFace-compatible config for NanoOSRT v4.
 
-    Architecture: 305M physical params, ~155M active per token,
-    ~930M effective via recursive weight sharing.
+    Architecture: ~157M physical params, ~107M active per token,
+    ~640M effective via recursive weight sharing.
+
+    Vocab reduced from 128K to 32K to rebalance parameter budget:
+    128K vocab with dim=1536 consumed 197M params (64% of model) in
+    embeddings alone. 32K vocab uses ~49M, freeing capacity for the
+    actual transformer blocks and MoE experts.
     """
 
     model_type = "nano-osrt-v4"
@@ -23,8 +28,8 @@ class NanoOSRTv4Config(PretrainedConfig):
         dim: int = 1536,
         heads: int = 24,
         head_dim: int = 64,
-        vocab_size: int = 128256,  # Llama 3 tokenizer (padded to 64)
-        real_vocab_size: int = 128256,
+        vocab_size: int = 32064,   # 32K vocab — optimal for 305M param budget
+        real_vocab_size: int = 32064,
 
         # Recursive structure
         num_blocks: int = 3,
@@ -42,6 +47,7 @@ class NanoOSRTv4Config(PretrainedConfig):
         top_k_experts: int = 2,
         expert_hidden: int = 1024,
         router_aux_loss_coeff: float = 0.01,
+        router_z_loss_coeff: float = 0.001,
 
         # Sequence length
         max_position_embeddings: int = 8192,
@@ -87,6 +93,7 @@ class NanoOSRTv4Config(PretrainedConfig):
         self.top_k_experts = top_k_experts
         self.expert_hidden = expert_hidden
         self.router_aux_loss_coeff = router_aux_loss_coeff
+        self.router_z_loss_coeff = router_z_loss_coeff
 
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta

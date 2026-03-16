@@ -7,15 +7,16 @@ Loop-aware router with learned loop embeddings.
 
 HuggingFace-compatible from day one via PreTrainedModel.
 
-Physical params: ~305M
-Active params/token: ~155M
-Effective params (recursive): ~930M
+Physical params: ~157M (with 32K vocab)
+Active params/token: ~107M
+Effective params (recursive): ~640M
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -76,8 +77,10 @@ class MoELayer(nn.Module):
         - 1 shared expert (always active, unconditional)
         - N routed experts (top-k selected per token)
         - Loop-aware router: receives hidden state + loop embedding
+        - Sigmoid gating (DeepSeek-V3 style) for independent expert scores
+        - Batched scatter-gather dispatch (each expert runs once per forward)
 
-    Load balancing via auxiliary loss to prevent expert collapse.
+    Load balancing via auxiliary loss + router z-loss to prevent expert collapse.
     """
 
     def __init__(self, config: NanoOSRTv4Config) -> None:
@@ -86,6 +89,7 @@ class MoELayer(nn.Module):
         self.top_k = config.top_k_experts
         self.num_loops = config.recursive_loops
         self.aux_loss_coeff = config.router_aux_loss_coeff
+        self.z_loss_coeff = config.router_z_loss_coeff
 
         # Shared expert (always active)
         self.shared_expert = ExpertFFN(config.dim, config.expert_hidden)
@@ -99,6 +103,11 @@ class MoELayer(nn.Module):
         # Loop-aware: concatenates a learned loop embedding
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
         self.router = nn.Linear(config.dim * 2, self.num_routed, bias=False)
+
+        # Pre-register loop index tensors to avoid torch.tensor() in forward
+        self.register_buffer(
+            "loop_indices", torch.arange(config.recursive_loops), persistent=False
+        )
 
         # Store aux loss for training
         self.aux_loss: Tensor | None = None
@@ -118,46 +127,84 @@ class MoELayer(nn.Module):
         # Shared expert (unconditional)
         shared_out = self.shared_expert(x)
 
-        # Loop-aware routing
+        # Loop-aware routing with cached index tensor
         loop_emb = self.loop_embeddings(
-            torch.tensor(loop_idx, device=x.device)
+            self.loop_indices[loop_idx]
         ).unsqueeze(0).unsqueeze(0).expand(B, S, -1)  # (B, S, dim)
 
         router_input = torch.cat([x, loop_emb], dim=-1)  # (B, S, 2*dim)
         router_logits = self.router(router_input)  # (B, S, num_routed)
-        router_probs = F.softmax(router_logits, dim=-1)
 
-        # Top-k selection
-        top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        # Renormalize top-k weights
-        top_k_weights = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        # Sigmoid gating: each expert gate is independent (DeepSeek-V3 style)
+        router_probs = torch.sigmoid(router_logits)
 
-        # Compute auxiliary load balancing loss
+        # Top-k selection (no renormalization needed with sigmoid)
+        top_k_weights, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+
+        # Compute auxiliary load balancing loss + z-loss
         if self.training:
-            self._compute_aux_loss(router_probs, top_k_indices, B, S)
+            self._compute_aux_loss(router_logits, router_probs, top_k_indices, B, S)
 
-        # Dispatch to selected experts
-        # For small models, simple loop is fine (no expert parallelism needed)
-        routed_out = torch.zeros_like(x)
-        flat_x = x.reshape(-1, D)  # (B*S, D)
-        flat_indices = top_k_indices.reshape(-1, self.top_k)  # (B*S, top_k)
-        flat_weights = top_k_weights.reshape(-1, self.top_k)  # (B*S, top_k)
+        # Batched scatter-gather dispatch: each expert runs exactly once
+        routed_out = self._dispatch_experts(
+            x.reshape(-1, D), top_k_indices.reshape(-1, self.top_k),
+            top_k_weights.reshape(-1, self.top_k), D,
+        )
 
-        for k in range(self.top_k):
-            expert_indices = flat_indices[:, k]  # (B*S,)
-            expert_weights = flat_weights[:, k]  # (B*S,)
+        return shared_out + routed_out.view(B, S, D)
 
-            for expert_idx in range(self.num_routed):
-                mask = expert_indices == expert_idx  # (B*S,)
-                if mask.any():
-                    expert_input = flat_x[mask]  # (num_tokens, D)
-                    expert_output = self.experts[expert_idx](expert_input)
-                    routed_out.view(-1, D)[mask] += expert_weights[mask].unsqueeze(-1) * expert_output
+    def _dispatch_experts(
+        self, flat_x: Tensor, flat_indices: Tensor, flat_weights: Tensor, D: int,
+    ) -> Tensor:
+        """Batch tokens by expert, run each expert once, scatter back.
 
-        return shared_out + routed_out
+        Instead of looping over top_k × num_experts (22 iterations), this
+        sorts tokens by expert assignment and runs each expert on its full
+        batch in a single call.
+        """
+        N = flat_x.shape[0]  # B*S
 
-    def _compute_aux_loss(self, router_probs: Tensor, top_k_indices: Tensor, B: int, S: int) -> None:
-        """Compute load balancing auxiliary loss (Switch Transformer style)."""
+        # Expand for top-k: each token appears top_k times
+        x_rep = flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*top_k, D)
+        idx_flat = flat_indices.reshape(-1)        # (N*top_k,)
+        w_flat = flat_weights.reshape(-1, 1)       # (N*top_k, 1)
+
+        # Sort by expert for batched execution
+        sorted_order = idx_flat.argsort(stable=True)
+        sorted_experts = idx_flat[sorted_order]
+        sorted_x = x_rep[sorted_order]
+        sorted_w = w_flat[sorted_order]
+
+        # Find token counts per expert
+        expert_counts = torch.bincount(sorted_experts, minlength=self.num_routed)
+
+        # Run each expert once on its batch of tokens
+        sorted_out = torch.empty_like(sorted_x)
+        offset = 0
+        for eid in range(self.num_routed):
+            count = expert_counts[eid].item()
+            if count == 0:
+                continue
+            expert_in = sorted_x[offset : offset + count]
+            sorted_out[offset : offset + count] = self.experts[eid](expert_in) * sorted_w[offset : offset + count]
+            offset += count
+
+        # Unsort and reduce across top-k
+        result = torch.zeros_like(x_rep)
+        result[sorted_order] = sorted_out
+        # Sum over the top_k dimension
+        result = result.view(N, self.top_k, D).sum(dim=1)
+        return result
+
+    def _compute_aux_loss(
+        self, router_logits: Tensor, router_probs: Tensor,
+        top_k_indices: Tensor, B: int, S: int,
+    ) -> None:
+        """Compute load balancing auxiliary loss + router z-loss.
+
+        Load balancing (Switch Transformer style): encourages uniform routing.
+        Z-loss (ST-MoE / PaLM): penalises large router logits for stability.
+        """
         # Fraction of tokens routed to each expert
         one_hot = F.one_hot(top_k_indices, self.num_routed).float()  # (B, S, top_k, num_routed)
         tokens_per_expert = one_hot.sum(dim=(0, 1, 2))  # (num_routed,)
@@ -166,8 +213,13 @@ class MoELayer(nn.Module):
         # Average router probability per expert
         avg_prob = router_probs.mean(dim=(0, 1))  # (num_routed,)
 
-        # Auxiliary loss: encourages uniform routing
-        self.aux_loss = self.num_routed * (fraction_routed * avg_prob).sum()
+        # Load balancing loss
+        load_balance_loss = self.num_routed * (fraction_routed * avg_prob).sum()
+
+        # Router z-loss: penalise large logits to prevent overconfident routing
+        z_loss = router_logits.logsumexp(dim=-1).pow(2).mean()
+
+        self.aux_loss = load_balance_loss + self.z_loss_coeff * z_loss
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────
@@ -216,6 +268,11 @@ class RecursiveBlockV4(nn.Module):
         self.norm_moe = nn.RMSNorm(config.dim)
         self.moe = MoELayer(config)
 
+        # Learnable gates for parallel dense + MoE residual scaling
+        # Initialised to 0.5 so combined contribution starts at 1.0×
+        self.dense_gate = nn.Parameter(torch.tensor(0.5))
+        self.moe_gate = nn.Parameter(torch.tensor(0.5))
+
     def forward(
         self,
         x: Tensor,
@@ -249,10 +306,10 @@ class RecursiveBlockV4(nn.Module):
 
         x = x_mod + self.out_proj(attn_out)
 
-        # ── Parallel Dense + MoE FFN ──
+        # ── Parallel Dense + MoE FFN with learnable scaling ──
         h_dense = self.ffn_dense(self.norm_dense(x))
         h_moe = self.moe(self.norm_moe(x), loop_idx)
-        x = x + h_dense + h_moe
+        x = x + self.dense_gate * h_dense + self.moe_gate * h_moe
 
         return x
 
@@ -327,17 +384,31 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         loop_rms: list[Tensor] = []
         total_aux_loss = torch.tensor(0.0, device=x.device)
 
+        use_ckpt = self.gradient_checkpointing and self.training
+
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
-                x = block(
-                    x,
-                    self.adapters_a[idx],
-                    self.adapters_b[idx],
-                    self.adapter_scale,
-                    cos, sin,
-                    loop_idx=loop,
-                )
+                if use_ckpt:
+                    x = gradient_checkpoint(
+                        block,
+                        x,
+                        self.adapters_a[idx],
+                        self.adapters_b[idx],
+                        self.adapter_scale,
+                        cos, sin,
+                        loop,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = block(
+                        x,
+                        self.adapters_a[idx],
+                        self.adapters_b[idx],
+                        self.adapter_scale,
+                        cos, sin,
+                        loop_idx=loop,
+                    )
                 # Accumulate MoE auxiliary loss
                 if block.moe.aux_loss is not None:
                     total_aux_loss = total_aux_loss + block.moe.aux_loss
