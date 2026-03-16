@@ -23,6 +23,8 @@ Usage:
 
 import argparse
 import os
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -195,9 +197,8 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
     t0 = time.time()
 
     os.makedirs(output_dir, exist_ok=True)
-    import subprocess
     subprocess.run(
-        ["python", "-m", "superbpe.train",
+        [sys.executable, "-m", "superbpe.train",
          "--input", data_path,
          "--vocab_size", str(subword_vocab),
          "--output", f"{output_dir}/stage1",
@@ -210,7 +211,7 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
     print(f"  Stage 2: SuperBPE extension to {vocab_size:,}...")
     t0 = time.time()
     subprocess.run(
-        ["python", "-m", "superbpe.extend",
+        [sys.executable, "-m", "superbpe.extend",
          "--input", data_path,
          "--base_tokenizer", f"{output_dir}/stage1",
          "--vocab_size", str(vocab_size),
@@ -221,7 +222,7 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
 
     # Convert to HF format
     subprocess.run(
-        ["python", "-m", "superbpe.construct_hf_tokenizer",
+        [sys.executable, "-m", "superbpe.construct_hf_tokenizer",
          "--tokenizer_path", f"{output_dir}/final",
          "--output_path", output_dir],
         check=True,

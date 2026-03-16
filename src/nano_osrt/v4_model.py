@@ -88,7 +88,6 @@ class MoELayer(nn.Module):
         self.num_routed = config.num_routed_experts
         self.top_k = config.top_k_experts
         self.num_loops = config.recursive_loops
-        self.aux_loss_coeff = config.router_aux_loss_coeff
         self.z_loss_coeff = config.router_z_loss_coeff
 
         # Shared expert (always active)
@@ -109,8 +108,9 @@ class MoELayer(nn.Module):
             "loop_indices", torch.arange(config.recursive_loops), persistent=False
         )
 
-        # Store aux loss for training
-        self.aux_loss: Tensor | None = None
+        # Store losses for training (load-balance and z-loss kept separate)
+        self.load_balance_loss: Tensor | None = None
+        self.z_loss: Tensor | None = None
 
     def forward(self, x: Tensor, loop_idx: int) -> Tensor:
         """Forward pass through MoE.
@@ -123,6 +123,10 @@ class MoELayer(nn.Module):
             Output tensor (B, S, dim).
         """
         B, S, D = x.shape
+
+        # Reset losses at start of every forward (prevents stale values in eval)
+        self.load_balance_loss = None
+        self.z_loss = None
 
         # Shared expert (unconditional)
         shared_out = self.shared_expert(x)
@@ -141,9 +145,9 @@ class MoELayer(nn.Module):
         # Top-k selection (no renormalization needed with sigmoid)
         top_k_weights, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
 
-        # Compute auxiliary load balancing loss + z-loss
+        # Compute load balancing + z-loss (kept separate for independent scaling)
         if self.training:
-            self._compute_aux_loss(router_logits, router_probs, top_k_indices, B, S)
+            self._compute_losses(router_logits, router_probs, top_k_indices, B, S)
 
         # Batched scatter-gather dispatch: each expert runs exactly once
         routed_out = self._dispatch_experts(
@@ -196,14 +200,17 @@ class MoELayer(nn.Module):
         result = result.view(N, self.top_k, D).sum(dim=1)
         return result
 
-    def _compute_aux_loss(
+    def _compute_losses(
         self, router_logits: Tensor, router_probs: Tensor,
         top_k_indices: Tensor, B: int, S: int,
     ) -> None:
-        """Compute load balancing auxiliary loss + router z-loss.
+        """Compute load balancing loss and router z-loss (stored separately).
 
         Load balancing (Switch Transformer style): encourages uniform routing.
         Z-loss (ST-MoE / PaLM): penalises large router logits for stability.
+
+        Losses are stored on separate attributes so the training loss can
+        apply router_aux_loss_coeff and router_z_loss_coeff independently.
         """
         # Fraction of tokens routed to each expert
         one_hot = F.one_hot(top_k_indices, self.num_routed).float()  # (B, S, top_k, num_routed)
@@ -214,12 +221,10 @@ class MoELayer(nn.Module):
         avg_prob = router_probs.mean(dim=(0, 1))  # (num_routed,)
 
         # Load balancing loss
-        load_balance_loss = self.num_routed * (fraction_routed * avg_prob).sum()
+        self.load_balance_loss = self.num_routed * (fraction_routed * avg_prob).sum()
 
         # Router z-loss: penalise large logits to prevent overconfident routing
-        z_loss = router_logits.logsumexp(dim=-1).pow(2).mean()
-
-        self.aux_loss = load_balance_loss + self.z_loss_coeff * z_loss
+        self.z_loss = router_logits.logsumexp(dim=-1).pow(2).mean()
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────
@@ -370,11 +375,11 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
 
         self.post_init()
 
-    def forward(self, input_ids: Tensor, **kwargs) -> tuple[Tensor, list[Tensor], Tensor]:
+    def forward(self, input_ids: Tensor, **kwargs) -> tuple[Tensor, list[Tensor], Tensor, Tensor]:
         """Forward pass.
 
         Returns:
-            (hidden_states, loop_rms_list, total_aux_loss)
+            (hidden_states, loop_rms_list, total_load_balance_loss, total_z_loss)
         """
         x = self.embedding(input_ids)
         S = input_ids.shape[1]
@@ -382,43 +387,47 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         sin = self.rope_sin[:, :S, :, :]
 
         loop_rms: list[Tensor] = []
-        total_aux_loss = torch.tensor(0.0, device=x.device)
+        total_lb_loss = torch.tensor(0.0, device=x.device)
+        total_z_loss = torch.tensor(0.0, device=x.device)
 
         use_ckpt = self.gradient_checkpointing and self.training
 
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
+                adapter_a = self.adapters_a[idx]
+                adapter_b = self.adapters_b[idx]
                 if use_ckpt:
+                    # Wrap in closure to capture non-tensor args (adapter_scale,
+                    # loop_idx) — gradient_checkpoint only accepts tensor inputs.
+                    def _block_fn(
+                        _x, _a, _b, _cos, _sin,
+                        _block=block, _scale=self.adapter_scale, _loop=loop,
+                    ):
+                        return _block(_x, _a, _b, _scale, _cos, _sin, _loop)
+
                     x = gradient_checkpoint(
-                        block,
-                        x,
-                        self.adapters_a[idx],
-                        self.adapters_b[idx],
-                        self.adapter_scale,
-                        cos, sin,
-                        loop,
+                        _block_fn, x, adapter_a, adapter_b, cos, sin,
                         use_reentrant=False,
                     )
                 else:
                     x = block(
-                        x,
-                        self.adapters_a[idx],
-                        self.adapters_b[idx],
-                        self.adapter_scale,
-                        cos, sin,
+                        x, adapter_a, adapter_b,
+                        self.adapter_scale, cos, sin,
                         loop_idx=loop,
                     )
-                # Accumulate MoE auxiliary loss
-                if block.moe.aux_loss is not None:
-                    total_aux_loss = total_aux_loss + block.moe.aux_loss
+                # Accumulate MoE losses (kept separate for independent scaling)
+                if block.moe.load_balance_loss is not None:
+                    total_lb_loss = total_lb_loss + block.moe.load_balance_loss
+                if block.moe.z_loss is not None:
+                    total_z_loss = total_z_loss + block.moe.z_loss
 
             loop_rms.append(x.float().pow(2).mean().sqrt())
             if loop < self.config.recursive_loops - 1:
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
-        return x, loop_rms, total_aux_loss
+        return x, loop_rms, total_lb_loss, total_z_loss
 
 
 class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
@@ -445,7 +454,7 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
         labels: Tensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden, loop_rms, aux_loss = self.model(input_ids)
+        hidden, loop_rms, lb_loss, z_loss = self.model(input_ids)
 
         # Weight-tied LM head
         logits = F.linear(hidden, self.model.embedding.weight)
@@ -459,8 +468,14 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # Add MoE auxiliary loss during training
-            loss = loss + self.config.router_aux_loss_coeff * aux_loss
+            # MoE losses scaled independently:
+            #   load-balance at router_aux_loss_coeff  (default 0.01)
+            #   z-loss at router_z_loss_coeff          (default 0.001)
+            loss = (
+                loss
+                + self.config.router_aux_loss_coeff * lb_loss
+                + self.config.router_z_loss_coeff * z_loss
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,

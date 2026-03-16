@@ -16,9 +16,10 @@ class NanoOSRTv4Config(PretrainedConfig):
 
     Vocab reduced from 128K to 64K to rebalance parameter budget:
     128K vocab with dim=1536 consumed 197M params (64% of model) in
-    embeddings alone. 64K vocab uses ~101M — still substantial but
-    a reasonable trade-off for better tokenisation quality (fewer
-    tokens per sequence = more effective context).
+    embeddings alone. 64K vocab uses ~101M, freeing ~96M params
+    worth of capacity for transformer blocks and MoE experts.
+    Trade-off: slightly more tokens per sequence vs 128K, but far
+    better allocation of the overall parameter budget.
     """
 
     model_type = "nano-osrt-v4"
