@@ -43,7 +43,7 @@ class V4PretrainConfig:
     phases: dict = {  # noqa: RUF012
         "foundation": {
             "start": 0,
-            "end": 15_000,
+            "end": 10_000,
             "seq_len": 2048,
             "grad_accum_steps": 8,
             "datasets": [
@@ -60,32 +60,27 @@ class V4PretrainConfig:
             ],
         },
         "knowledge": {
-            "start": 15_000,
+            "start": 10_000,
             "end": 250_000,
             "seq_len": 4096,
-            "grad_accum_steps": 8,
+            "batch_size": 4,
+            "grad_accum_steps": 16,
             "datasets": [
                 {
                     "name": "fineweb-edu",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.40,
+                    "weight": 0.50,
                 },
                 {
                     "name": "codeparrot-clean",
                     "hf_id": "codeparrot/codeparrot-clean",
-                    "weight": 0.25,
-                },
-                {
-                    "name": "peS2o",
-                    "hf_id": "allenai/peS2o",
-                    "hf_config": "v2",
-                    "weight": 0.20,
+                    "weight": 0.30,
                 },
                 {
                     "name": "wikipedia",
                     "hf_id": "wikimedia/wikipedia",
                     "hf_config": "20231101.en",
-                    "weight": 0.15,
+                    "weight": 0.20,
                 },
             ],
         },
@@ -93,7 +88,8 @@ class V4PretrainConfig:
             "start": 250_000,
             "end": 300_000,
             "seq_len": 8192,
-            "grad_accum_steps": 4,  # halved for VRAM
+            "batch_size": 2,
+            "grad_accum_steps": 32,  # halved for VRAM
             "datasets": [
                 {
                     "name": "smoltalk",

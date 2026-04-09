@@ -308,9 +308,20 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             current_phase = phase_name
             current_seq_len = phase_cfg["seq_len"]
             grad_accum = phase_cfg.get("grad_accum_steps", train_cfg.grad_accum_steps)
+            current_batch_size = phase_cfg.get("batch_size", train_cfg.batch_size)
 
-            print(f"\n>>> Phase: {current_phase} | seq_len: {current_seq_len} | Step: {step}")
+            print(f"\n>>> Phase: {current_phase} | seq_len: {current_seq_len} | "
+                  f"batch: {current_batch_size} | accum: {grad_accum} | Step: {step}")
             print(f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}")
+
+            # Enable gradient checkpointing for long sequences
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            if hasattr(inner, "model") and hasattr(inner.model, "gradient_checkpointing"):
+                if current_seq_len >= 4096:
+                    inner.model.gradient_checkpointing = True
+                    print(f"    Gradient checkpointing: ENABLED")
+                else:
+                    inner.model.gradient_checkpointing = False
 
             if current_loader is not None:
                 del current_loader
@@ -319,7 +330,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                 phase_cfg["datasets"],
                 current_seq_len,
                 tokenizer_name,
-                train_cfg.batch_size,
+                current_batch_size,
                 step,
             )
             loader_iter = iter(current_loader)
@@ -350,7 +361,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                     p_cfg["datasets"],
                     p_cfg["seq_len"],
                     tokenizer_name,
-                    train_cfg.batch_size,
+                    p_cfg.get("batch_size", train_cfg.batch_size),
                     step,
                 )
                 loader_iter = iter(current_loader)
@@ -384,7 +395,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             vram_gb = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
 
-            eff_batch = train_cfg.batch_size * grad_accum
+            eff_batch = current_batch_size * grad_accum
             tok_per_sec = eff_batch * current_seq_len / max(elapsed / max(step - start_step, 1), 1e-8)
 
             print(
