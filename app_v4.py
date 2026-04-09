@@ -61,7 +61,7 @@ def train_tokenizer():
     import sys
     sys.path.insert(0, "/root")
 
-    from scripts.train_tokenizer import sample_training_data, train_with_hf_tokenizers, _verify_tokenizer
+    from scripts.train_tokenizer import sample_training_data, train_with_hf_tokenizers
 
     print("=" * 60)
     print("NanoOSRT v4 — Custom 64K Tokenizer Training")
@@ -79,7 +79,7 @@ def train_tokenizer():
     import os
     os.remove(data_path)
 
-    print(f"\nTokenizer saved to Modal volume 'osrt-v4-tokenizer'")
+    print("\nTokenizer saved to Modal volume 'osrt-v4-tokenizer'")
 
 
 # =============================================================================
@@ -99,14 +99,13 @@ def train_tokenizer():
 )
 def pretrain():
     """Run v4 pre-training with progressive seq_len curriculum."""
+    # Force reload volume to avoid stale cache
+    import modal as _modal
     from transformers import AutoTokenizer
 
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_train import run_v4_training
     from nano_osrt.v4_train_config import V4PretrainConfig
-
-    # Force reload volume to avoid stale cache
-    import modal as _modal
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
 
@@ -125,7 +124,7 @@ def pretrain():
     expected_vocab = 65536
     if len(tok) != expected_vocab:
         print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
-        print(f"  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
+        print("  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
 
     model_config = NanoOSRTv4Config(
         vocab_size=len(tok),
@@ -206,10 +205,8 @@ def sft():
 def grpo():
     """Run GRPO with verifiable math rewards."""
     import copy
-    import glob
     import math
     import os
-    import sys
     import time
 
     import torch
@@ -222,11 +219,11 @@ def grpo():
     except ImportError:
         wandb = None
 
+    from nano_osrt.hra import get_param_groups, inject_hra
+    from nano_osrt.rewards import compute_group_advantages, compute_reward
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
     from nano_osrt.v4_train_config import V4GRPOConfig
-    from nano_osrt.rewards import compute_group_advantages, compute_reward
-    from nano_osrt.hra import inject_hra, get_param_groups
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -486,9 +483,9 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
     """Run lm-evaluation-harness benchmarks."""
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
-    from lm_eval.api.model import LM
     from lm_eval import evaluator
+    from lm_eval.api.model import LM
+    from transformers import AutoTokenizer
 
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
@@ -511,7 +508,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
             self.model = NanoOSRTv4ForCausalLM(model_config).to("cuda")
 
             # Load latest checkpoint
-            import glob, os
+            import os
             ckpt_dir = "/vol/checkpoints/v4"
             # Priority: grpo_final > sft_final > final
             for name in ["osrt_v4_grpo_final.pt", "osrt_v4_sft_final.pt", "osrt_v4_final.pt"]:

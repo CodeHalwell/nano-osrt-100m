@@ -51,7 +51,6 @@ def generate_completions(
     Uses top-p sampling at the configured temperature.
     Returns a list of token tensors (prompt + completion).
     """
-    device = prompt_ids.device
     completions = []
 
     for _ in range(cfg.group_size):

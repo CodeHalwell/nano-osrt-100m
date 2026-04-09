@@ -125,7 +125,7 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     print(f"Max tokens per step : {tok_per_step:,}")
     print(f"Total SFT steps     : {cfg.total_steps}")
     print(f"Optimizer           : {cfg.optimizer_name}")
-    print(f"Chat format         : user/assistant with <think>...</think>")
+    print("Chat format         : user/assistant with <think>...</think>")
     print()
 
     # ------------------------------------------------------------------

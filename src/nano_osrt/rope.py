@@ -22,6 +22,8 @@ def compute_rope_freqs(
         ``(cos, sin)`` each of shape ``(1, seq_len, 1, dim)`` for
         broadcasting with ``(B, S, heads, head_dim)`` tensors.
     """
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE requires even dimension, got dim={dim}")
     freqs = 1.0 / (
         theta
         ** (

@@ -21,7 +21,6 @@ import time
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     import wandb
@@ -29,8 +28,8 @@ except ImportError:
     wandb = None
 
 from nano_osrt.v4_config import NanoOSRTv4Config
-from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
 from nano_osrt.v4_data import make_v4_loader
+from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
 from nano_osrt.v4_train_config import V4PretrainConfig
 
 
@@ -98,7 +97,7 @@ def load_checkpoint(
     missing, unexpected = inner.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing:
         print(f"  Missing keys: {len(missing)}")
-        print(f"  Skipping optimizer state (parameter count changed)")
+        print("  Skipping optimizer state (parameter count changed)")
     else:
         try:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -320,7 +319,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             if hasattr(inner, "model") and hasattr(inner.model, "gradient_checkpointing"):
                 if current_seq_len >= 4096:
                     inner.model.gradient_checkpointing = True
-                    print(f"    Gradient checkpointing: ENABLED")
+                    print("    Gradient checkpointing: ENABLED")
                 else:
                     inner.model.gradient_checkpointing = False
 
@@ -346,7 +345,6 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
 
         optimizer.zero_grad(set_to_none=True)
         accum_loss = torch.tensor(0.0, device=device)
-        last_loop_rms = None
 
         if step == start_step:
             print("Fetching first batch...")

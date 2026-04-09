@@ -22,7 +22,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nano_osrt.v4_config import NanoOSRTv4Config
 
-
 # ── RoPE ────────────────────────────────────────────────────────────────
 
 
@@ -33,6 +32,8 @@ def compute_rope_freqs(
     device: torch.device | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Pre-compute RoPE cos/sin tensors. Shape: (1, seq_len, 1, dim)."""
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE requires even dimension, got dim={dim}")
     freqs = 1.0 / (
         theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim)
     )
@@ -518,8 +519,9 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-                cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_mask = cumprobs - F.softmax(sorted_logits, dim=-1) >= top_p
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_mask = cumprobs - sorted_probs >= top_p
                 sorted_logits[sorted_mask] = float("-inf")
                 next_logits.scatter_(1, sorted_indices, sorted_logits)
 

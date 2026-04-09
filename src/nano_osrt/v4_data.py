@@ -7,7 +7,6 @@ Handles:
 - Instruction format handling (messages column)
 """
 
-import itertools
 import random
 
 import torch

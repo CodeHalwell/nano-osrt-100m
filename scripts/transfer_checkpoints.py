@@ -25,8 +25,6 @@ Usage:
 
 import argparse
 import os
-import sys
-
 
 LOCAL_DIR = "./transfer"
 CKPT_VOL = "osrt-v4-checkpoints"
@@ -101,7 +99,6 @@ def download(args):
                 full_remote = f"{prefix}{path}" if prefix else path
                 local_path = f"{LOCAL_DIR}/checkpoints/{prefix}{path}"
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                size_before = 0
                 print(f"  Downloading {full_remote}...")
                 with open(local_path, "wb") as f:
                     for chunk in ckpt_vol.read_file(full_remote):
@@ -126,7 +123,7 @@ def download(args):
 
     print(f"\nAll files saved to {LOCAL_DIR}/")
     print("Now switch Modal accounts with: modal token new")
-    print(f"Then run: uv run python scripts/transfer_checkpoints.py upload")
+    print("Then run: uv run python scripts/transfer_checkpoints.py upload")
 
 
 def upload(args):
@@ -169,8 +166,8 @@ def upload(args):
         ckpt_vol.commit()
         print("  Checkpoints uploaded.")
 
-    print(f"\nTransfer complete. You can now run:")
-    print(f"  uv run modal run --detach app_v4.py --stage pretrain")
+    print("\nTransfer complete. You can now run:")
+    print("  uv run modal run --detach app_v4.py --stage pretrain")
 
 
 def status(args):

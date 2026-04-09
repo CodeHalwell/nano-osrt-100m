@@ -113,8 +113,9 @@ def generate_stream(
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-                cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_mask = cumprobs - torch.softmax(sorted_logits, dim=-1) >= top_p
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_mask = cumprobs - sorted_probs >= top_p
                 sorted_logits[sorted_mask] = float("-inf")
                 next_logits.scatter_(1, sorted_indices, sorted_logits)
 
@@ -189,13 +190,13 @@ def create_demo():
                 )
 
                 gr.Markdown(
-                    f"### Model Info\n"
+                    "### Model Info\n"
                     f"- **Device:** {DEVICE}\n"
-                    f"- **Parameters:** 115,744,256\n"
-                    f"- **Architecture:** 2 blocks x 6 loops\n"
-                    f"- **Context:** 4096 tokens\n"
+                    f"- **Parameters:** {sum(p.numel() for p in MODEL.parameters()):,}\n"
+                    "- **Architecture:** 2 blocks x 6 loops\n"
+                    "- **Context:** 4096 tokens\n"
                     f"- **Sliding window:** {MAX_CONTEXT_TOKENS} tokens\n"
-                    f"- **Format:** `<think>...</think>`\n"
+                    "- **Format:** `<think>...</think>`\n"
                 )
 
         gr.Examples(
