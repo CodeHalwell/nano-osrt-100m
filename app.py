@@ -234,7 +234,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
 
             import copy
             ckpt = torch.load("/vol/checkpoints/osrt100m_code_final.pt",
-                              map_location="cuda", weights_only=False)
+                              map_location="cuda", weights_only=True)
             state_dict = ckpt.get("model_state_dict", ckpt)
             self.model.load_state_dict(state_dict, strict=False)
             self.model = self.model.to("cuda")

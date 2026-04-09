@@ -14,7 +14,10 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        if config.n_embd % config.n_head != 0:
+            raise ValueError(
+                f"n_embd ({config.n_embd}) must be divisible by n_head ({config.n_head})"
+            )
 
         # key, query, value projections (packed together for efficiency)
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -152,9 +155,10 @@ class NanoOSRT(nn.Module):
             are returned for efficiency.
         """
         B, T = idx.size()
-        assert T <= self.config.block_size, (
-            f"Sequence length {T} exceeds block_size {self.config.block_size}"
-        )
+        if T > self.config.block_size:
+            raise ValueError(
+                f"Sequence length {T} exceeds block_size {self.config.block_size}"
+            )
 
         device = idx.device
         pos = torch.arange(0, T, dtype=torch.long, device=device)

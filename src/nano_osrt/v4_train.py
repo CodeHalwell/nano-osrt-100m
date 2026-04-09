@@ -93,7 +93,7 @@ def load_checkpoint(
     if not os.path.exists(path):
         return 0
     print(f"Resuming from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     missing, unexpected = inner.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing:
@@ -299,6 +299,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
     current_loader = None
     loader_iter = None
     current_seq_len = 2048
+    current_batch_size = train_cfg.batch_size
 
     while step < train_cfg.total_steps:
         phase_name, phase_cfg = get_phase(step, train_cfg)
@@ -337,6 +338,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
         else:
             grad_accum = phase_cfg.get("grad_accum_steps", train_cfg.grad_accum_steps)
+            current_batch_size = phase_cfg.get("batch_size", train_cfg.batch_size)
 
         lr = get_lr(step, train_cfg)
         for pg in optimizer.param_groups:

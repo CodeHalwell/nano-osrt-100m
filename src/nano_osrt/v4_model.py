@@ -218,15 +218,16 @@ class MoELayer(nn.Module):
         tokens_per_expert = one_hot.sum(dim=(0, 1, 2))  # (num_routed,)
         fraction_routed = tokens_per_expert / (B * S * self.top_k)
 
-        # Average router probability per expert (use normalized distribution for loss)
-        router_norm_probs = router_logits.softmax(dim=-1)  # (B, S, num_routed)
-        avg_prob = router_norm_probs.mean(dim=(0, 1))  # (num_routed,)
+        # Average router probability per expert (sigmoid — matches gating)
+        avg_prob = router_probs.mean(dim=(0, 1))  # (num_routed,)
 
         # Load balancing loss (Switch Transformer style)
         self.load_balance_loss = self.num_routed * (fraction_routed * avg_prob).sum()
 
         # Router z-loss: penalise large logits to prevent overconfident routing
-        self.z_loss = router_logits.logsumexp(dim=-1).pow(2).mean()
+        # For sigmoid routing, penalise squared logits directly (large |logit|
+        # pushes sigmoid toward 0 or 1, reducing routing flexibility).
+        self.z_loss = router_logits.pow(2).mean()
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────

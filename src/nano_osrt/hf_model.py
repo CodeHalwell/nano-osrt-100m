@@ -345,7 +345,7 @@ class NanoOSRTForCausalLM(nn.Module):
             config = NanoOSRTConfig()
 
         model = cls(config)
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
         state_dict = ckpt.get("model_state_dict", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:

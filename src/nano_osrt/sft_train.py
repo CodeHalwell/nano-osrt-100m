@@ -40,7 +40,7 @@ def load_pretrained(model: nn.Module, path: str, device: torch.device) -> None:
         )
 
     print(f"Loading pretrained weights from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
 
     if "model_state_dict" in ckpt:
         state_dict = ckpt["model_state_dict"]
@@ -88,7 +88,7 @@ def load_sft_checkpoint(
     if not os.path.exists(path):
         return 0
     print(f"Resuming SFT from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     inner.load_state_dict(ckpt["model_state_dict"], strict=False)
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])

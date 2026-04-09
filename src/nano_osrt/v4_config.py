@@ -120,3 +120,21 @@ class NanoOSRTv4Config(PretrainedConfig):
             pad_token_id=pad_token_id,
             **kwargs,
         )
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.dim % self.heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by heads ({self.heads})"
+            )
+        if self.top_k_experts > self.num_routed_experts:
+            raise ValueError(
+                f"top_k_experts ({self.top_k_experts}) must be <= "
+                f"num_routed_experts ({self.num_routed_experts})"
+            )
+        if self.num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {self.num_blocks}")
+        if self.recursive_loops < 1:
+            raise ValueError(
+                f"recursive_loops must be >= 1, got {self.recursive_loops}"
+            )

@@ -259,7 +259,7 @@ def grpo():
     ckpt_path = cfg.pretrained_checkpoint
     if os.path.exists(ckpt_path):
         print(f"Loading SFT weights from {ckpt_path}...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         state_dict = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict(state_dict, strict=False)
         print("  Loaded.")
@@ -518,7 +518,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 path = os.path.join(ckpt_dir, name)
                 if os.path.exists(path):
                     print(f"Loading {path}...")
-                    ckpt = torch.load(path, map_location="cuda", weights_only=False)
+                    ckpt = torch.load(path, map_location="cuda", weights_only=True)
                     self.model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
                     break
 
