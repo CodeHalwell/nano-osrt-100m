@@ -51,7 +51,6 @@ def generate_completions(
     Uses top-p sampling at the configured temperature.
     Returns a list of token tensors (prompt + completion).
     """
-    device = prompt_ids.device
     completions = []
 
     for _ in range(cfg.group_size):
@@ -142,7 +141,7 @@ def load_grpo_checkpoint(
     if not os.path.exists(path):
         return 0
     print(f"Resuming GRPO from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     inner.load_state_dict(ckpt["model_state_dict"], strict=False)
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -205,7 +204,7 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
             f"SFT checkpoint not found: {sft_path}. Run SFT first."
         )
     print(f"Loading SFT weights from {sft_path}...")
-    ckpt = torch.load(sft_path, map_location=device, weights_only=False)
+    ckpt = torch.load(sft_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:

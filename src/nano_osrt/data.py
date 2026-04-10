@@ -19,7 +19,8 @@ class TokenDataset(Dataset):
     def __init__(self, data_path: str | Path, block_size: int) -> None:
         self.block_size = block_size
         data_path = Path(data_path)
-        assert data_path.exists(), f"Data file not found: {data_path}"
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data file not found: {data_path}")
         self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
 
     def __len__(self) -> int:
@@ -49,7 +50,8 @@ class StreamingTokenDataset(IterableDataset):
         self.block_size = block_size
         self.seed = seed
         data_path = Path(data_path)
-        assert data_path.exists(), f"Data file not found: {data_path}"
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data file not found: {data_path}")
         self.data = np.memmap(data_path, dtype=np.uint16, mode="r")
         self.n_chunks = len(self.data) - block_size
 
@@ -114,8 +116,9 @@ def load_data_split(
     """
     data_dir = Path(data_dir)
     path = data_dir / f"{split}.bin"
-    assert path.exists(), (
-        f"Data file '{path}' not found. "
-        "Run your tokenisation script to generate train.bin / val.bin first."
-    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Data file '{path}' not found. "
+            "Run your tokenisation script to generate train.bin / val.bin first."
+        )
     return np.memmap(path, dtype=np.uint16, mode="r")

@@ -81,7 +81,7 @@ def train(cfg: TrainConfig) -> NanoOSRT:
     if cfg.resume:
         ckpt_path = ckpt_dir / "latest.pt"
         if ckpt_path.exists():
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
             model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_iter = checkpoint["iter"] + 1

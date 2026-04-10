@@ -213,12 +213,11 @@ def code_sft():
 )
 def evaluate(tasks: str = "ifeval", limit: int = 0):
     """Run lm-evaluation-harness benchmarks on A100."""
-    import json
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
-    from lm_eval.api.model import LM
     from lm_eval import evaluator
+    from lm_eval.api.model import LM
+    from transformers import AutoTokenizer
 
     from nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
 
@@ -232,9 +231,8 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
             config = NanoOSRTConfig()
             self.model = NanoOSRTForCausalLM(config)
 
-            import copy
             ckpt = torch.load("/vol/checkpoints/osrt100m_code_final.pt",
-                              map_location="cuda", weights_only=False)
+                              map_location="cuda", weights_only=True)
             state_dict = ckpt.get("model_state_dict", ckpt)
             self.model.load_state_dict(state_dict, strict=False)
             self.model = self.model.to("cuda")

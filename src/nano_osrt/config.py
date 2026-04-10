@@ -28,8 +28,21 @@ class ModelConfig:
 
     @property
     def head_dim(self) -> int:
-        assert self.n_embd % self.n_head == 0, "n_embd must be divisible by n_head"
+        if self.n_embd % self.n_head != 0:
+            raise ValueError("n_embd must be divisible by n_head")
         return self.n_embd // self.n_head
+
+    def __post_init__(self) -> None:
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
+            )
+        if self.n_layer < 1:
+            raise ValueError(f"n_layer must be >= 1, got {self.n_layer}")
+        if self.block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {self.block_size}")
+        if self.dropout < 0.0 or self.dropout > 1.0:
+            raise ValueError(f"dropout must be in [0, 1], got {self.dropout}")
 
 
 @dataclass

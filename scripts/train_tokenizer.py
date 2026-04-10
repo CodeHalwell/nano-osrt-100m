@@ -53,9 +53,7 @@ def sample_training_data(sample_size: int = 50_000_000, seed: int = 42) -> str:
         Path to temporary file with training text.
     """
     from datasets import load_dataset
-    import random
 
-    rng = random.Random(seed)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
 
     sources = [
@@ -116,7 +114,14 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
     Falls back to this when SuperBPE is not installed.
     Still produces a high-quality BPE tokenizer, just without superword merges.
     """
-    from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
+    from tokenizers import (
+        Tokenizer,
+        decoders,
+        models,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
 
     print("\nTraining BPE tokenizer with HuggingFace tokenizers...")
     print(f"  Vocab size: {vocab_size:,}")

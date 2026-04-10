@@ -89,7 +89,7 @@ class V4PretrainConfig:
             "end": 300_000,
             "seq_len": 8192,
             "batch_size": 2,
-            "grad_accum_steps": 32,  # halved for VRAM
+            "grad_accum_steps": 32,  # increased to compensate for smaller batch_size
             "datasets": [
                 {
                     "name": "smoltalk",

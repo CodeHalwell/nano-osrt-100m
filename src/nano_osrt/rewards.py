@@ -88,7 +88,7 @@ def count_reasoning_steps(thinking: str) -> int:
         return len(numbered)
 
     # Fallback: count non-empty lines as steps
-    lines = [l.strip() for l in thinking.split("\n") if l.strip()]
+    lines = [line.strip() for line in thinking.split("\n") if line.strip()]
     return len(lines)
 
 

@@ -81,5 +81,5 @@ def test_train_config_defaults() -> None:
 def test_block_size_exceeded_raises(tiny_config: ModelConfig) -> None:
     model = NanoOSRT(tiny_config)
     idx = torch.zeros((1, tiny_config.block_size + 1), dtype=torch.long)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         model(idx)

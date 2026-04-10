@@ -12,8 +12,6 @@ import sys
 import time
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     import wandb
@@ -71,7 +69,7 @@ def run_v4_sft(model_config: NanoOSRTv4Config, sft_cfg, vol, tokenizer) -> None:
     ckpt_path = sft_cfg.pretrained_checkpoint
     if os.path.exists(ckpt_path):
         print(f"Loading weights from {ckpt_path}...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         state_dict = ckpt.get("model_state_dict", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -155,7 +153,7 @@ def run_v4_sft(model_config: NanoOSRTv4Config, sft_cfg, vol, tokenizer) -> None:
     start_step = 0
     if best_step > 0:
         print(f"Found {prefix} checkpoint at step {best_step}")
-        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         inner.load_state_dict(ckpt["model_state_dict"], strict=False)
         try:

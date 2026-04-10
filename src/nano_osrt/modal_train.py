@@ -188,7 +188,7 @@ def load_checkpoint(
     if not os.path.exists(path):
         return 0
     print(f"Resuming from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     inner.load_state_dict(ckpt["model_state_dict"], strict=False)
     # If checkpoint predates norm_loop, it's already initialized as identity
