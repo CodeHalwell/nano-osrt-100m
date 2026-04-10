@@ -422,15 +422,15 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                 if moe_stats:
                     log_dict.update(moe_stats)
                 # Log individual MoE losses from last forward pass
-                total_lb = torch.tensor(0.0)
-                total_z = torch.tensor(0.0)
+                total_lb = 0.0
+                total_z = 0.0
                 for block in inner_model.blocks:
                     if block.moe.load_balance_loss is not None:
-                        total_lb = total_lb + block.moe.load_balance_loss.detach().cpu()
+                        total_lb += block.moe.load_balance_loss.item()
                     if block.moe.z_loss is not None:
-                        total_z = total_z + block.moe.z_loss.detach().cpu()
-                log_dict["moe/load_balance_loss"] = total_lb.item()
-                log_dict["moe/z_loss"] = total_z.item()
+                        total_z += block.moe.z_loss.item()
+                log_dict["moe/load_balance_loss"] = total_lb
+                log_dict["moe/z_loss"] = total_z
 
                 wandb.log(log_dict, step=step)
 

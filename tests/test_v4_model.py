@@ -242,8 +242,8 @@ class TestMoELayer:
         assert moe.expert_counts is not None
         assert moe.expert_counts.shape == (tiny_v4_config.num_routed_experts,)
         # Total tokens dispatched = B*S*top_k = 2*8*2 = 32
-        assert moe.expert_counts.sum().item() == pytest.approx(
-            2 * 8 * tiny_v4_config.top_k_experts, abs=0.1
+        assert moe.expert_counts.sum().item() == (
+            2 * 8 * tiny_v4_config.top_k_experts
         )
 
     def test_expert_counts_none_in_eval(self, tiny_v4_config: NanoOSRTv4Config) -> None:
