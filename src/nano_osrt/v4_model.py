@@ -113,6 +113,9 @@ class MoELayer(nn.Module):
         self.load_balance_loss: Tensor | None = None
         self.z_loss: Tensor | None = None
 
+        # Expert utilization stats (detached, for monitoring only)
+        self.expert_counts: Tensor | None = None  # (num_routed,)
+
     def forward(self, x: Tensor, loop_idx: int) -> Tensor:
         """Forward pass through MoE.
 
@@ -128,6 +131,7 @@ class MoELayer(nn.Module):
         # Reset losses at start of every forward (prevents stale values in eval)
         self.load_balance_loss = None
         self.z_loss = None
+        self.expert_counts = None
 
         # Shared expert (unconditional)
         shared_out = self.shared_expert(x)
@@ -213,6 +217,7 @@ class MoELayer(nn.Module):
 
         Losses are stored on separate attributes so the training loss can
         apply router_aux_loss_coeff and router_z_loss_coeff independently.
+        Also stores per-expert token counts for monitoring.
         """
         # Fraction of tokens routed to each expert
         one_hot = F.one_hot(top_k_indices, self.num_routed).float()  # (B, S, top_k, num_routed)
@@ -229,6 +234,9 @@ class MoELayer(nn.Module):
         # For sigmoid routing, penalise squared logits directly (large |logit|
         # pushes sigmoid toward 0 or 1, reducing routing flexibility).
         self.z_loss = router_logits.pow(2).mean()
+
+        # Expert utilization counts (detached for monitoring; no gradient needed)
+        self.expert_counts = tokens_per_expert.detach()
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────
@@ -381,6 +389,36 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         self.gradient_checkpointing = False
 
         self.post_init()
+
+    @torch.no_grad()
+    def get_moe_stats(self) -> dict[str, float]:
+        """Collect routing stats from all MoE layers.
+
+        Call after forward(). Returns dict with:
+            moe/expert_balance_cv: coefficient of variation
+            moe/max_expert_share: busiest expert fraction
+            moe/dead_experts: experts that received 0 tokens
+        """
+        total_counts = None
+        for block in self.blocks:
+            if block.moe.expert_counts is not None:
+                if total_counts is None:
+                    total_counts = block.moe.expert_counts.clone()
+                else:
+                    total_counts = total_counts + block.moe.expert_counts
+        if total_counts is None:
+            return {}
+        total = total_counts.sum().item()
+        if total == 0:
+            return {}
+        fractions = total_counts / total
+        mean_frac = fractions.mean().item()
+        std_frac = fractions.std().item()
+        return {
+            "moe/expert_balance_cv": std_frac / mean_frac if mean_frac > 0 else 0.0,
+            "moe/max_expert_share": fractions.max().item(),
+            "moe/dead_experts": int((total_counts == 0).sum().item()),
+        }
 
     def forward(self, input_ids: Tensor, **kwargs) -> tuple[Tensor, list[Tensor], Tensor, Tensor]:
         """Forward pass.

@@ -174,8 +174,10 @@ class TestMoELayer:
         assert moe.load_balance_loss is None
         assert moe.z_loss is None
 
-    def test_different_loop_indices(self, tiny_v4_config: NanoOSRTv4Config) -> None:
-        """Different loop indices should produce different outputs (loop-aware routing)."""
+    def test_different_loop_indices(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        """Different loop indices produce different outputs."""
         moe = MoELayer(tiny_v4_config)
         moe.eval()
         torch.manual_seed(42)
@@ -202,7 +204,9 @@ class TestMoELayer:
         assert (probs >= 0).all()
         assert (probs <= 1).all()
 
-    def test_load_balance_loss_nonnegative(self, tiny_v4_config: NanoOSRTv4Config) -> None:
+    def test_load_balance_loss_nonnegative(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
         moe = MoELayer(tiny_v4_config)
         moe.train()
         x = torch.randn(2, 8, tiny_v4_config.dim)
@@ -216,7 +220,9 @@ class TestMoELayer:
         moe(x, loop_idx=0)
         assert moe.z_loss.item() >= 0
 
-    def test_expert_count_matches_config(self, tiny_v4_config: NanoOSRTv4Config) -> None:
+    def test_expert_count_matches_config(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
         moe = MoELayer(tiny_v4_config)
         assert len(moe.experts) == tiny_v4_config.num_routed_experts
 
@@ -225,6 +231,27 @@ class TestMoELayer:
         moe = MoELayer(tiny_v4_config)
         assert moe.router.in_features == tiny_v4_config.dim * 2
         assert moe.router.out_features == tiny_v4_config.num_routed_experts
+
+    def test_expert_counts_tracked_in_train(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        moe = MoELayer(tiny_v4_config)
+        moe.train()
+        x = torch.randn(2, 8, tiny_v4_config.dim)
+        moe(x, loop_idx=0)
+        assert moe.expert_counts is not None
+        assert moe.expert_counts.shape == (tiny_v4_config.num_routed_experts,)
+        # Total tokens dispatched = B*S*top_k = 2*8*2 = 32
+        assert moe.expert_counts.sum().item() == pytest.approx(
+            2 * 8 * tiny_v4_config.top_k_experts, abs=0.1
+        )
+
+    def test_expert_counts_none_in_eval(self, tiny_v4_config: NanoOSRTv4Config) -> None:
+        moe = MoELayer(tiny_v4_config)
+        moe.eval()
+        x = torch.randn(2, 8, tiny_v4_config.dim)
+        moe(x, loop_idx=0)
+        assert moe.expert_counts is None
 
 
 # ── RecursiveBlockV4 ────────────────────────────────────────────────────
@@ -276,7 +303,9 @@ class TestNanoOSRTv4Model:
         assert len(model.adapters_a) == expected
         assert len(model.adapters_b) == expected
 
-    def test_moe_losses_accumulate_in_train(self, tiny_v4_config: NanoOSRTv4Config) -> None:
+    def test_moe_losses_accumulate_in_train(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
         model = NanoOSRTv4Model(tiny_v4_config)
         model.train()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 8))
@@ -284,6 +313,33 @@ class TestNanoOSRTv4Model:
         # With 2 blocks × 2 loops = 4 MoE forwards, losses should be > 0
         assert lb_loss.item() > 0
         assert z_loss.item() > 0
+
+    def test_get_moe_stats_train(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        """get_moe_stats returns utilization metrics after train."""
+        model = NanoOSRTv4Model(tiny_v4_config)
+        model.train()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (2, 8))
+        model(input_ids)
+        stats = model.get_moe_stats()
+        assert "moe/expert_balance_cv" in stats
+        assert "moe/max_expert_share" in stats
+        assert "moe/dead_experts" in stats
+        assert stats["moe/expert_balance_cv"] >= 0
+        assert 0 < stats["moe/max_expert_share"] <= 1.0
+        assert stats["moe/dead_experts"] >= 0
+
+    def test_get_moe_stats_empty_in_eval(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        """get_moe_stats returns empty dict in eval mode."""
+        model = NanoOSRTv4Model(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 8))
+        model(input_ids)
+        stats = model.get_moe_stats()
+        assert stats == {}
 
 
 # ── NanoOSRTv4ForCausalLM ──────────────────────────────────────────────
@@ -334,9 +390,6 @@ class TestNanoOSRTv4ForCausalLM:
     def test_weight_tying(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         """LM head should use the embedding weights (weight-tied)."""
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
-        model.eval()
-        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        outputs = model(input_ids)
         # Weight-tied: logits = hidden @ embedding.weight.T
         # Check that embedding weight shapes match what the logits need
         assert model.model.embedding.weight.shape == (

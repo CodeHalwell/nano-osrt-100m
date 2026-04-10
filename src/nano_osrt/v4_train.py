@@ -414,6 +414,24 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                     "train/phase": current_phase,
                     "train/seq_len": current_seq_len,
                 }
+
+                # MoE routing stats (aux losses + expert utilization)
+                inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+                inner_model = inner.model if hasattr(inner, "model") else inner
+                moe_stats = inner_model.get_moe_stats()
+                if moe_stats:
+                    log_dict.update(moe_stats)
+                # Log individual MoE losses from last forward pass
+                total_lb = torch.tensor(0.0)
+                total_z = torch.tensor(0.0)
+                for block in inner_model.blocks:
+                    if block.moe.load_balance_loss is not None:
+                        total_lb = total_lb + block.moe.load_balance_loss.detach().cpu()
+                    if block.moe.z_loss is not None:
+                        total_z = total_z + block.moe.z_loss.detach().cpu()
+                log_dict["moe/load_balance_loss"] = total_lb.item()
+                log_dict["moe/z_loss"] = total_z.item()
+
                 wandb.log(log_dict, step=step)
 
         elif step < 100:
