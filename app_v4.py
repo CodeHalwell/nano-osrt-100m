@@ -1,12 +1,12 @@
 """NanoOSRT v4 — Modal deployment entrypoint.
 
-~356M physical params (64K vocab + 1536 dim), ~180M active/token,
-~2.1B effective via recursive weight sharing.
+~306M physical params (32K vocab + 1536 dim), ~130M active/token,
+~1.8B effective via recursive weight sharing.
 3 physical blocks × 6 loops = 18 effective layers.
 Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
 
 Stages:
-    modal run app_v4.py --stage tokenizer    Train custom 64K BPE tokenizer
+    modal run app_v4.py --stage tokenizer    Train custom 32K BPE tokenizer
     modal run app_v4.py --stage pretrain     Pre-training (progressive seq_len)
     modal run app_v4.py --stage sft          Balanced SFT (math + code + STEM + general)
     modal run app_v4.py --stage grpo         GRPO reinforcement learning
@@ -58,14 +58,14 @@ tokenizer_vol = modal.Volume.from_name("osrt-v4-tokenizer", create_if_missing=Tr
     timeout=14400,  # 4 hours
 )
 def train_tokenizer():
-    """Train custom 64K BPE tokenizer on pre-training data mix."""
+    """Train custom 32K BPE tokenizer on pre-training data mix."""
     import sys
     sys.path.insert(0, "/root")
 
     from scripts.train_tokenizer import sample_training_data, train_with_hf_tokenizers
 
     print("=" * 60)
-    print("NanoOSRT v4 — Custom 64K Tokenizer Training")
+    print("NanoOSRT v4 — Custom 32K Tokenizer Training")
     print("=" * 60)
 
     # Sample 10GB of training data (proportional to pre-training mix)
@@ -74,7 +74,7 @@ def train_tokenizer():
 
     # Train tokenizer
     output_dir = "/vol/tokenizer"
-    train_with_hf_tokenizers(data_path, vocab_size=65536, output_dir=output_dir)
+    train_with_hf_tokenizers(data_path, vocab_size=32768, output_dir=output_dir)
 
     # Cleanup temp file
     import os
@@ -122,7 +122,7 @@ def pretrain():
     print(f"Tokenizer loaded: vocab_size={len(tok)}")
 
     # Sanity check — if tokenizer is wrong size, warn loudly
-    expected_vocab = 65536
+    expected_vocab = 32768
     if len(tok) != expected_vocab:
         print(f"WARNING: Expected {expected_vocab} vocab but got {len(tok)}!")
         print("  Retrain tokenizer: modal run app_v4.py --stage tokenizer")
