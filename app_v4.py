@@ -1,11 +1,12 @@
 """NanoOSRT v4 — Modal deployment entrypoint.
 
-453M physical params, ~275M active/token, ~2.7B effective via recursive MoE.
+~356M physical params (64K vocab + 1536 dim), ~180M active/token,
+~2.1B effective via recursive weight sharing.
 3 physical blocks × 6 loops = 18 effective layers.
 Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
 
 Stages:
-    modal run app_v4.py --stage tokenizer    Train custom 128K tokenizer
+    modal run app_v4.py --stage tokenizer    Train custom 64K BPE tokenizer
     modal run app_v4.py --stage pretrain     Pre-training (progressive seq_len)
     modal run app_v4.py --stage sft          Balanced SFT (math + code + STEM + general)
     modal run app_v4.py --stage grpo         GRPO reinforcement learning
@@ -318,6 +319,7 @@ def grpo():
 
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
+        step_kl = 0.0
         step_rewards = []
         step_correct = 0
         step_total = 0
@@ -363,16 +365,26 @@ def grpo():
                 completions.append(generated.squeeze(0))
             model.train()
 
-            # Score
+            # Score — IMPORTANT: skip_special_tokens=False so native tags
+            # like <|think|>, <|answer|> survive decoding for the reward
+            # scorer. And explicitly pass the v4 native tag strings so
+            # the reward function doesn't fall back to v3 defaults.
             rewards = []
             for comp_ids in completions:
-                comp_text = tok.decode(comp_ids[prompt_len:].tolist(), skip_special_tokens=True)
+                comp_text = tok.decode(
+                    comp_ids[prompt_len:].tolist(),
+                    skip_special_tokens=False,
+                )
                 comp_tokens = len(comp_ids) - prompt_len
                 reward, breakdown = compute_reward(
                     comp_text, ground_truth,
                     correctness_weight=cfg.correctness_reward,
                     format_weight=cfg.format_reward,
                     length_penalty=cfg.length_penalty,
+                    think_open=cfg.think_open,
+                    think_close=cfg.think_close,
+                    answer_open=cfg.answer_open,
+                    answer_close=cfg.answer_close,
                     max_tokens=cfg.max_gen_len,
                     completion_tokens=comp_tokens,
                     reasoning_bonus=cfg.reasoning_bonus,
@@ -395,28 +407,45 @@ def grpo():
                 if comp_len <= 0:
                     continue
 
-                # Policy log probs
+                # Policy log probs on the sampled completion
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model(comp_ids.unsqueeze(0))
                     logits = out.logits[0, :, :model_config.real_vocab_size].float()
                 shift_logits = logits[prompt_len - 1:-1]
                 shift_labels = comp_ids[prompt_len:]
-                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(
+                    1, shift_labels.unsqueeze(1)
+                ).squeeze(1)
 
+                # Reference log probs (frozen, no grad)
                 with torch.no_grad():
                     ref_out = ref_model(comp_ids.unsqueeze(0))
-                    ref_logits = ref_out.logits[0, :, :model_config.real_vocab_size].float()
+                    ref_logits = ref_out.logits[
+                        0, :, :model_config.real_vocab_size
+                    ].float()
                 ref_shift = ref_logits[prompt_len - 1:-1]
-                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(
+                    1, shift_labels.unsqueeze(1)
+                ).squeeze(1)
 
-                ratio = torch.exp(policy_lp - ref_lp)
-                clipped = torch.clamp(ratio, 1 - cfg.clip_range, 1 + cfg.clip_range)
+                # Direct policy gradient weighted by group-normalised advantage.
+                # Since we perform only one gradient step per sampled batch,
+                # importance-sampling ratio ~= 1, so PPO clipping is a no-op
+                # here. We keep the formulation simple and correct.
                 adv_t = torch.tensor(adv, device=device, dtype=torch.float32)
-                policy_loss = -torch.min(ratio * adv_t, clipped * adv_t).mean()
-                kl_loss = cfg.kl_coeff * (policy_lp - ref_lp).mean()
-                loss = (policy_loss + kl_loss) / cfg.grad_accum_steps
+                policy_loss = -(policy_lp * adv_t).mean()
+
+                # Schulman's unbiased non-negative KL approximation:
+                #   approx_kl = exp(ref_lp - policy_lp) - (ref_lp - policy_lp) - 1
+                # Always >= 0 (unlike the simple mean(policy_lp - ref_lp) which
+                # can go negative and give a bogus "negative KL" penalty).
+                log_ratio = ref_lp - policy_lp
+                approx_kl = (torch.exp(log_ratio) - log_ratio - 1).mean()
+
+                loss = (policy_loss + cfg.kl_coeff * approx_kl) / cfg.grad_accum_steps
                 loss.backward()
                 step_loss += loss.item()
+                step_kl += approx_kl.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
@@ -428,12 +457,19 @@ def grpo():
             elapsed = time.time() - start_time
             vram = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
+            mean_kl = step_kl / max(step_total, 1)
             print(f"step {step:>6d}/{cfg.total_steps} | loss {step_loss:.4f} | "
                   f"reward {mean_reward:.3f} | acc {accuracy:.1%} | "
-                  f"lr {lr:.2e} | vram {vram:.1f}GB | elapsed {elapsed:.0f}s")
+                  f"kl {mean_kl:.4f} | lr {lr:.2e} | "
+                  f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s")
             if use_wandb:
-                wandb.log({"grpo/loss": step_loss, "grpo/mean_reward": mean_reward,
-                           "grpo/accuracy": accuracy, "grpo/lr": lr}, step=step)
+                wandb.log({
+                    "grpo/loss": step_loss,
+                    "grpo/mean_reward": mean_reward,
+                    "grpo/accuracy": accuracy,
+                    "grpo/approx_kl": mean_kl,
+                    "grpo/lr": lr,
+                }, step=step)
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
@@ -507,17 +543,57 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
 
             self.model = NanoOSRTv4ForCausalLM(model_config).to("cuda")
 
-            # Load latest checkpoint
+            # Resolve latest checkpoint: priority grpo_final > sft_final > final.
             import os
+
+            from nano_osrt.hra import inject_hra
+
             ckpt_dir = "/vol/checkpoints/v4"
-            # Priority: grpo_final > sft_final > final
-            for name in ["osrt_v4_grpo_final.pt", "osrt_v4_sft_final.pt", "osrt_v4_final.pt"]:
+            resolved_path = None
+            resolved_stage = None
+            for stage, name in [
+                ("grpo", "osrt_v4_grpo_final.pt"),
+                ("sft", "osrt_v4_sft_final.pt"),
+                ("pretrain", "osrt_v4_final.pt"),
+            ]:
                 path = os.path.join(ckpt_dir, name)
                 if os.path.exists(path):
-                    print(f"Loading {path}...")
-                    ckpt = torch.load(path, map_location="cuda", weights_only=True)
-                    self.model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+                    resolved_path = path
+                    resolved_stage = stage
                     break
+
+            if resolved_path is None:
+                raise FileNotFoundError(
+                    f"No v4 checkpoint found in {ckpt_dir}. "
+                    "Run pretrain/sft/grpo first."
+                )
+
+            print(f"Loading {resolved_path} (stage={resolved_stage})...")
+            ckpt = torch.load(resolved_path, map_location="cuda", weights_only=True)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+
+            # SFT/GRPO checkpoints have HRA-wrapped linear layers (keys like
+            # 'blocks.0.qkv.adapter_a', 'blocks.0.qkv.original.weight').
+            # Inject HRA into a plain base model so the key names match,
+            # otherwise load_state_dict silently drops everything HRA-related.
+            if resolved_stage in ("sft", "grpo"):
+                has_hra_keys = any(
+                    "adapter_a" in k or "adapter_b" in k or "original.weight" in k
+                    for k in state_dict
+                )
+                if has_hra_keys:
+                    print("  Detected HRA keys in checkpoint, injecting adapters...")
+                    inject_hra(self.model, rank=256)
+
+            missing, unexpected = self.model.load_state_dict(
+                state_dict, strict=False
+            )
+            if missing:
+                print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
+            if unexpected:
+                print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
+            if not missing and not unexpected:
+                print("  Clean load: all keys matched.")
 
             self.model.eval()
             self.tokenizer = tok
@@ -631,7 +707,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
 def main(stage: str = "pretrain"):
     """Run v4 training stages.
 
-    --stage tokenizer  Train custom 128K tokenizer
+    --stage tokenizer  Train custom 64K BPE tokenizer
     --stage pretrain   Pre-training (progressive seq_len)
     --stage sft        Balanced SFT
     --stage grpo       GRPO reinforcement learning

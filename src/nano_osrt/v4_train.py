@@ -398,6 +398,34 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             eff_batch = current_batch_size * grad_accum
             tok_per_sec = eff_batch * current_seq_len / max(elapsed / max(step - start_step, 1), 1e-8)
 
+            # ── MoE diagnostics (cheap, high-value for debugging) ──
+            # Pull gate values and last-seen aux losses from the compiled
+            # model via the unwrapped inner module.
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            moe_metrics = {}
+            try:
+                base = inner.model if hasattr(inner, "model") else inner
+                dense_gates = []
+                moe_gates = []
+                block_lb_losses = []
+                block_z_losses = []
+                for bi, blk in enumerate(base.blocks):
+                    dense_gates.append(blk.dense_gate.item())
+                    moe_gates.append(blk.moe_gate.item())
+                    if blk.moe.load_balance_loss is not None:
+                        block_lb_losses.append(blk.moe.load_balance_loss.item())
+                    if blk.moe.z_loss is not None:
+                        block_z_losses.append(blk.moe.z_loss.item())
+                for bi, (dg, mg) in enumerate(zip(dense_gates, moe_gates)):
+                    moe_metrics[f"moe/dense_gate_b{bi}"] = dg
+                    moe_metrics[f"moe/moe_gate_b{bi}"] = mg
+                if block_lb_losses:
+                    moe_metrics["moe/load_balance_loss_mean"] = sum(block_lb_losses) / len(block_lb_losses)
+                if block_z_losses:
+                    moe_metrics["moe/z_loss_mean"] = sum(block_z_losses) / len(block_z_losses)
+            except AttributeError:
+                pass  # model not fully set up yet (first step)
+
             print(
                 f"step {step:>7d}/{train_cfg.total_steps} | "
                 f"loss {accum_loss.item():.4f} | lr {lr:.2e} | "
@@ -414,6 +442,7 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                     "train/phase": current_phase,
                     "train/seq_len": current_seq_len,
                 }
+                log_dict.update(moe_metrics)
                 wandb.log(log_dict, step=step)
 
         elif step < 100:
@@ -424,10 +453,11 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                 sys.stdout.flush()
 
         # --- Eval on held-out data ---
+        # Use phase-specific batch_size to avoid OOM at seq_len 4096 / 8192.
         if step > 0 and step % train_cfg.eval_interval == 0:
             eval_metrics = run_eval(
                 model, tokenizer_name, current_seq_len,
-                train_cfg.batch_size, train_cfg.eval_steps,
+                current_batch_size, train_cfg.eval_steps,
                 device, model_config.real_vocab_size,
             )
             print(

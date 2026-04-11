@@ -2,11 +2,11 @@
 
 Progressive curriculum:
   Phase 1 (Foundation):  seq_len 2048, TinyStories + CodeParrot
-  Phase 2 (Knowledge):   seq_len 4096, FineWeb-Edu + StarCoder + Wikipedia
+  Phase 2 (Knowledge):   seq_len 4096, FineWeb-Edu + CodeParrot + Wikipedia
   Phase 3 (Instruction): seq_len 8192, SmolTalk + Evol-Code + OpenHermes
 
 Post-training:
-  SFT:  Balanced math + code + STEM + general
+  SFT:  Balanced math + code + STEM + general (native tag format)
   GRPO: Verifiable math rewards (retry with larger model)
 """
 
@@ -37,9 +37,11 @@ class V4PretrainConfig:
 
     # Progressive seq_len curriculum
     # Tokens per step at each phase:
-    #   Phase 1: 8 × 8 × 2048 = 131K
-    #   Phase 2: 8 × 8 × 4096 = 262K
-    #   Phase 3: 8 × 4 × 8192 = 262K (halved accum to fit VRAM)
+    #   Phase 1 (foundation, 10K steps):  8 × 8  × 2048 = 131K tok/step → ~1.3B tokens
+    #   Phase 2 (knowledge, 240K steps):  4 × 16 × 4096 = 262K tok/step → ~63B tokens
+    #   Phase 3 (instruction, 50K steps): 2 × 32 × 8192 = 524K tok/step → ~26B tokens
+    # Total budget: ~90B tokens if the full 300K schedule completes.
+    # Batch sizes reduced at longer seq_len to fit H100 80GB VRAM.
     phases: dict = {  # noqa: RUF012
         "foundation": {
             "start": 0,
@@ -111,11 +113,9 @@ class V4PretrainConfig:
         },
     }
 
-    # Estimated token budget:
-    #   Phase 1: 15K × 131K = ~2.0B tokens
-    #   Phase 2: 235K × 262K = ~61.6B tokens
-    #   Phase 3: 50K × 262K = ~13.1B tokens
-    #   Total: ~76.7B tokens (adjust steps to hit ~50B within budget)
+    # Budget note: the schedule is aspirational — the user runs in chunks as
+    # Modal credits allow. Checkpoints every 5K steps make stop/resume cheap.
+    # Any early stopping still leaves a usable model for SFT.
 
 
 class V4SFTConfig:

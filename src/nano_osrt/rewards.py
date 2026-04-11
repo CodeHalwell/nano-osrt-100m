@@ -11,22 +11,36 @@ Uses rule-based rewards (no learned reward model):
 import re
 
 
-def extract_numeric_answer(text: str) -> str | None:
+def extract_numeric_answer(
+    text: str,
+    think_close: str = "</think>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+) -> str | None:
     """Extract the final numeric answer from model output.
 
-    Looks for the answer after </think> tag, or falls back to
-    the last number in the text.
+    Priority order:
+        1. Content between answer_open / answer_close tags (v4 native tags)
+        2. First number after think_close (v3 format)
+        3. Last number in the entire text (fallback)
     """
-    # Try to get answer after </think>
-    think_split = text.split("</think>")
-    if len(think_split) > 1:
-        after_think = think_split[-1].strip()
-        # Find numbers (including negatives, decimals, commas)
+    # Strategy 1: look inside explicit answer tags
+    if answer_open in text and answer_close in text:
+        start = text.index(answer_open) + len(answer_open)
+        end = text.index(answer_close, start) if answer_close in text[start:] else len(text)
+        inside = text[start:end]
+        numbers = re.findall(r"-?[\d,]+\.?\d*", inside)
+        if numbers:
+            return numbers[0].replace(",", "")
+
+    # Strategy 2: first number after the think_close tag
+    if think_close and think_close in text:
+        after_think = text.split(think_close, 1)[1].strip()
         numbers = re.findall(r"-?[\d,]+\.?\d*", after_think)
         if numbers:
             return numbers[0].replace(",", "")
 
-    # Fallback: last number in entire text
+    # Strategy 3: fallback to last number in entire text
     numbers = re.findall(r"-?[\d,]+\.?\d*", text)
     if numbers:
         return numbers[-1].replace(",", "")
@@ -100,6 +114,8 @@ def compute_reward(
     length_penalty: float = 0.0,
     think_open: str = "<think>",
     think_close: str = "</think>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
     max_tokens: int = 0,
     completion_tokens: int = 0,
     reasoning_bonus: float = 0.3,
@@ -110,11 +126,15 @@ def compute_reward(
 
     Reward components:
         1. Correctness (+1.0): correct final answer
-        2. Format (+0.2): proper <think>...</think> tags
+        2. Format (+0.2): proper think_open/think_close tags present
         3. Reasoning bonus (+0.3): multi-step thinking when correct
         4. Truncation penalty (-0.5): output hit 90% of max tokens
-        5. Empty thinking penalty (-0.1): <think></think> with no content
+        5. Empty thinking penalty (-0.1): thinking block has no content
         6. Length penalty (0.0 default): disabled, reasoning needs room
+
+    IMPORTANT: pass the actual tag strings used during training (e.g. v4 uses
+    single-token native tags '<|think|>' and '<|/think|>'). The defaults match
+    v3's plain-string tags and will silently fail for v4 if not overridden.
 
     Returns:
         (total_reward, reward_breakdown_dict)
@@ -123,7 +143,12 @@ def compute_reward(
     breakdown = {}
 
     # 1. Correctness reward (core signal)
-    predicted = extract_numeric_answer(completion)
+    predicted = extract_numeric_answer(
+        completion,
+        think_close=think_close,
+        answer_open=answer_open,
+        answer_close=answer_close,
+    )
     gt = extract_gsm8k_answer(ground_truth_answer)
     if gt is None:
         gt = ground_truth_answer.replace(",", "").strip()

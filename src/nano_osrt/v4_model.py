@@ -158,6 +158,7 @@ class MoELayer(nn.Module):
 
         return shared_out + routed_out.view(B, S, D)
 
+    @torch._dynamo.disable
     def _dispatch_experts(
         self, flat_x: Tensor, flat_indices: Tensor, flat_weights: Tensor, D: int,
     ) -> Tensor:
@@ -166,6 +167,11 @@ class MoELayer(nn.Module):
         Instead of looping over top_k × num_experts (22 iterations), this
         sorts tokens by expert assignment and runs each expert on its full
         batch in a single call.
+
+        @torch._dynamo.disable: per-expert batch size is data-dependent,
+        which causes torch.compile to exceed its recompile_limit and fall
+        back to full-graph eager. Keeping only this method in eager lets
+        the rest of the model (attention, dense FFN, RoPE) stay compiled.
         """
         N = flat_x.shape[0]  # B*S
 
@@ -214,9 +220,13 @@ class MoELayer(nn.Module):
         Losses are stored on separate attributes so the training loss can
         apply router_aux_loss_coeff and router_z_loss_coeff independently.
         """
-        # Fraction of tokens routed to each expert
-        one_hot = F.one_hot(top_k_indices, self.num_routed).float()  # (B, S, top_k, num_routed)
-        tokens_per_expert = one_hot.sum(dim=(0, 1, 2))  # (num_routed,)
+        # Fraction of tokens routed to each expert — bincount avoids the
+        # (B, S, top_k, num_routed) one-hot allocation which spikes memory
+        # at seq_len 4096/8192. Cast is needed because bincount returns int.
+        flat_indices = top_k_indices.reshape(-1)  # (B * S * top_k,)
+        tokens_per_expert = torch.bincount(
+            flat_indices, minlength=self.num_routed
+        ).to(router_probs.dtype)
         fraction_routed = tokens_per_expert / (B * S * self.top_k)
 
         # Average router probability per expert (sigmoid — matches gating)
@@ -475,13 +485,17 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # MoE losses scaled independently:
-            #   load-balance at router_aux_loss_coeff  (default 0.01)
-            #   z-loss at router_z_loss_coeff          (default 0.001)
+            # MoE losses are accumulated across all (num_blocks × recursive_loops)
+            # effective MoE applications (18 for default v4). Normalise by that
+            # count so the configured coefficient matches the per-layer weight
+            # instead of being silently multiplied by 18.
+            n_moe_layers = self.config.num_blocks * self.config.recursive_loops
+            lb_norm = lb_loss / n_moe_layers
+            z_norm = z_loss / n_moe_layers
             loss = (
                 loss
-                + self.config.router_aux_loss_coeff * lb_loss
-                + self.config.router_z_loss_coeff * z_loss
+                + self.config.router_aux_loss_coeff * lb_norm
+                + self.config.router_z_loss_coeff * z_norm
             )
 
         return CausalLMOutputWithPast(
