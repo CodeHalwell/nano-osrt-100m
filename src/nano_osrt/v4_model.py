@@ -99,10 +99,15 @@ class MoELayer(nn.Module):
             [ExpertFFN(config.dim, config.expert_hidden) for _ in range(self.num_routed)]
         )
 
-        # Router: projects hidden state to expert scores
-        # Loop-aware: concatenates a learned loop embedding
+        # Router: projects hidden state to expert scores.
+        # Loop-aware routing: add a learned per-loop embedding to the hidden
+        # state before the router projection. Addition (not concat) keeps
+        # router parameters at (dim -> num_routed) instead of (2*dim -> num_routed),
+        # halving router params with equivalent expressive power because a
+        # linear layer over cat([x, e]) can always be re-expressed as the
+        # sum of two linear layers over x and e.
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
-        self.router = nn.Linear(config.dim * 2, self.num_routed, bias=False)
+        self.router = nn.Linear(config.dim, self.num_routed, bias=False)
 
         # Pre-register loop index tensors to avoid torch.tensor() in forward
         self.register_buffer(
@@ -132,12 +137,11 @@ class MoELayer(nn.Module):
         # Shared expert (unconditional)
         shared_out = self.shared_expert(x)
 
-        # Loop-aware routing with cached index tensor
-        loop_emb = self.loop_embeddings(
-            self.loop_indices[loop_idx]
-        ).unsqueeze(0).unsqueeze(0).expand(B, S, -1)  # (B, S, dim)
-
-        router_input = torch.cat([x, loop_emb], dim=-1)  # (B, S, 2*dim)
+        # Loop-aware routing: add the learned per-loop embedding to x.
+        # Broadcasts (dim,) -> (B, S, dim) without materialising an
+        # expanded tensor, then router projects (dim -> num_routed).
+        loop_emb = self.loop_embeddings(self.loop_indices[loop_idx])  # (dim,)
+        router_input = x + loop_emb  # (B, S, dim)
         router_logits = self.router(router_input)  # (B, S, num_routed)
 
         # Sigmoid gating: each expert gate is independent (DeepSeek-V3 style)
@@ -287,10 +291,14 @@ class RecursiveBlockV4(nn.Module):
         self.norm_moe = nn.RMSNorm(config.dim)
         self.moe = MoELayer(config)
 
-        # Learnable gates for parallel dense + MoE residual scaling
-        # Initialised to 0.5 so combined contribution starts at 1.0×
-        self.dense_gate = nn.Parameter(torch.tensor(0.5))
-        self.moe_gate = nn.Parameter(torch.tensor(0.5))
+        # Learnable gates for parallel dense + MoE residual scaling.
+        # Init dense_gate=1.0, moe_gate=0.01 so the model starts as a
+        # (nearly) pure dense network and gradually blends in the MoE path
+        # as the router learns to route sensibly. This avoids destabilising
+        # early training with a half-random MoE contribution before the
+        # experts have specialised.
+        self.dense_gate = nn.Parameter(torch.tensor(1.0))
+        self.moe_gate = nn.Parameter(torch.tensor(0.01))
 
     def forward(
         self,
@@ -304,11 +312,15 @@ class RecursiveBlockV4(nn.Module):
     ) -> Tensor:
         B, S, D = x.shape
 
-        # Per-pass residual adapter (activation-space, not weight-LoRA)
-        x_mod = x + adapter_scale * (x @ adapter_a @ adapter_b)
+        # Per-pass residual adapter (activation-space, not weight-LoRA).
+        # Treated as a strictly additive parallel branch so the main
+        # residual stream stays clean — attention and FFN see the
+        # unadapted x, which is safer early in training when B is
+        # zero-initialised and the adapter direction is still noise.
+        adapter_out = adapter_scale * (x @ adapter_a @ adapter_b)
 
-        # ── Causal Attention with RoPE ──
-        h = self.norm_attn(x_mod)
+        # ── Causal Attention with RoPE (reads x, not x_mod) ──
+        h = self.norm_attn(x)
         qkv = self.qkv(h)
         q, k, v = qkv.chunk(3, dim=-1)
 
@@ -323,7 +335,8 @@ class RecursiveBlockV4(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
-        x = x_mod + self.out_proj(attn_out)
+        # Attention residual + adapter (parallel branches into x)
+        x = x + self.out_proj(attn_out) + adapter_out
 
         # ── Parallel Dense + MoE FFN with learnable scaling ──
         h_dense = self.ffn_dense(self.norm_dense(x))
