@@ -144,7 +144,10 @@ def test_assignment_entropy_detects_collapse():
     """Assignment entropy should be much lower when routing is collapsed."""
     import math
 
-    cfg = _tiny_config(router_noise_std=0.0)  # kill noise so we can construct a deterministic fake
+    # router_noise_std_init would be rejected as unexpected by the config,
+    # but this test calls _record_telemetry() directly with a synthetic
+    # top_k_indices tensor so forward()-path noise never enters the picture.
+    cfg = _tiny_config()
     model = NanoOSRTv4ForCausalLM(cfg)
 
     # Build a synthetic top_k_indices that picks only experts 0 and 1
@@ -181,6 +184,41 @@ def test_router_uses_additive_loop_embedding():
     for blk in model.model.blocks:
         # (num_routed, dim) — additive router halves what cat-router would use
         assert blk.moe.router.weight.shape == (cfg.num_routed_experts, cfg.dim)
+
+
+def test_loop_embedding_init_std_survives_post_init():
+    """Regression test: HF PreTrainedModel.post_init() walks the module
+    tree and re-inits every nn.Embedding with initializer_range=0.02,
+    which previously silently overwrote the larger loop-embedding init.
+    Verify that the _osrt_init_std tag is respected and the actual
+    stddev of the initialised weights matches config.loop_embedding_init_std.
+    """
+    cfg = _tiny_config(loop_embedding_init_std=0.15)
+    model = NanoOSRTv4ForCausalLM(cfg)
+    for blk in model.model.blocks:
+        w = blk.moe.loop_embeddings.weight.detach()
+        actual_std = w.std().item()
+        # With small tensors (recursive_loops × dim = 3 × 128 = 384 values)
+        # the empirical std has some sampling error, so allow 30% tolerance.
+        assert 0.7 * cfg.loop_embedding_init_std < actual_std < 1.3 * cfg.loop_embedding_init_std, (
+            f"Expected loop_embeddings std ~ {cfg.loop_embedding_init_std}, "
+            f"got {actual_std:.4f}. HF post_init probably stomped the custom init."
+        )
+        # Verify the tag is present so the custom init path is taken
+        assert getattr(blk.moe.loop_embeddings, "_osrt_init_std", None) == cfg.loop_embedding_init_std
+
+
+def test_token_embedding_still_uses_default_std():
+    """Sanity: the main token embedding should still use initializer_range,
+    not the loop-embedding std, since only loop_embeddings was tagged.
+    """
+    cfg = _tiny_config(loop_embedding_init_std=0.15, initializer_range=0.02)
+    model = NanoOSRTv4ForCausalLM(cfg)
+    w = model.model.embedding.weight.detach()
+    actual_std = w.std().item()
+    assert 0.7 * cfg.initializer_range < actual_std < 1.3 * cfg.initializer_range, (
+        f"Token embedding std expected ~ {cfg.initializer_range}, got {actual_std:.4f}"
+    )
 
 
 # Adapter placement ----------------------------------------------------------

@@ -150,16 +150,22 @@ class MoELayer(nn.Module):
         # linear layer over cat([x, e]) can always be re-expressed as the
         # sum of two linear layers over x and e.
         #
-        # Loop embeddings get their own larger init_std (config.loop_embedding_init_std,
-        # default 0.1) so that they actually shift routing between loops at
-        # init — the default 0.02 was too small compared to the x-signal
-        # std ~0.78, making early routing loop-invariant.
+        # Loop embeddings get their own larger init_std
+        # (config.loop_embedding_init_std, default 0.1) so that they
+        # actually shift routing between loops at init — the default
+        # 0.02 was too small compared to the x-signal std ~0.78, making
+        # early routing loop-invariant.
+        #
+        # NOTE: HF PreTrainedModel.post_init() walks the module tree and
+        # calls _init_weights on every nn.Embedding with
+        # initializer_range (default 0.02), which would silently stomp
+        # whatever we set here. We tag this embedding with
+        # _osrt_init_std so the overridden _init_weights in
+        # NanoOSRTv4PreTrainedModel uses config.loop_embedding_init_std
+        # instead. Do NOT call nn.init.normal_ here — post_init will
+        # overwrite it anyway; the tag is what actually takes effect.
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
-        nn.init.normal_(
-            self.loop_embeddings.weight,
-            mean=0.0,
-            std=config.loop_embedding_init_std,
-        )
+        self.loop_embeddings._osrt_init_std = config.loop_embedding_init_std
         self.router = nn.Linear(config.dim, self.num_routed, bias=False)
 
         # Pre-register loop index tensors to avoid torch.tensor() in forward
@@ -493,7 +499,20 @@ class NanoOSRTv4PreTrainedModel(PreTrainedModel):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+            # HF's post_init() walks the tree and calls _init_weights on
+            # every nn.Embedding with initializer_range (default 0.02).
+            # The MoE layer's loop_embeddings needs a LARGER init std
+            # (config.loop_embedding_init_std, default 0.1) so routing
+            # can actually differentiate across recursive loops at init.
+            # We tag that specific embedding in MoELayer.__init__ with
+            # a `_osrt_init_std` attribute so we use it here instead of
+            # the generic initializer_range.
+            custom_std = getattr(module, "_osrt_init_std", None)
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=custom_std if custom_std is not None else std,
+            )
 
 
 class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
