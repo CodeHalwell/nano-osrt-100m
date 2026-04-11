@@ -12,14 +12,14 @@ to dramatically increase model capacity while keeping active compute manageable.
 | Effective layers | 12 | 18 |
 | Dense FFN | Yes | Yes (kept) |
 | MoE FFN | No | 12 experts (1 shared + 11 routed, top-2) |
-| Physical params | 104.5M | ~356M |
-| Active params/token | 104.5M | ~180M |
-| Effective params (recursive) | ~302M | ~2.1B |
+| Physical params | 104.5M | ~306M |
+| Active params/token (body) | 104.5M | ~130M |
+| Block applications (recursive) | 12 | 18 |
 | HRA (post-training) | +11M | +15-20M |
 | Hidden dim | 1280 | 1536 |
 | Attention heads | 20 | 24 |
 | Head dim | 64 | 64 |
-| Tokenizer | GPT-NeoX (50K) | Custom 64K BPE |
+| Tokenizer | GPT-NeoX (50K) | Custom 32K BPE |
 | Seq len (training) | 2048 → 4096 | 2048 → 4096 → 8192 |
 | Seq len (inference) | 4096 | 16K+ (RoPE scaling) |
 
@@ -55,9 +55,8 @@ x = x + h_dense + h_moe
 
 ```
                     ┌─────────────┐
-                    │   Router    │ (dim → 11, softmax)
-                    │  + loop     │
-                    │  embedding  │
+                    │   Router    │ (dim → 11, sigmoid)
+                    │ x + loop_e  │
                     └──────┬──────┘
                            │ top-2 indices + weights
             ┌──────────────┼──────────────┐
@@ -74,10 +73,12 @@ x = x + h_dense + h_moe
 ```
 
 **Router design:**
-- Input: hidden state + learned loop embedding (loop-aware routing)
-- Output: softmax over 11 routed experts
-- Top-2 selection with load balancing auxiliary loss
+- Input: hidden state + learned loop embedding added together (loop-aware routing)
+- Output: independent sigmoid gates over 11 routed experts (DeepSeek-V3 style)
+- Top-2 selection with load-balancing auxiliary loss + router z-loss
 - Shared expert output added unconditionally
+- Dense FFN runs in parallel with gated contribution (dense_gate=1.0 init,
+  moe_gate=0.01 init so training starts near-pure-dense)
 
 **Expert architecture:**
 - Each expert is a small SwiGLU: dim → expert_hidden → dim

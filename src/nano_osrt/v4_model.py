@@ -30,12 +30,31 @@ def compute_rope_freqs(
     dim: int,
     theta: float = 10000.0,
     device: torch.device | None = None,
+    scaling: dict | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Pre-compute RoPE cos/sin tensors. Shape: (1, seq_len, 1, dim)."""
+    """Pre-compute RoPE cos/sin tensors. Shape: (1, seq_len, 1, dim).
+
+    Supports optional NTK-aware scaling for extending context beyond
+    training length. Pass scaling={"type": "ntk", "factor": 4.0} in the
+    model config to extend the effective max position by ~4x at
+    inference time without retraining.
+    """
     if dim % 2 != 0:
         raise ValueError(f"RoPE requires even dimension, got dim={dim}")
+
+    # NTK-aware scaling: rescale theta so higher positions fit.
+    # factor = desired_context / training_context.
+    effective_theta = theta
+    if scaling is not None:
+        stype = scaling.get("type", "").lower()
+        factor = float(scaling.get("factor", 1.0))
+        if stype == "ntk" and factor > 1.0:
+            effective_theta = theta * (factor ** (dim / (dim - 2)))
+
     freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim)
+        effective_theta ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim
+        )
     )
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
@@ -118,6 +137,14 @@ class MoELayer(nn.Module):
         self.load_balance_loss: Tensor | None = None
         self.z_loss: Tensor | None = None
 
+        # Per-loop telemetry — indexed [0..num_loops-1], overwritten on
+        # each forward. Used by the training loop for per-loop W&B metrics.
+        # Keep as plain tensors (no grad) so logging is free.
+        self.last_router_entropy: list[float] = [0.0] * config.recursive_loops
+        self.last_expert_fraction: list[list[float]] = [
+            [0.0] * config.num_routed_experts for _ in range(config.recursive_loops)
+        ]
+
     def forward(self, x: Tensor, loop_idx: int) -> Tensor:
         """Forward pass through MoE.
 
@@ -153,6 +180,7 @@ class MoELayer(nn.Module):
         # Compute load balancing + z-loss (kept separate for independent scaling)
         if self.training:
             self._compute_losses(router_logits, router_probs, top_k_indices, B, S)
+            self._record_telemetry(router_probs, top_k_indices, loop_idx)
 
         # Batched scatter-gather dispatch: each expert runs exactly once
         routed_out = self._dispatch_experts(
@@ -243,6 +271,31 @@ class MoELayer(nn.Module):
         # For sigmoid routing, penalise squared logits directly (large |logit|
         # pushes sigmoid toward 0 or 1, reducing routing flexibility).
         self.z_loss = router_logits.pow(2).mean()
+
+    @torch.no_grad()
+    def _record_telemetry(
+        self, router_probs: Tensor, top_k_indices: Tensor, loop_idx: int,
+    ) -> None:
+        """Record per-loop router entropy and expert-fraction histogram.
+
+        Called inside forward() during training only. Values live on CPU
+        as plain Python lists so the training loop can log them cheaply
+        without touching the compiled graph.
+        """
+        # Router entropy: how spread-out is the distribution? Low entropy
+        # means routing is collapsing (one expert dominates).
+        # Normalise sigmoid probs to a distribution first so entropy is bounded.
+        norm = router_probs / (router_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        entropy = -(norm * (norm + 1e-8).log()).sum(dim=-1).mean()
+        if 0 <= loop_idx < len(self.last_router_entropy):
+            self.last_router_entropy[loop_idx] = entropy.item()
+
+        # Fraction of tokens routed to each expert (top-k counts / total).
+        flat = top_k_indices.reshape(-1)
+        counts = torch.bincount(flat, minlength=self.num_routed).float()
+        fractions = (counts / counts.sum().clamp_min(1)).tolist()
+        if 0 <= loop_idx < len(self.last_expert_fraction):
+            self.last_expert_fraction[loop_idx] = fractions
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────
@@ -374,8 +427,16 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.dim)
 
-        # RoPE (non-persistent buffers)
-        cos, sin = compute_rope_freqs(config.max_position_embeddings, config.head_dim, config.rope_theta)
+        # RoPE (non-persistent buffers). Optional NTK scaling extends
+        # the effective context beyond max_position_embeddings at
+        # inference time — set config.rope_scaling = {"type": "ntk",
+        # "factor": 4.0} and bump max_position_embeddings accordingly.
+        cos, sin = compute_rope_freqs(
+            config.max_position_embeddings,
+            config.head_dim,
+            config.rope_theta,
+            scaling=config.rope_scaling,
+        )
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 

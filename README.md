@@ -26,18 +26,18 @@
 
 ### v4: Recursive MoE (In Development)
 
-356M physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
+306M physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
 
 | Property | Value |
 |----------|-------|
-| Physical params | ~356M |
-| Active params/token | ~180M |
-| Effective params | ~2.1B |
+| Physical params | ~306M |
+| Active params/token (transformer body) | ~130M |
+| Total compute (recursive ×6 block applications) | ~1.8B |
 | Architecture | 3 blocks x 6 loops = 18 effective layers |
 | MoE | 12 experts (1 shared + 11 routed, top-2) |
 | Hidden dim | 1536 |
 | Attention heads | 24 (head_dim=64) |
-| Tokenizer | Custom 64K BPE (trained on code + text + Wikipedia) |
+| Tokenizer | Custom 32K BPE (trained on 10GB of text + code + Wikipedia) |
 | Context length | 8192 (progressive: 2048 -> 4096 -> 8192) |
 | Target training data | 50B tokens |
 | RoPE scaling | NTK-aware for inference beyond training length |
@@ -216,21 +216,29 @@
          +---> output = shared_out + weighted_sum(selected_expert_outputs)
 ```
 
-**Parameter budget (v4):**
+**Parameter budget (v4, 32K vocab):**
 
 ```
-  Token Embedding       101M  [====================]                    28.3%
-  MoE Routed (11)       156M  [================================]        43.7%
-  Dense FFN x3           57M  [============]                            15.9%
-  Attention x3           28M  [======]                                   7.9%
-  Shared Expert x3       14M  [===]                                      3.9%
-  Adapters x18            1M  []                                         0.2%
-  Router + Loop Emb      <1M  []                                         0.0%
+  MoE Routed (11 experts) 156M  [================================]      50.9%
+  Dense FFN x3             57M  [============]                          18.5%
+  Token Embedding          50M  [==========]                            16.4%
+  Attention x3             28M  [======]                                 9.3%
+  Shared Expert x3         14M  [===]                                    4.6%
+  Adapters x18              1M  []                                       0.3%
+  Router + Loop Emb       <1M  []                                        0.0%
   ─────────────────────────────────────────────────────────────────
-  Total Physical       ~356M
-  Active / Token       ~180M   (shared + 2 of 11 routed)
-  Effective            ~2.1B   (recursive x6)
+  Total Physical         ~306M
+  Active transformer body ~130M   per-token compute (excl. embedding lookup)
+  Block applications      6x     via recursive weight sharing
 ```
+
+Note on "effective params": recursion gives 18 block applications, not 18
+independent sets of weights. The model has 306M **physical** parameters;
+each forward runs the body ~6 times with unique per-pass adapters and
+loop-conditioned routing, so the compute budget is comparable to a model
+of roughly ~1.8B FLOPs per token — but with much tighter memorisation
+capacity than a dense 1.8B model. Treat this as iterative refinement on
+a budget, not a 1:1 parameter substitute.
 
 ### Per-Pass Residual Adapters
 
@@ -330,7 +338,7 @@ Each tag is a single token in the v4 tokenizer -- no multi-token string matching
          |  |   Foundation    |                         |            |
          |  |     2048        |                         |            |
     ─────+--+-----------------+-------------------------+------------+---> steps
-         0              15K                        250K          300K
+         0              10K                        250K          300K
 ```
 
 ### Training Pipeline Overview
@@ -338,7 +346,7 @@ Each tag is a single token in the v4 tokenizer -- no multi-token string matching
 ```
   +===========+     +==========+     +========+     +==========+     +======+
   | Tokenizer |---->| Pretrain |---->|  SFT   |---->|  GRPO    |---->| Eval |
-  | (64K BPE) |     | (300K    |     | (5K    |     | (2K      |     |      |
+  | (32K BPE) |     | (300K    |     | (5K    |     | (2K      |     |      |
   |  10GB     |     |  steps)  |     |  steps)|     |  steps)  |     |      |
   +===========+     +==========+     +========+     +==========+     +======+
        |                 |               |               |               |
@@ -371,7 +379,7 @@ Stage 4: Code SFT     -> 7K steps (2 epochs), AdamW + HRA, seq_len 4096
 ### v4 Pipeline (Planned)
 
 ```
-Step 0: Tokenizer     -> Train custom 64K BPE on 10GB text+code+wiki
+Step 0: Tokenizer     -> Train custom 32K BPE on 10GB text+code+wiki
 Step 1: Pretrain      -> 300K steps, progressive seq_len 2048->4096->8192
   Foundation: TinyStories + CodeParrot (15K steps)
   Knowledge:  FineWeb-Edu + CodeParrot + Wikipedia (235K steps)
@@ -430,7 +438,7 @@ uv run modal run app.py --stage eval
 ### v4 Training
 
 ```bash
-# Train custom 64K tokenizer
+# Train custom 32K tokenizer
 uv run modal run --detach app_v4.py --stage tokenizer
 
 # Pre-training (progressive seq_len)
@@ -485,7 +493,7 @@ nano-osrt-100m/
 │   └── v4_sft_train.py             # SFT training loop
 │
 ├── scripts/
-│   └── train_tokenizer.py          # Custom 64K BPE tokenizer training
+│   └── train_tokenizer.py          # Custom 32K BPE tokenizer training
 │
 ├── docs/
 │   ├── training-report.md          # v3 end-to-end training report
@@ -539,7 +547,7 @@ W&B project: [nano-osrt-100m](https://wandb.ai/codhe-synextra/nano-osrt-100m) | 
 
 | Version | Key Changes |
 |---------|-------------|
-| **v4.0** (dev) | 3 blocks, MoE (12 experts, top-2), 64K custom tokenizer, progressive seq_len, native tags, HF-native |
+| **v4.0** (dev) | 3 blocks, MoE (12 experts, top-2), 32K custom tokenizer, parallel adapter residual, dense-first MoE gating, additive loop-aware router, progressive seq_len, native tags, HF-native |
 | **v3.3** | Code SFT (7K steps, 2 epochs), HRA adapters (+11.2M params), HF inference wrapper, IFEval benchmark |
 | **v3.2** | Post-training pipeline: Math SFT + GRPO + improved reward functions |
 | **v3.1** | RoPE, FP32 master weights, dynamic vocab, SmolTalk formatting |

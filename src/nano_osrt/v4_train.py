@@ -399,30 +399,52 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             tok_per_sec = eff_batch * current_seq_len / max(elapsed / max(step - start_step, 1), 1e-8)
 
             # ── MoE diagnostics (cheap, high-value for debugging) ──
-            # Pull gate values and last-seen aux losses from the compiled
-            # model via the unwrapped inner module.
+            # Pull gate values, aux losses, router entropy, and expert
+            # usage fractions from the compiled model via the unwrapped
+            # inner module. Values are per physical block and per loop.
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
             moe_metrics = {}
             try:
                 base = inner.model if hasattr(inner, "model") else inner
-                dense_gates = []
-                moe_gates = []
                 block_lb_losses = []
                 block_z_losses = []
+                all_entropies = []
+                max_fracs = []
+                min_fracs = []
                 for bi, blk in enumerate(base.blocks):
-                    dense_gates.append(blk.dense_gate.item())
-                    moe_gates.append(blk.moe_gate.item())
+                    moe_metrics[f"moe/dense_gate_b{bi}"] = blk.dense_gate.item()
+                    moe_metrics[f"moe/moe_gate_b{bi}"] = blk.moe_gate.item()
                     if blk.moe.load_balance_loss is not None:
                         block_lb_losses.append(blk.moe.load_balance_loss.item())
                     if blk.moe.z_loss is not None:
                         block_z_losses.append(blk.moe.z_loss.item())
-                for bi, (dg, mg) in enumerate(zip(dense_gates, moe_gates)):
-                    moe_metrics[f"moe/dense_gate_b{bi}"] = dg
-                    moe_metrics[f"moe/moe_gate_b{bi}"] = mg
+
+                    # Per-loop router entropy for this block
+                    for li, ent in enumerate(blk.moe.last_router_entropy):
+                        moe_metrics[f"moe/entropy_b{bi}_l{li}"] = ent
+                        all_entropies.append(ent)
+
+                    # Per-loop expert usage: track max and min fraction
+                    # (tight gap = collapsed routing, wide gap = specialisation)
+                    for li, fracs in enumerate(blk.moe.last_expert_fraction):
+                        if fracs:
+                            mx = max(fracs)
+                            mn = min(fracs)
+                            moe_metrics[f"moe/expert_max_b{bi}_l{li}"] = mx
+                            moe_metrics[f"moe/expert_min_b{bi}_l{li}"] = mn
+                            max_fracs.append(mx)
+                            min_fracs.append(mn)
+
                 if block_lb_losses:
                     moe_metrics["moe/load_balance_loss_mean"] = sum(block_lb_losses) / len(block_lb_losses)
                 if block_z_losses:
                     moe_metrics["moe/z_loss_mean"] = sum(block_z_losses) / len(block_z_losses)
+                if all_entropies:
+                    moe_metrics["moe/entropy_mean"] = sum(all_entropies) / len(all_entropies)
+                if max_fracs:
+                    moe_metrics["moe/expert_max_mean"] = sum(max_fracs) / len(max_fracs)
+                if min_fracs:
+                    moe_metrics["moe/expert_min_mean"] = sum(min_fracs) / len(min_fracs)
             except AttributeError:
                 pass  # model not fully set up yet (first step)
 

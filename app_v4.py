@@ -253,14 +253,24 @@ def grpo():
         print(f"Injecting HRA (rank={cfg.hra_rank})...")
         hra_params = inject_hra(model, rank=cfg.hra_rank)
 
-    # Load SFT weights
+    # Load SFT weights — GRPO MUST start from a real SFT checkpoint.
     ckpt_path = cfg.pretrained_checkpoint
-    if os.path.exists(ckpt_path):
-        print(f"Loading SFT weights from {ckpt_path}...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state_dict, strict=False)
-        print("  Loaded.")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"GRPO refuses to start: SFT checkpoint not found at {ckpt_path}. "
+            "Run SFT first (modal run app_v4.py --stage sft)."
+        )
+
+    print(f"Loading SFT weights from {ckpt_path}...")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
+    if unexpected:
+        print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
+    if not missing and not unexpected:
+        print("  Clean load: all keys matched.")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
@@ -611,8 +621,60 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
         @property
         def device(self): return self._device
 
-        def tok_encode(self, s, **kw): return self.tokenizer.encode(s, add_special_tokens=False)
-        def tok_decode(self, t, **kw): return self.tokenizer.decode(t, skip_special_tokens=True)
+        def tok_encode(self, s, **kw):
+            return self.tokenizer.encode(s, add_special_tokens=False)
+
+        def tok_decode(self, t, **kw):
+            return self.tokenizer.decode(t, skip_special_tokens=True)
+
+        def tok_decode_with_tags(self, t):
+            """Decode keeping special tokens visible so we can parse tags."""
+            return self.tokenizer.decode(t, skip_special_tokens=False)
+
+        def extract_answer(self, raw_text: str) -> str:
+            """Pull the <|answer|>...<|/answer|> region out of raw model output.
+
+            For benchmarks the model is trained to emit reasoning inside
+            <|think|>...<|/think|> and the actual answer inside
+            <|answer|>...<|/answer|>. If we submit the full decoded text as
+            the response, strict benchmarks (e.g. IFEval format checks,
+            GSM8K answer extraction) see the reasoning mixed in with the
+            answer and usually mark it wrong.
+
+            Strategy:
+              1. If <|answer|> is present, take everything up to <|/answer|>
+                 (or EOS/end if no close tag).
+              2. Else, if <|/think|> is present, take everything after it.
+              3. Else, fall back to the raw text.
+            Then strip any remaining special token markers from the result.
+            """
+            ANS_OPEN = "<|answer|>"
+            ANS_CLOSE = "<|/answer|>"
+            THINK_CLOSE = "<|/think|>"
+
+            text = raw_text
+            if ANS_OPEN in text:
+                start = text.index(ANS_OPEN) + len(ANS_OPEN)
+                tail = text[start:]
+                if ANS_CLOSE in tail:
+                    tail = tail[: tail.index(ANS_CLOSE)]
+                extracted = tail
+            elif THINK_CLOSE in text:
+                extracted = text.split(THINK_CLOSE, 1)[1]
+            else:
+                extracted = text
+
+            # Strip any residual special-token markers the harness might
+            # otherwise interpret as content.
+            for tok in (
+                "<|begin_of_text|>", "<|end_of_text|>", "<|padding|>",
+                "<|user|>", "<|assistant|>", "<|system|>",
+                "<|think|>", "<|/think|>", ANS_OPEN, ANS_CLOSE,
+                "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+                "<|unknown|>",
+            ):
+                extracted = extracted.replace(tok, "")
+            return extracted.strip()
 
         def _model_call(self, inps):
             with torch.no_grad():
@@ -665,15 +727,27 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 ctx_t = torch.tensor([ctx_ids], dtype=torch.long)
                 if ctx_t.shape[1] > self.max_length - max_gen:
                     ctx_t = ctx_t[:, -(self.max_length - max_gen):]
-                out = self.model.generate(ctx_t.to(self._device), max_new_tokens=max_gen,
-                                          temperature=0.0, eos_token_id=self.tokenizer.eos_token_id)
-                resp = self.tok_decode(out[0, ctx_t.shape[1]:].tolist())
+                out = self.model.generate(
+                    ctx_t.to(self._device),
+                    max_new_tokens=max_gen,
+                    temperature=0.0,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+                new_ids = out[0, ctx_t.shape[1]:].tolist()
+
+                # Decode keeping the special tokens visible so we can
+                # extract <|answer|>...<|/answer|>. Strict benchmarks need
+                # ONLY the answer, not the reasoning prefix.
+                raw = self.tok_decode_with_tags(new_ids)
+                resp = self.extract_answer(raw)
+
+                # Also respect the harness-provided stop strings.
                 for stop in until:
-                    if stop in resp:
+                    if stop and stop in resp:
                         resp = resp[:resp.index(stop)]
                 results.append(resp)
-                if (i+1) % 50 == 0:
-                    print(f"  Generated {i+1}/{len(requests)}")
+                if (i + 1) % 50 == 0:
+                    print(f"  Generated {i + 1}/{len(requests)}")
             return results
 
     lm = V4EvalModel()

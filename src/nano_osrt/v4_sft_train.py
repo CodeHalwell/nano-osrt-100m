@@ -65,20 +65,28 @@ def run_v4_sft(model_config: NanoOSRTv4Config, sft_cfg, vol, tokenizer) -> None:
         hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
                                 freeze_pretrained=sft_cfg.hra_freeze_pretrained)
 
-    # Load pretrained weights
+    # Load pretrained weights — SFT MUST start from a real pretrained
+    # checkpoint. Running SFT on a randomly-initialised model would waste
+    # compute and silently produce a garbage model.
     ckpt_path = sft_cfg.pretrained_checkpoint
-    if os.path.exists(ckpt_path):
-        print(f"Loading weights from {ckpt_path}...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"  Missing keys: {len(missing)}")
-        if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
-        print("  Weights loaded.")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"SFT refuses to start: pretrained checkpoint not found at {ckpt_path}. "
+            "Run pretrain first (modal run app_v4.py --stage pretrain)."
+        )
+
+    print(f"Loading weights from {ckpt_path}...")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
+    if unexpected:
+        print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
+    if not missing and not unexpected:
+        print("  Clean load: all keys matched.")
     else:
-        print(f"WARNING: Checkpoint not found: {ckpt_path}")
+        print("  Partial load: review the keys above if this is unexpected.")
 
     if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
         from nano_osrt.hra import inject_hra
