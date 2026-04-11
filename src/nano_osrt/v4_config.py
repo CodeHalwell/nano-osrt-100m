@@ -53,11 +53,14 @@ class NanoOSRTv4Config(PretrainedConfig):
         router_z_loss_coeff: float = 0.01,
         # Router noise: additive Gaussian on router logits before top-k
         # during training. Breaks deterministic tie-locking at init when
-        # all sigmoid probs are near 0.5. std=0.3 relative to logit std ~0.78
-        # at init gives ~40% perturbation, more than enough to diversify
-        # top-k selections while staying small vs learned logits late in
-        # training.
-        router_noise_std: float = 0.3,
+        # all sigmoid probs are near 0.5. Starts at router_noise_std_init
+        # and decays linearly to router_noise_std_final over
+        # router_noise_anneal_steps. By the end of warmup the router is
+        # on its own and training-time assign_H reflects learned routing,
+        # not randomness.
+        router_noise_std_init: float = 0.3,
+        router_noise_std_final: float = 0.02,
+        router_noise_anneal_steps: int = 5000,
         # Loop embedding init std — raised from the default initializer_range
         # (0.02) so that x + loop_emb actually produces per-loop routing
         # differentiation at init. At 0.02, loop_emb contribution to router
@@ -109,7 +112,9 @@ class NanoOSRTv4Config(PretrainedConfig):
         self.expert_hidden = expert_hidden
         self.router_aux_loss_coeff = router_aux_loss_coeff
         self.router_z_loss_coeff = router_z_loss_coeff
-        self.router_noise_std = router_noise_std
+        self.router_noise_std_init = router_noise_std_init
+        self.router_noise_std_final = router_noise_std_final
+        self.router_noise_anneal_steps = router_noise_anneal_steps
         self.loop_embedding_init_std = loop_embedding_init_std
 
         self.max_position_embeddings = max_position_embeddings

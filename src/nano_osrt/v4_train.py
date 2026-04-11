@@ -343,6 +343,20 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
+        # ── Anneal router noise linearly from init to final over
+        #    router_noise_anneal_steps (default 5000). Updates the
+        #    per-MoE noise_std buffer in-place so torch.compile sees a
+        #    fresh tensor each step without recompiling.
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        base = inner.model if hasattr(inner, "model") else inner
+        ns_init = model_config.router_noise_std_init
+        ns_final = model_config.router_noise_std_final
+        ns_anneal = max(model_config.router_noise_anneal_steps, 1)
+        noise_progress = min(step / ns_anneal, 1.0)
+        current_noise = ns_init + (ns_final - ns_init) * noise_progress
+        for blk in base.blocks:
+            blk.moe.noise_std.fill_(current_noise)
+
         optimizer.zero_grad(set_to_none=True)
         accum_loss = torch.tensor(0.0, device=device)
 
@@ -476,6 +490,52 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                     "lb_loss": _mean(block_lb_losses),
                     "z_loss": _mean(block_z_losses),
                 }
+
+                # ── Clean-routing diagnostic ──
+                # The noisy numbers above include router_noise_std
+                # perturbation, so they optimistically bias assign_H
+                # upward. Zero the noise buffers, run ONE extra forward
+                # pass on the same data (no gradients), read the
+                # telemetry, then restore the noise schedule. This
+                # gives us the "true" learned routing every log step.
+                clean_assign = None
+                clean_max = None
+                try:
+                    saved_noise = [blk.moe.noise_std.clone() for blk in base.blocks]
+                    for blk in base.blocks:
+                        blk.moe.noise_std.fill_(0.0)
+                    with torch.no_grad():
+                        _ = model(input_ids)
+                    # telemetry was refreshed by the clean forward
+                    clean_assign_entropies = []
+                    clean_max_fracs = []
+                    clean_min_fracs = []
+                    for blk in base.blocks:
+                        clean_assign_entropies.extend(blk.moe.last_assignment_entropy)
+                        for fracs in blk.moe.last_expert_fraction:
+                            if fracs:
+                                clean_max_fracs.append(max(fracs))
+                                clean_min_fracs.append(min(fracs))
+                    clean_assign = _mean(clean_assign_entropies)
+                    clean_max = _mean(clean_max_fracs)
+                    clean_min = _mean(clean_min_fracs)
+                    moe_metrics["moe/clean_assign_entropy_mean"] = clean_assign
+                    moe_metrics["moe/clean_expert_max_mean"] = clean_max
+                    moe_metrics["moe/clean_expert_min_mean"] = clean_min
+                    moe_summary["clean_assign_entropy"] = clean_assign
+                    moe_summary["clean_expert_max"] = clean_max
+                    moe_summary["clean_expert_min"] = clean_min
+                finally:
+                    # ALWAYS restore noise schedule, even if the
+                    # diagnostic forward raised.
+                    for blk, ns in zip(base.blocks, saved_noise):
+                        blk.moe.noise_std.copy_(ns)
+                    # Re-run one noisy forward to repopulate telemetry
+                    # for the next log cycle — otherwise the stored
+                    # last_* lists would reflect the clean forward and
+                    # skew the noisy training metrics next time.
+                    with torch.no_grad():
+                        _ = model(input_ids)
             except AttributeError:
                 pass  # model not fully set up yet (first step)
 
@@ -489,22 +549,68 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
 
             # Critical MoE health line — prints to stdout so we see
             # routing collapse immediately in the live Modal log instead
-            # of having to check W&B. Key number is assign_entropy:
+            # of having to check W&B. Key number is the CLEAN assign_H
+            # (no router noise), which reflects what the router has
+            # actually learned:
             #   ~2.40 (ln 11) = uniform, healthy
             #   ~2.00        = mildly concentrated
             #   ~1.00        = collapsing
             #   ~0.69 (ln 2) = full top-2 collapse
             if moe_summary is not None:
+                clean_H = moe_summary.get("clean_assign_entropy", float("nan"))
+                clean_max = moe_summary.get("clean_expert_max", float("nan"))
+                clean_min = moe_summary.get("clean_expert_min", float("nan"))
+                noise_std_now = current_noise
                 print(
-                    f"           moe: assign_H={moe_summary['assign_entropy']:.3f} "
-                    f"max={moe_summary['expert_max']:.3f} "
-                    f"min={moe_summary['expert_min']:.3f} | "
+                    f"           moe: clean assign_H={clean_H:.3f} "
+                    f"max={clean_max:.3f} "
+                    f"min={clean_min:.3f} | "
+                    f"noisy assign_H={moe_summary['assign_entropy']:.3f} "
+                    f"(noise_std={noise_std_now:.3f}) | "
                     f"gates d={moe_summary['dense_gate']:.4f} "
                     f"m={moe_summary['moe_gate']:.4f} | "
                     f"lb={moe_summary['lb_loss']:.3f} "
                     f"z={moe_summary['z_loss']:.3f}",
                     flush=True,
                 )
+
+                # ── Early-stop guard ──
+                # Criteria from the review: stop immediately if routing
+                # has collapsed in a way we can't recover from. We apply
+                # these to the CLEAN metrics (not the noisy training
+                # ones) and only after step 50 so random init noise
+                # doesn't trigger false alarms.
+                if step >= 50 and clean_H == clean_H:  # not NaN
+                    collapse_reasons = []
+                    if clean_H < 1.5:
+                        collapse_reasons.append(
+                            f"clean assign_H {clean_H:.3f} < 1.5 (severe collapse)"
+                        )
+                    if clean_max > 0.35:
+                        collapse_reasons.append(
+                            f"clean expert_max {clean_max:.3f} > 0.35 (concentrated)"
+                        )
+                    if clean_min < 1e-5:
+                        collapse_reasons.append(
+                            f"clean expert_min {clean_min:.5f} ~ 0 (dead experts)"
+                        )
+                    if collapse_reasons:
+                        print(
+                            "\n!!! MoE ROUTING COLLAPSE DETECTED — aborting run:",
+                            flush=True,
+                        )
+                        for r in collapse_reasons:
+                            print(f"    - {r}", flush=True)
+                        print(
+                            "Saving rescue checkpoint for post-mortem and exiting.",
+                            flush=True,
+                        )
+                        save_checkpoint(model, optimizer, step, rescue_path)
+                        vol.commit()
+                        if use_wandb:
+                            wandb.log({"train/aborted": 1.0}, step=step)
+                            wandb.finish()
+                        return
 
             if use_wandb:
                 log_dict = {

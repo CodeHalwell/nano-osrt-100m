@@ -120,10 +120,19 @@ class MoELayer(nn.Module):
         self.top_k = config.top_k_experts
         self.num_loops = config.recursive_loops
         self.z_loss_coeff = config.router_z_loss_coeff
-        # Additive Gaussian noise std on router logits during training.
-        # Fixes the deterministic top-2 tie-lock at init where all sigmoid
-        # probs are near 0.5 and topk always picks the first two indices.
-        self.noise_std = config.router_noise_std
+
+        # Router noise schedule. Stored as a scalar tensor buffer so
+        # torch.compile sees it as a graph input (no .item() graph break)
+        # and the training loop can update it in-place each step to
+        # implement the linear anneal from router_noise_std_init down to
+        # router_noise_std_final. Setting it to 0.0 temporarily lets the
+        # training loop run "clean" diagnostic forwards that measure
+        # learned routing without the noise perturbation.
+        self.register_buffer(
+            "noise_std",
+            torch.tensor(config.router_noise_std_init, dtype=torch.float32),
+            persistent=False,
+        )
 
         # Shared expert (always active)
         self.shared_expert = ExpertFFN(config.dim, config.expert_hidden)
@@ -208,8 +217,11 @@ class MoELayer(nn.Module):
         # Training-time router noise (Switch-Transformer style). Breaks
         # deterministic top-k tie-locking at init when all sigmoid values
         # are near 0.5 and the same two indices would win every time.
-        # Applied only in training; eval/inference uses clean logits.
-        if self.training and self.noise_std > 0:
+        # noise_std is a scalar tensor buffer — zero means clean routing,
+        # so no Python-level branching is required and torch.compile
+        # stays happy. Training loop sets it to 0.0 temporarily during
+        # diagnostic forwards to measure learned (non-random) routing.
+        if self.training:
             router_logits = router_logits + torch.randn_like(router_logits) * self.noise_std
 
         # Sigmoid gating: each expert gate is independent (DeepSeek-V3 style)
