@@ -24,7 +24,10 @@ app = modal.App("nano-osrt-v4")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "build-essential")
-    .env({"TORCH_LOGS": "perf_hints"})
+    # PYTHONUNBUFFERED=1 forces line-buffered stdout/stderr inside the
+    # container, otherwise long-running stages like tokenizer sampling
+    # look frozen from the local log stream until the buffer flushes.
+    .env({"TORCH_LOGS": "perf_hints", "PYTHONUNBUFFERED": "1"})
     .pip_install(
         "torch==2.10.0+cu128",
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
@@ -62,15 +65,23 @@ def train_tokenizer():
     import sys
     sys.path.insert(0, "/root")
 
+    # Force unbuffered stdout so Modal's log tail shows progress in real
+    # time (belt-and-braces over PYTHONUNBUFFERED in the image env).
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     from scripts.train_tokenizer import sample_training_data, train_with_hf_tokenizers
 
-    print("=" * 60)
-    print("NanoOSRT v4 — Custom 32K Tokenizer Training")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("NanoOSRT v4 — Custom 32K Tokenizer Training", flush=True)
+    print("=" * 60, flush=True)
 
-    # Sample 10GB of training data (proportional to pre-training mix)
-    print("\nSampling training data...")
-    data_path = sample_training_data(sample_size=10_000_000_000)
+    # Sample 2GB of training data (proportional to pre-training mix).
+    # 2GB is the sweet spot for a 32K BPE tokenizer: diminishing returns
+    # kick in past that, and larger samples expose us to more HF Hub
+    # connection drops (see ~10GB run that died on repeated timeouts).
+    print("\nSampling training data...", flush=True)
+    data_path = sample_training_data(sample_size=2_000_000_000)
 
     # Train tokenizer
     output_dir = "/vol/tokenizer"
@@ -80,7 +91,7 @@ def train_tokenizer():
     import os
     os.remove(data_path)
 
-    print("\nTokenizer saved to Modal volume 'osrt-v4-tokenizer'")
+    print("\nTokenizer saved to Modal volume 'osrt-v4-tokenizer'", flush=True)
 
 
 # =============================================================================

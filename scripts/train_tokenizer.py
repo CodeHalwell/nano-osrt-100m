@@ -37,16 +37,24 @@ except ImportError:
     pass
 
 
-def sample_training_data(sample_size: int = 50_000_000, seed: int = 42) -> str:
+def sample_training_data(sample_size: int = 2_000_000_000, seed: int = 42) -> str:
     """Sample training data from pre-training mix and save to temp file.
 
     Samples proportionally:
       - 55% FineWeb-Edu (general text)
-      - 30% StarCoder Python (code)
+      - 30% CodeParrot Clean (code)
       - 15% Wikipedia (factual/STEM)
 
+    For a 32K BPE tokenizer, ~2GB of training data is the sweet spot —
+    larger samples hit diminishing returns on merge quality and expose
+    us to more HF Hub network issues.
+
+    Resilient to transient HF Hub connection drops: if a source fails
+    partway through, we log the partial collection and move on to the
+    next source instead of aborting the whole run.
+
     Args:
-        sample_size: Target number of characters to sample.
+        sample_size: Target number of characters to sample (default 2GB).
         seed: Random seed.
 
     Returns:
@@ -78,33 +86,120 @@ def sample_training_data(sample_size: int = 50_000_000, seed: int = 42) -> str:
         },
     ]
 
+    def _log(msg: str) -> None:
+        """Print with explicit flush so Modal log tail stays live."""
+        print(msg, flush=True)
+
+    def _stream_with_retry(src: dict, target_chars: int) -> int:
+        """Stream from one source, retrying on transient errors.
+
+        Logs progress every ~10MB and on every retry so the run is never
+        silent. Returns the number of characters successfully written.
+        """
+        max_attempts = 3
+        collected = 0
+        last_error = None
+        # Log roughly every 10MB of accumulated text.
+        progress_every = 10_000_000
+        next_progress_at = progress_every
+        src_start = time.time()
+
+        for attempt in range(1, max_attempts + 1):
+            if collected >= target_chars:
+                break
+            try:
+                load_kwargs = {"split": "train", "streaming": True}
+                if "hf_config" in src:
+                    load_kwargs["name"] = src["hf_config"]
+
+                _log(
+                    f"    [{src['name']}] attempt {attempt}/{max_attempts}: "
+                    f"opening stream..."
+                )
+                ds = load_dataset(src["hf_id"], **load_kwargs)
+                ds = ds.shuffle(buffer_size=10_000, seed=seed + attempt)
+                _log(f"    [{src['name']}] stream ready, reading examples...")
+
+                examples_seen = 0
+                for example in ds:
+                    examples_seen += 1
+                    text = example.get(src["text_key"], "")
+                    if not text or len(text) < 100:
+                        continue
+                    tmp.write(text + "\n")
+                    collected += len(text)
+
+                    if collected >= next_progress_at:
+                        elapsed = time.time() - src_start
+                        mb = collected / 1e6
+                        pct = collected / target_chars * 100
+                        rate = mb / elapsed if elapsed > 0 else 0
+                        _log(
+                            f"    [{src['name']}] {mb:.0f} MB "
+                            f"({pct:.1f}% of target, "
+                            f"{examples_seen:,} examples read, "
+                            f"{rate:.1f} MB/s, {elapsed:.0f}s elapsed)"
+                        )
+                        next_progress_at += progress_every
+
+                    if collected >= target_chars:
+                        break
+                # Clean exit — loop terminated because we hit target or
+                # the stream ended naturally.
+                elapsed = time.time() - src_start
+                _log(
+                    f"    [{src['name']}] stream finished at {collected / 1e6:.0f} MB "
+                    f"({examples_seen:,} examples, {elapsed:.0f}s)"
+                )
+                return collected
+            except Exception as e:
+                last_error = e
+                pct = collected / target_chars * 100 if target_chars else 0
+                _log(
+                    f"    [{src['name']}] attempt {attempt}/{max_attempts} "
+                    f"hit {type(e).__name__}: {str(e)[:120]}"
+                )
+                _log(
+                    f"    [{src['name']}] {collected / 1e6:.0f} MB collected so far "
+                    f"({pct:.0f}% of target), retrying from fresh stream..."
+                )
+
+        if last_error and collected < target_chars:
+            pct = collected / target_chars * 100 if target_chars else 0
+            _log(
+                f"    [{src['name']}] giving up after {max_attempts} attempts "
+                f"({collected / 1e6:.0f} MB, {pct:.0f}% of target)"
+            )
+        return collected
+
+    sample_start = time.time()
+    _log(f"  Target: {sample_size:,} chars ({sample_size / 1e9:.1f} GB)")
+
     total_chars = 0
     for src in sources:
         target_chars = int(sample_size * src["fraction"])
-        chars = 0
-
-        print(f"  Sampling {src['name']} ({target_chars:,} chars target)...")
-        load_kwargs = {"split": "train", "streaming": True}
-        if "hf_config" in src:
-            load_kwargs["name"] = src["hf_config"]
-
-        ds = load_dataset(src["hf_id"], **load_kwargs)
-        ds = ds.shuffle(buffer_size=10_000, seed=seed)
-
-        for example in ds:
-            text = example.get(src["text_key"], "")
-            if not text or len(text) < 100:
-                continue
-            tmp.write(text + "\n")
-            chars += len(text)
-            if chars >= target_chars:
-                break
-
-        total_chars += chars
-        print(f"    Collected {chars:,} chars")
+        _log(
+            f"  Sampling {src['name']} "
+            f"({target_chars:,} chars target, {target_chars / 1e9:.2f} GB)..."
+        )
+        got = _stream_with_retry(src, target_chars)
+        total_chars += got
+        _log(f"    Collected {got:,} chars from {src['name']}")
 
     tmp.close()
-    print(f"  Total: {total_chars:,} chars -> {tmp.name}")
+    elapsed = time.time() - sample_start
+    _log(
+        f"  Sampling complete: {total_chars:,} chars "
+        f"({total_chars / 1e9:.2f} GB) in {elapsed:.0f}s -> {tmp.name}"
+    )
+
+    if total_chars < 100_000_000:  # <100MB is too little even for 32K BPE
+        raise RuntimeError(
+            f"Sampling produced only {total_chars:,} chars (<100MB). "
+            "Network to HF Hub is probably broken. Retry later or "
+            "lower the target further."
+        )
+
     return tmp.name
 
 
@@ -123,8 +218,8 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
         trainers,
     )
 
-    print("\nTraining BPE tokenizer with HuggingFace tokenizers...")
-    print(f"  Vocab size: {vocab_size:,}")
+    print("\nTraining BPE tokenizer with HuggingFace tokenizers...", flush=True)
+    print(f"  Vocab size: {vocab_size:,}", flush=True)
 
     # BPE model with byte fallback
     tokenizer = Tokenizer(models.BPE())
@@ -159,10 +254,17 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
-    print("  Training (this may take a while)...")
+    # Report sample size in MB so the user can estimate training time.
+    import os as _os
+    sample_mb = _os.path.getsize(data_path) / 1e6
+    print(
+        f"  Training on {sample_mb:.0f} MB of text "
+        f"(this usually takes 2-10 min depending on CPU speed)...",
+        flush=True,
+    )
     t0 = time.time()
     tokenizer.train([data_path], trainer)
-    print(f"  Training done in {time.time() - t0:.0f}s")
+    print(f"  Training done in {time.time() - t0:.0f}s", flush=True)
 
     # Post-processor: add BOS/EOS
     tokenizer.post_processor = processors.TemplateProcessing(
