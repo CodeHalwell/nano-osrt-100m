@@ -399,30 +399,46 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             tok_per_sec = eff_batch * current_seq_len / max(elapsed / max(step - start_step, 1), 1e-8)
 
             # ── MoE diagnostics (cheap, high-value for debugging) ──
-            # Pull gate values, aux losses, router entropy, and expert
-            # usage fractions from the compiled model via the unwrapped
-            # inner module. Values are per physical block and per loop.
+            # Pull gate values, aux losses, router entropy, expert usage
+            # fractions, and (most importantly) assignment entropy from the
+            # compiled model via the unwrapped inner module. Values are per
+            # physical block and per loop. Key summary numbers are also
+            # printed to stdout so we catch routing collapse in real time
+            # without needing the W&B dashboard.
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
             moe_metrics = {}
+            # Collected for stdout summary line
+            moe_summary = None
             try:
                 base = inner.model if hasattr(inner, "model") else inner
                 block_lb_losses = []
                 block_z_losses = []
-                all_entropies = []
+                prob_entropies = []
+                assign_entropies = []
                 max_fracs = []
                 min_fracs = []
+                dense_gates = []
+                moe_gates = []
                 for bi, blk in enumerate(base.blocks):
-                    moe_metrics[f"moe/dense_gate_b{bi}"] = blk.dense_gate.item()
-                    moe_metrics[f"moe/moe_gate_b{bi}"] = blk.moe_gate.item()
+                    dg = blk.dense_gate.item()
+                    mg = blk.moe_gate.item()
+                    dense_gates.append(dg)
+                    moe_gates.append(mg)
+                    moe_metrics[f"moe/dense_gate_b{bi}"] = dg
+                    moe_metrics[f"moe/moe_gate_b{bi}"] = mg
                     if blk.moe.load_balance_loss is not None:
                         block_lb_losses.append(blk.moe.load_balance_loss.item())
                     if blk.moe.z_loss is not None:
                         block_z_losses.append(blk.moe.z_loss.item())
 
-                    # Per-loop router entropy for this block
+                    # Per-loop router-prob entropy (can be misleading) +
+                    # per-loop assignment entropy (the real metric).
                     for li, ent in enumerate(blk.moe.last_router_entropy):
-                        moe_metrics[f"moe/entropy_b{bi}_l{li}"] = ent
-                        all_entropies.append(ent)
+                        moe_metrics[f"moe/prob_entropy_b{bi}_l{li}"] = ent
+                        prob_entropies.append(ent)
+                    for li, ent in enumerate(blk.moe.last_assignment_entropy):
+                        moe_metrics[f"moe/assign_entropy_b{bi}_l{li}"] = ent
+                        assign_entropies.append(ent)
 
                     # Per-loop expert usage: track max and min fraction
                     # (tight gap = collapsed routing, wide gap = specialisation)
@@ -435,16 +451,31 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                             max_fracs.append(mx)
                             min_fracs.append(mn)
 
+                def _mean(xs):
+                    return sum(xs) / len(xs) if xs else 0.0
+
                 if block_lb_losses:
-                    moe_metrics["moe/load_balance_loss_mean"] = sum(block_lb_losses) / len(block_lb_losses)
+                    moe_metrics["moe/load_balance_loss_mean"] = _mean(block_lb_losses)
                 if block_z_losses:
-                    moe_metrics["moe/z_loss_mean"] = sum(block_z_losses) / len(block_z_losses)
-                if all_entropies:
-                    moe_metrics["moe/entropy_mean"] = sum(all_entropies) / len(all_entropies)
+                    moe_metrics["moe/z_loss_mean"] = _mean(block_z_losses)
+                if prob_entropies:
+                    moe_metrics["moe/prob_entropy_mean"] = _mean(prob_entropies)
+                if assign_entropies:
+                    moe_metrics["moe/assign_entropy_mean"] = _mean(assign_entropies)
                 if max_fracs:
-                    moe_metrics["moe/expert_max_mean"] = sum(max_fracs) / len(max_fracs)
+                    moe_metrics["moe/expert_max_mean"] = _mean(max_fracs)
                 if min_fracs:
-                    moe_metrics["moe/expert_min_mean"] = sum(min_fracs) / len(min_fracs)
+                    moe_metrics["moe/expert_min_mean"] = _mean(min_fracs)
+
+                moe_summary = {
+                    "assign_entropy": _mean(assign_entropies),
+                    "expert_max": _mean(max_fracs),
+                    "expert_min": _mean(min_fracs),
+                    "dense_gate": _mean(dense_gates),
+                    "moe_gate": _mean(moe_gates),
+                    "lb_loss": _mean(block_lb_losses),
+                    "z_loss": _mean(block_z_losses),
+                }
             except AttributeError:
                 pass  # model not fully set up yet (first step)
 
@@ -452,8 +483,28 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                 f"step {step:>7d}/{train_cfg.total_steps} | "
                 f"loss {accum_loss.item():.4f} | lr {lr:.2e} | "
                 f"vram {vram_gb:.1f}GB | tok/s {tok_per_sec:,.0f} | "
-                f"phase {current_phase} | seq_len {current_seq_len}"
+                f"phase {current_phase} | seq_len {current_seq_len}",
+                flush=True,
             )
+
+            # Critical MoE health line — prints to stdout so we see
+            # routing collapse immediately in the live Modal log instead
+            # of having to check W&B. Key number is assign_entropy:
+            #   ~2.40 (ln 11) = uniform, healthy
+            #   ~2.00        = mildly concentrated
+            #   ~1.00        = collapsing
+            #   ~0.69 (ln 2) = full top-2 collapse
+            if moe_summary is not None:
+                print(
+                    f"           moe: assign_H={moe_summary['assign_entropy']:.3f} "
+                    f"max={moe_summary['expert_max']:.3f} "
+                    f"min={moe_summary['expert_min']:.3f} | "
+                    f"gates d={moe_summary['dense_gate']:.4f} "
+                    f"m={moe_summary['moe_gate']:.4f} | "
+                    f"lb={moe_summary['lb_loss']:.3f} "
+                    f"z={moe_summary['z_loss']:.3f}",
+                    flush=True,
+                )
 
             if use_wandb:
                 log_dict = {

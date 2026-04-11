@@ -129,13 +129,41 @@ def test_moe_telemetry_records_per_loop():
     for blk in model.model.blocks:
         # One entry per recursive loop
         assert len(blk.moe.last_router_entropy) == cfg.recursive_loops
+        assert len(blk.moe.last_assignment_entropy) == cfg.recursive_loops
         assert len(blk.moe.last_expert_fraction) == cfg.recursive_loops
-        # Entropy should be > 0 (distribution is not a point mass)
+        # Both entropies should be > 0 (distribution is not a point mass)
         assert all(e > 0 for e in blk.moe.last_router_entropy)
+        assert all(e > 0 for e in blk.moe.last_assignment_entropy)
         # Each fraction row sums to ~1.0
         for fracs in blk.moe.last_expert_fraction:
             assert len(fracs) == cfg.num_routed_experts
             assert abs(sum(fracs) - 1.0) < 1e-4
+
+
+def test_assignment_entropy_detects_collapse():
+    """Assignment entropy should be much lower when routing is collapsed."""
+    import math
+
+    cfg = _tiny_config(router_noise_std=0.0)  # kill noise so we can construct a deterministic fake
+    model = NanoOSRTv4ForCausalLM(cfg)
+
+    # Build a synthetic top_k_indices that picks only experts 0 and 1
+    collapsed = torch.zeros(1, 16, cfg.top_k_experts, dtype=torch.long)
+    collapsed[..., 0] = 0  # all top-1 to expert 0
+    collapsed[..., 1] = 1  # all top-2 to expert 1
+    fake_probs = torch.full((1, 16, cfg.num_routed_experts), 0.5)
+
+    moe = model.model.blocks[0].moe
+    moe._record_telemetry(fake_probs, collapsed, loop_idx=0)
+
+    # Full top-2 collapse gives exactly ln(2) = 0.693.
+    # Uniform routing over 3 routed experts gives ln(3) = 1.099.
+    # We want the collapsed case to register as strictly lower than uniform.
+    assert moe.last_assignment_entropy[0] < math.log(cfg.num_routed_experts) - 0.2
+    assert abs(moe.last_assignment_entropy[0] - math.log(2)) < 0.05
+    # Prob entropy is still near-uniform because all fake probs are equal —
+    # this is the exact "misleading" case we wanted assignment entropy to catch.
+    assert moe.last_router_entropy[0] > math.log(cfg.num_routed_experts) * 0.9
 
 
 def test_gates_initialised_dense_first():

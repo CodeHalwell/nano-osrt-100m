@@ -46,8 +46,23 @@ class NanoOSRTv4Config(PretrainedConfig):
         num_routed_experts: int = 11,
         top_k_experts: int = 2,
         expert_hidden: int = 1024,
-        router_aux_loss_coeff: float = 0.01,
-        router_z_loss_coeff: float = 0.001,
+        # Stronger regularization to prevent the top-2 collapse we saw in
+        # the first v4 sanity run (expert_max_mean ~0.5 at step 200 while
+        # router_prob_entropy was still near-uniform).
+        router_aux_loss_coeff: float = 0.05,
+        router_z_loss_coeff: float = 0.01,
+        # Router noise: additive Gaussian on router logits before top-k
+        # during training. Breaks deterministic tie-locking at init when
+        # all sigmoid probs are near 0.5. std=0.3 relative to logit std ~0.78
+        # at init gives ~40% perturbation, more than enough to diversify
+        # top-k selections while staying small vs learned logits late in
+        # training.
+        router_noise_std: float = 0.3,
+        # Loop embedding init std — raised from the default initializer_range
+        # (0.02) so that x + loop_emb actually produces per-loop routing
+        # differentiation at init. At 0.02, loop_emb contribution to router
+        # logits is ~0.016 vs ~0.78 from x → effectively invisible.
+        loop_embedding_init_std: float = 0.1,
 
         # Sequence length
         max_position_embeddings: int = 8192,
@@ -94,6 +109,8 @@ class NanoOSRTv4Config(PretrainedConfig):
         self.expert_hidden = expert_hidden
         self.router_aux_loss_coeff = router_aux_loss_coeff
         self.router_z_loss_coeff = router_z_loss_coeff
+        self.router_noise_std = router_noise_std
+        self.loop_embedding_init_std = loop_embedding_init_std
 
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta

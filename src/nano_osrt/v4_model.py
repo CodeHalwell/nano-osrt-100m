@@ -120,6 +120,10 @@ class MoELayer(nn.Module):
         self.top_k = config.top_k_experts
         self.num_loops = config.recursive_loops
         self.z_loss_coeff = config.router_z_loss_coeff
+        # Additive Gaussian noise std on router logits during training.
+        # Fixes the deterministic top-2 tie-lock at init where all sigmoid
+        # probs are near 0.5 and topk always picks the first two indices.
+        self.noise_std = config.router_noise_std
 
         # Shared expert (always active)
         self.shared_expert = ExpertFFN(config.dim, config.expert_hidden)
@@ -136,7 +140,17 @@ class MoELayer(nn.Module):
         # halving router params with equivalent expressive power because a
         # linear layer over cat([x, e]) can always be re-expressed as the
         # sum of two linear layers over x and e.
+        #
+        # Loop embeddings get their own larger init_std (config.loop_embedding_init_std,
+        # default 0.1) so that they actually shift routing between loops at
+        # init — the default 0.02 was too small compared to the x-signal
+        # std ~0.78, making early routing loop-invariant.
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
+        nn.init.normal_(
+            self.loop_embeddings.weight,
+            mean=0.0,
+            std=config.loop_embedding_init_std,
+        )
         self.router = nn.Linear(config.dim, self.num_routed, bias=False)
 
         # Pre-register loop index tensors to avoid torch.tensor() in forward
@@ -151,7 +165,16 @@ class MoELayer(nn.Module):
         # Per-loop telemetry — indexed [0..num_loops-1], overwritten on
         # each forward. Used by the training loop for per-loop W&B metrics.
         # Keep as plain tensors (no grad) so logging is free.
+        #
+        # router_prob_entropy: entropy of the normalised sigmoid probs. Can
+        # be near-uniform even when top-k is collapsed — not a reliable
+        # collapse detector by itself.
+        #
+        # assignment_entropy: entropy of the actual top-k token assignment
+        # distribution. Uniform routing gives ~ln(num_routed)=2.40, full
+        # top-2 collapse gives ~ln(2)=0.69. THIS is the reliable metric.
         self.last_router_entropy: list[float] = [0.0] * config.recursive_loops
+        self.last_assignment_entropy: list[float] = [0.0] * config.recursive_loops
         self.last_expert_fraction: list[list[float]] = [
             [0.0] * config.num_routed_experts for _ in range(config.recursive_loops)
         ]
@@ -182,11 +205,26 @@ class MoELayer(nn.Module):
         router_input = x + loop_emb  # (B, S, dim)
         router_logits = self.router(router_input)  # (B, S, num_routed)
 
+        # Training-time router noise (Switch-Transformer style). Breaks
+        # deterministic top-k tie-locking at init when all sigmoid values
+        # are near 0.5 and the same two indices would win every time.
+        # Applied only in training; eval/inference uses clean logits.
+        if self.training and self.noise_std > 0:
+            router_logits = router_logits + torch.randn_like(router_logits) * self.noise_std
+
         # Sigmoid gating: each expert gate is independent (DeepSeek-V3 style)
         router_probs = torch.sigmoid(router_logits)
 
-        # Top-k selection (no renormalization needed with sigmoid)
+        # Top-k selection
         top_k_weights, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+
+        # Renormalise the selected weights so their sum is 1.0 per token.
+        # Without this, if all sigmoid values are small (e.g. early training
+        # with low-magnitude logits) the routed MoE output magnitude is
+        # also small and gradients into the router are suppressed. With
+        # renormalisation, the routed output has a consistent scale
+        # regardless of the absolute sigmoid magnitudes.
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # Compute load balancing + z-loss (kept separate for independent scaling)
         if self.training:
@@ -287,26 +325,42 @@ class MoELayer(nn.Module):
     def _record_telemetry(
         self, router_probs: Tensor, top_k_indices: Tensor, loop_idx: int,
     ) -> None:
-        """Record per-loop router entropy and expert-fraction histogram.
+        """Record per-loop routing telemetry.
 
         Called inside forward() during training only. Values live on CPU
-        as plain Python lists so the training loop can log them cheaply
-        without touching the compiled graph.
-        """
-        # Router entropy: how spread-out is the distribution? Low entropy
-        # means routing is collapsing (one expert dominates).
-        # Normalise sigmoid probs to a distribution first so entropy is bounded.
-        norm = router_probs / (router_probs.sum(dim=-1, keepdim=True) + 1e-8)
-        entropy = -(norm * (norm + 1e-8).log()).sum(dim=-1).mean()
-        if 0 <= loop_idx < len(self.last_router_entropy):
-            self.last_router_entropy[loop_idx] = entropy.item()
+        as plain Python lists so the training loop can log them cheaply.
 
-        # Fraction of tokens routed to each expert (top-k counts / total).
+        Two entropy metrics:
+          - router_prob_entropy: entropy of the normalised sigmoid probs.
+            CAN BE MISLEADING — near-uniform sigmoid can still produce
+            deterministic top-k (the failure mode we saw at step 200 of
+            the first sanity run).
+          - assignment_entropy: entropy of the actual top-k token
+            assignment distribution. Uniform routing over 11 experts
+            gives ~ln(11) = 2.40; full top-2 collapse gives ~ln(2) = 0.69.
+            THIS is the reliable collapse detector.
+        """
+        # 1. Router-prob entropy (kept for backwards compat + sanity)
+        norm = router_probs / (router_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        prob_entropy = -(norm * (norm + 1e-8).log()).sum(dim=-1).mean()
+        if 0 <= loop_idx < len(self.last_router_entropy):
+            self.last_router_entropy[loop_idx] = prob_entropy.item()
+
+        # 2. Assignment entropy + per-expert fractions
         flat = top_k_indices.reshape(-1)
         counts = torch.bincount(flat, minlength=self.num_routed).float()
-        fractions = (counts / counts.sum().clamp_min(1)).tolist()
+        total = counts.sum().clamp_min(1)
+        fractions_tensor = counts / total
+        fractions = fractions_tensor.tolist()
         if 0 <= loop_idx < len(self.last_expert_fraction):
             self.last_expert_fraction[loop_idx] = fractions
+
+        # Entropy over the actual assignment distribution (the real metric)
+        assign_entropy = -(
+            fractions_tensor * (fractions_tensor + 1e-8).log()
+        ).sum()
+        if 0 <= loop_idx < len(self.last_assignment_entropy):
+            self.last_assignment_entropy[loop_idx] = assign_entropy.item()
 
 
 # ── Dense FFN ───────────────────────────────────────────────────────────
