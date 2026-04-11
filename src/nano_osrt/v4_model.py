@@ -1,15 +1,26 @@
 """NanoOSRT v4 — Recursive MoE Model.
 
-3 physical blocks × 6 recursive loops = 18 effective layers.
-Each block: causal attention + dense SwiGLU FFN + MoE FFN (parallel residual).
-MoE: 1 shared expert (always active) + 11 routed experts (top-2).
-Loop-aware router with learned loop embeddings.
+3 physical blocks × 6 recursive loops = 18 block applications.
+Each block: causal attention (parallel adapter branch) + dense SwiGLU
+FFN + MoE FFN with parallel residual gating (dense_gate=1.0, moe_gate=0.01
+init — dense-first warmup).
+
+MoE: 1 shared expert (always active) + 11 routed experts (top-2,
+sigmoid gating). Loop-aware router adds a learned per-loop embedding
+to the hidden state before projecting (additive, not concat).
 
 HuggingFace-compatible from day one via PreTrainedModel.
 
-Physical params: ~356M (with 64K vocab)
-Active params/token: ~180M
-Effective params (recursive): ~2.1B
+Default config (32K vocab, dim=1536):
+  Physical params      : ~306M
+  Active / token (body): ~130M (shared expert + 2 of 11 routed + dense + attn)
+  Block applications    : 18    (num_blocks × recursive_loops)
+
+Note: "effective parameters" is a misleading narrative at this scale.
+The model has 306M unique weights — it just runs them 6 times per forward
+with distinct per-pass adapters and loop-conditioned routing. Think of it
+as iterative refinement on a fixed parameter budget, not a 1:1 substitute
+for a dense 1.8B model.
 """
 
 import torch

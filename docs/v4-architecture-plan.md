@@ -29,27 +29,65 @@ to dramatically increase model capacity while keeping active compute manageable.
 
 ### 1.1 Block Structure
 
-Each of the 3 physical `RecursiveBlock` modules contains:
+Each of the 3 physical `RecursiveBlock` modules runs three parallel
+branches into a shared residual stream. The adapter is an additive
+parallel branch alongside attention — attention always reads the
+clean (un-adapted) residual, and the adapter contribution survives
+into downstream layers as part of the residual sum.
 
 ```
-Input
-  ├── RMSNorm → Per-pass adapter → Causal Attention (RoPE) → Residual
-  ├── RMSNorm → Dense SwiGLU FFN → Residual
-  └── RMSNorm → MoE FFN (shared + top-2 routed) → Residual
+                    x  ──┬─────────────┐
+                         │             │
+         ┌───────────────┤        adapter_out =
+         │               │        scale * (x @ A @ B)
+     RMSNorm             │             │
+         │               │             │
+     Attention           │             │
+  (QKV + RoPE + SDPA)    │             │
+         │               │             │
+     out_proj ───────────┘             │
+                         │             │
+                         │  x = x + attn_out + adapter_out
+                         │             │
+                         │             ▼
+                         │       (block residual)
+                         │             │
+           ┌─────────────┴─────────────┤
+           │                           │
+       RMSNorm                     RMSNorm
+           │                           │
+     Dense SwiGLU              MoE FFN (loop-aware)
+           │                           │
+           ▼                           ▼
+   dense_gate=1.0            moe_gate=0.01 (init)
+         (1.0) × h_dense     (0.01) × h_moe
+           │                           │
+           └──────────┬────────────────┘
+                      ▼
+         x = x + dense_gate * h_dense
+               + moe_gate   * h_moe
 ```
 
-The dense FFN and MoE FFN run in **parallel residual** paths:
-
+Pseudocode:
 ```python
-# Dense path (always active, full capacity)
-h_dense = self.ffn_dense(self.norm_dense(x))
+# Additive parallel adapter — attention reads the clean x
+adapter_out = scale * (x @ A @ B)
+attn_out = attention(norm_attn(x))
+x = x + out_proj(attn_out) + adapter_out
 
-# Sparse MoE path (shared expert + top-2 routed)
-h_moe = self.moe(self.norm_moe(x))
-
-# Combined residual
-x = x + h_dense + h_moe
+# Parallel dense + MoE FFN with learnable gates
+h_dense = ffn_dense(norm_dense(x))
+h_moe   = moe(norm_moe(x), loop_idx)
+x = x + dense_gate * h_dense + moe_gate * h_moe
 ```
+
+Key choices:
+- Adapter as parallel branch (not pre-attention shift) — attention
+  never has to compensate for a random-init adapter direction.
+- `moe_gate = 0.01` at init — model starts near-pure-dense and
+  gradually blends in the MoE path as the router and experts
+  specialise. Avoids destabilising early training with random MoE
+  contributions before the router has learned anything useful.
 
 ### 1.2 MoE Layer
 
@@ -101,28 +139,36 @@ x = x + h_dense + h_moe
 
 | Component | Params |
 |-----------|--------|
-| Token embedding (32K × 1536) | 49.2M |
+| Token embedding (32K × 1536) | 50.3M |
 | Blocks (3) | 254.8M |
 | Per-pass adapters (18 × rank 16) | 0.88M |
-| Norm layers (loop + output) | 3.1K |
-| Router weights (3 blocks × 11) | ~50K |
-| **Total physical** | **~305M** |
-| **Active per token** | **~155M** |
-| **Effective (recursive ×6)** | **~930M** |
+| Norm layers (loop + output) | ~3K |
+| Router weights (3 × 11 × 1536) | ~50K |
+| Loop embeddings (6 × 1536) | ~9K |
+| Dense/MoE gates (6 scalars) | 6 |
+| **Total physical**            | **~306M** |
+| **Active transformer body**   | **~130M** per-token compute (excl. embedding lookup) |
+| **Block applications**        | **6** (via recursive weight sharing) |
 
-> Note: Physical params are higher than 200M target. Options to reduce:
-> - Reduce to 8 experts (saves ~60M)
-> - Reduce expert hidden to 768 (saves ~40M)
-> - Reduce dim to 1408 (saves ~30M across everything)
-> - Drop to 2 blocks (back to v3 structure, saves ~85M)
+### Parameter accounting notes
 
-**Recommended trim: 8 routed experts + 1 shared = 9 total, expert hidden 896:**
-
-| | 12 experts | 9 experts (trimmed) |
-|--|-----------|-------------------|
-| Physical | ~305M | ~220M |
-| Active/token | ~155M | ~135M |
-| Effective | ~930M | ~810M |
+- "Effective params" is **not** the same as a dense model with that many
+  independent weights. The model has 306M unique parameters; each
+  forward runs the transformer body ~6 times with distinct per-pass
+  adapters and loop-conditioned routing. Think of the 1.8B "effective"
+  number as the **per-token compute budget**, not as memorisation
+  capacity.
+- **Active per token** is what determines inference speed. Only the
+  shared expert plus 2 of 11 routed experts run per token per loop,
+  so even though the routed pool is 156M, only ~28M of it is used per
+  token (top-2 of 11 ≈ 18% of expert params). Plus dense FFN (57M),
+  attention (28M), and shared expert (14M), giving ~130M transformer
+  body compute per token per block application.
+- **Why this is interesting**: 130M active / 306M physical is a 43%
+  activation ratio — tight, which gives the model specialised capacity
+  without exploding inference cost. Compared to a dense 306M model,
+  v4 gets an additional 162M of specialist weights "for free" in terms
+  of per-token inference FLOPs.
 
 ### 1.4 Tokenizer
 

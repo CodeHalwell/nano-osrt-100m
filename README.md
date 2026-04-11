@@ -438,7 +438,7 @@ uv run modal run app.py --stage eval
 ### v4 Training
 
 ```bash
-# Train custom 32K tokenizer
+# Train custom 32K tokenizer (~8 min on A100, ~$2)
 uv run modal run --detach app_v4.py --stage tokenizer
 
 # Pre-training (progressive seq_len)
@@ -453,6 +453,25 @@ uv run modal run --detach app_v4.py --stage grpo
 # Benchmarks
 uv run modal run app_v4.py --stage eval
 ```
+
+**Recommended first run: sanity check, not full send.** Launch the pretrain
+stage, watch the first ~500-1000 steps in W&B, and confirm the following
+signals before committing more GPU hours:
+
+| What to watch | Healthy signal |
+|---|---|
+| `train/loss` | Drops from ~10.4 baseline (ln 32768) toward ~7-8 within the warmup |
+| `train/tok_per_sec` | Stable at >20K on H100 at seq_len 2048 |
+| `moe/dense_gate_b{0,1,2}` | Starts at 1.0, drifts slowly — not collapsing |
+| `moe/moe_gate_b{0,1,2}` | Starts at 0.01, grows as router learns |
+| `moe/entropy_mean` | ≥ 2.0 (router not collapsing; ln(11) ≈ 2.40 is max) |
+| `moe/expert_max_mean` | < 0.4 (no single expert eating most tokens) |
+| `moe/load_balance_loss_mean` | Stable, not exploding |
+| `eval/loss` | Slowly improving on the held-out FineWeb-Edu stream |
+
+If anything is off — routing collapse, slow tok/s, NaN loss — stop the run
+early, diagnose, and restart. Cheap to iterate, expensive to burn the
+whole budget on a broken run.
 
 ---
 
