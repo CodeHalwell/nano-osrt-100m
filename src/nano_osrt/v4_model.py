@@ -450,8 +450,23 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                     )
                 past_length = key.shape[2]
 
-        cos = self.rope_cos[:, past_length:past_length + S, :, :]
-        sin = self.rope_sin[:, past_length:past_length + S, :, :]
+        required_seq_len = past_length + S
+        if required_seq_len <= self.rope_cos.shape[1]:
+            cos = self.rope_cos[:, past_length:required_seq_len, :, :]
+            sin = self.rope_sin[:, past_length:required_seq_len, :, :]
+        else:
+            rope_cos, rope_sin = compute_rope_freqs(
+                required_seq_len,
+                self.rope_cos.shape[-1],
+                theta=getattr(self.config, "rope_theta", 10000.0),
+                device=x.device,
+            )
+            cos = rope_cos[:, past_length:required_seq_len, :, :].to(
+                device=self.rope_cos.device, dtype=self.rope_cos.dtype
+            )
+            sin = rope_sin[:, past_length:required_seq_len, :, :].to(
+                device=self.rope_sin.device, dtype=self.rope_sin.dtype
+            )
 
         loop_rms: list[Tensor] = []
         total_lb_loss = torch.tensor(0.0, device=x.device)
