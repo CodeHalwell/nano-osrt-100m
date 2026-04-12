@@ -490,6 +490,12 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         total_z_loss = torch.tensor(0.0, device=x.device)
 
         use_ckpt = self.gradient_checkpointing and self.training
+        if use_ckpt and (use_cache or past_key_values is not None):
+            raise ValueError(
+                "KV caching (use_cache=True or past_key_values) is incompatible with "
+                "gradient checkpointing. Disable gradient_checkpointing or set "
+                "use_cache=False."
+            )
         presents: list[tuple[Tensor, Tensor]] | None = [] if use_cache else None
 
         for loop in range(self.config.recursive_loops):
@@ -637,6 +643,17 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
 
             if use_cache:
                 past_key_values = outputs.past_key_values
+                # Trim KV cache to a sliding window so memory stays bounded and
+                # RoPE positions never exceed max_position_embeddings.
+                max_len = self.config.max_position_embeddings
+                if past_key_values is not None and past_key_values[0] is not None:
+                    cached_len = past_key_values[0][0].shape[2]
+                    if cached_len > max_len:
+                        past_key_values = [
+                            (kv[0][:, :, -max_len:, :], kv[1][:, :, -max_len:, :])
+                            if kv is not None else None
+                            for kv in past_key_values
+                        ]
 
             next_logits = outputs.logits[:, -1, :self.config.real_vocab_size].float()
 
