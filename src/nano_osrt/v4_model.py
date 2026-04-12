@@ -646,8 +646,14 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                 # Trim KV cache to a sliding window so memory stays bounded and
                 # RoPE positions never exceed max_position_embeddings.
                 max_len = self.config.max_position_embeddings
-                if past_key_values is not None and past_key_values[0] is not None:
-                    cached_len = past_key_values[0][0].shape[2]
+                first = past_key_values[0] if past_key_values else None
+                if (
+                    first is not None
+                    and isinstance(first, tuple)
+                    and len(first) == 2
+                    and isinstance(first[0], torch.Tensor)
+                ):
+                    cached_len = first[0].shape[2]
                     if cached_len > max_len:
                         past_key_values = [
                             (kv[0][:, :, -max_len:, :], kv[1][:, :, -max_len:, :])
