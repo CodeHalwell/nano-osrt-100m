@@ -421,11 +421,34 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         """
         x = self.embedding(input_ids)
         S = input_ids.shape[1]
+        expected_past_layers = self.config.num_blocks * self.config.recursive_loops
 
-        # Determine position offset from cached sequence length
+        # Validate KV cache shape/length before indexing into it.
         past_length = 0
-        if past_key_values is not None and past_key_values[0] is not None:
-            past_length = past_key_values[0][0].shape[2]
+        if past_key_values is not None:
+            if len(past_key_values) != expected_past_layers:
+                raise ValueError(
+                    "Invalid past_key_values: expected "
+                    f"{expected_past_layers} entries (num_blocks * recursive_loops), "
+                    f"got {len(past_key_values)}."
+                )
+            for idx, layer_past in enumerate(past_key_values):
+                if layer_past is not None and (
+                    not isinstance(layer_past, tuple) or len(layer_past) != 2
+                ):
+                    raise ValueError(
+                        "Invalid past_key_values: each entry must be None or a "
+                        f"(key, value) tuple, but entry {idx} has type "
+                        f"{type(layer_past).__name__}."
+                    )
+            if past_key_values[0] is not None:
+                key, value = past_key_values[0]
+                if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                    raise ValueError(
+                        "Invalid past_key_values: each non-None entry must contain "
+                        "torch.Tensor key/value tensors."
+                    )
+                past_length = key.shape[2]
 
         cos = self.rope_cos[:, past_length:past_length + S, :, :]
         sin = self.rope_sin[:, past_length:past_length + S, :, :]
