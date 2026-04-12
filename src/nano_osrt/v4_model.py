@@ -445,7 +445,9 @@ class RecursiveBlockV4(nn.Module):
         rope_cos: Tensor,
         rope_sin: Tensor,
         loop_idx: int,
-    ) -> Tensor:
+        past_key_value: tuple[Tensor, Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
         B, S, D = x.shape
 
         # Per-pass residual adapter (activation-space, not weight-LoRA).
@@ -464,11 +466,43 @@ class RecursiveBlockV4(nn.Module):
         k = k.view(B, S, self.heads, self.head_dim)
         v = v.view(B, S, self.heads, self.head_dim)
 
+        # Apply RoPE to new positions only (cos/sin pre-sliced by caller)
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
+        # Transpose to (B, heads, S, head_dim) for attention
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # Concatenate with cached KV from previous generation steps
+        past_len = past_key_value[0].shape[2] if past_key_value is not None else 0
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=2)
+            v = torch.cat([past_key_value[1], v], dim=2)
+
+        present_kv = (k, v) if use_cache else None
+
+        # Preserve autoregressive masking for cached multi-token decode.
+        # - Prefill (Q_len == K_len): use the built-in causal path.
+        # - Single-token decode (Q_len == 1): no mask is needed.
+        # - Cached chunked decode (past_len > 0 and Q_len > 1): provide an
+        #   explicit causal mask shifted by the cache length so earlier new
+        #   tokens cannot attend to later new tokens in the same chunk.
+        q_len = q.shape[2]
+        k_len = k.shape[2]
+        if past_len > 0 and q_len > 1:
+            attn_mask = torch.full(
+                (q_len, k_len),
+                float("-inf"),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            attn_mask = torch.triu(attn_mask, diagonal=1 + past_len)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=False
+            )
+        else:
+            is_causal = (q_len == k_len)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
         # Attention residual + adapter (parallel branches into x)
@@ -479,7 +513,7 @@ class RecursiveBlockV4(nn.Module):
         h_moe = self.moe(self.norm_moe(x), loop_idx)
         x = x + self.dense_gate * h_dense + self.moe_gate * h_moe
 
-        return x
+        return x, present_kv
 
 
 # ── Main Model ──────────────────────────────────────────────────────────
@@ -562,47 +596,120 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
 
         self.post_init()
 
-    def forward(self, input_ids: Tensor, **kwargs) -> tuple[Tensor, list[Tensor], Tensor, Tensor]:
+    def forward(
+        self,
+        input_ids: Tensor,
+        past_key_values: list[tuple[Tensor, Tensor]] | None = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> tuple[Tensor, list[Tensor], Tensor, Tensor, list[tuple[Tensor, Tensor]] | None]:
         """Forward pass.
 
+        Args:
+            input_ids: Token indices (B, S).
+            past_key_values: KV cache — list of (K, V) tuples, one per
+                effective layer (num_blocks × recursive_loops entries).
+                Each tensor has shape (B, heads, cached_S, head_dim).
+            use_cache: Whether to return updated KV cache for generation.
+
         Returns:
-            (hidden_states, loop_rms_list, total_load_balance_loss, total_z_loss)
+            (hidden_states, loop_rms_list, total_load_balance_loss,
+             total_z_loss, present_key_values)
         """
         x = self.embedding(input_ids)
         S = input_ids.shape[1]
-        cos = self.rope_cos[:, :S, :, :]
-        sin = self.rope_sin[:, :S, :, :]
+        expected_past_layers = self.config.num_blocks * self.config.recursive_loops
+
+        # Validate KV cache shape/length before indexing into it.
+        past_length = 0
+        if past_key_values is not None:
+            if len(past_key_values) != expected_past_layers:
+                raise ValueError(
+                    "Invalid past_key_values: expected "
+                    f"{expected_past_layers} entries (num_blocks * recursive_loops), "
+                    f"got {len(past_key_values)}."
+                )
+            for idx, layer_past in enumerate(past_key_values):
+                if layer_past is not None and (
+                    not isinstance(layer_past, tuple) or len(layer_past) != 2
+                ):
+                    raise ValueError(
+                        "Invalid past_key_values: each entry must be None or a "
+                        f"(key, value) tuple, but entry {idx} has type "
+                        f"{type(layer_past).__name__}."
+                    )
+            if past_key_values[0] is not None:
+                key, value = past_key_values[0]
+                if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                    raise ValueError(
+                        "Invalid past_key_values: each non-None entry must contain "
+                        "torch.Tensor key/value tensors."
+                    )
+                past_length = key.shape[2]
+
+        required_seq_len = past_length + S
+        if required_seq_len <= self.rope_cos.shape[1]:
+            cos = self.rope_cos[:, past_length:required_seq_len, :, :]
+            sin = self.rope_sin[:, past_length:required_seq_len, :, :]
+        else:
+            rope_cos, rope_sin = compute_rope_freqs(
+                required_seq_len,
+                self.rope_cos.shape[-1],
+                theta=getattr(self.config, "rope_theta", 10000.0),
+                device=x.device,
+            )
+            cos = rope_cos[:, past_length:required_seq_len, :, :].to(
+                device=self.rope_cos.device, dtype=self.rope_cos.dtype
+            )
+            sin = rope_sin[:, past_length:required_seq_len, :, :].to(
+                device=self.rope_sin.device, dtype=self.rope_sin.dtype
+            )
 
         loop_rms: list[Tensor] = []
         total_lb_loss = torch.tensor(0.0, device=x.device)
         total_z_loss = torch.tensor(0.0, device=x.device)
 
         use_ckpt = self.gradient_checkpointing and self.training
+        if use_ckpt and (use_cache or past_key_values is not None):
+            raise ValueError(
+                "KV caching (use_cache=True or past_key_values) is incompatible with "
+                "gradient checkpointing. Disable gradient_checkpointing or set "
+                "use_cache=False."
+            )
+        presents: list[tuple[Tensor, Tensor]] | None = [] if use_cache else None
 
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
                 adapter_a = self.adapters_a[idx]
                 adapter_b = self.adapters_b[idx]
+
+                layer_past = past_key_values[idx] if past_key_values is not None else None
+
                 if use_ckpt:
-                    # Wrap in closure to capture non-tensor args (adapter_scale,
-                    # loop_idx) — gradient_checkpoint only accepts tensor inputs.
+                    # Gradient checkpointing (training only, never with cache).
+                    # Wrap in closure to capture non-tensor args.
                     def _block_fn(
                         _x, _a, _b, _cos, _sin,
                         _block=block, _scale=self.adapter_scale, _loop=loop,
                     ):
-                        return _block(_x, _a, _b, _scale, _cos, _sin, _loop)
+                        return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
 
                     x = gradient_checkpoint(
                         _block_fn, x, adapter_a, adapter_b, cos, sin,
                         use_reentrant=False,
                     )
                 else:
-                    x = block(
+                    x, present_kv = block(
                         x, adapter_a, adapter_b,
                         self.adapter_scale, cos, sin,
                         loop_idx=loop,
+                        past_key_value=layer_past,
+                        use_cache=use_cache,
                     )
+                    if presents is not None:
+                        presents.append(present_kv)
+
                 # Accumulate MoE losses (kept separate for independent scaling)
                 if block.moe.load_balance_loss is not None:
                     total_lb_loss = total_lb_loss + block.moe.load_balance_loss
@@ -614,7 +721,7 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
-        return x, loop_rms, total_lb_loss, total_z_loss
+        return x, loop_rms, total_lb_loss, total_z_loss, presents
 
 
 class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
@@ -639,9 +746,15 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
         self,
         input_ids: Tensor,
         labels: Tensor | None = None,
+        past_key_values: list[tuple[Tensor, Tensor]] | None = None,
+        use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden, loop_rms, lb_loss, z_loss = self.model(input_ids)
+        hidden, loop_rms, lb_loss, z_loss, presents = self.model(
+            input_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
 
         # Weight-tied LM head
         logits = F.linear(hidden, self.model.embedding.weight)
@@ -671,6 +784,7 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
+            past_key_values=presents,
         )
 
     @torch.no_grad()
@@ -682,17 +796,55 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
         top_p: float = 0.9,
         top_k: int = 50,
         eos_token_id: int | None = None,
+        use_cache: bool = True,
         **kwargs,
     ) -> Tensor:
-        """Generate tokens autoregressively with top-p/top-k sampling."""
+        """Generate tokens autoregressively with KV cache and top-p/top-k sampling.
+
+        On the first step the full prompt is processed and KV states are
+        cached.  Subsequent steps feed only the latest token, reusing the
+        cache for O(1) attention per new token instead of O(n).
+        """
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
 
         generated = input_ids.clone()
+        past_key_values = None
 
         for _ in range(max_new_tokens):
-            context = generated[:, -self.config.max_position_embeddings:]
-            outputs = self.forward(context)
+            if past_key_values is not None:
+                # Incremental decode: only the latest token
+                model_input = generated[:, -1:]
+            else:
+                # Prefill: full context (capped to max position embeddings)
+                model_input = generated[:, -self.config.max_position_embeddings:]
+
+            outputs = self.forward(
+                model_input,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
+            if use_cache:
+                past_key_values = outputs.past_key_values
+                # Trim KV cache to a sliding window so memory stays bounded and
+                # RoPE positions never exceed max_position_embeddings.
+                max_len = self.config.max_position_embeddings
+                first = past_key_values[0] if past_key_values else None
+                if (
+                    first is not None
+                    and isinstance(first, tuple)
+                    and len(first) == 2
+                    and isinstance(first[0], torch.Tensor)
+                ):
+                    cached_len = first[0].shape[2]
+                    if cached_len > max_len:
+                        past_key_values = [
+                            (kv[0][:, :, -max_len:, :], kv[1][:, :, -max_len:, :])
+                            if kv is not None else None
+                            for kv in past_key_values
+                        ]
+
             next_logits = outputs.logits[:, -1, :self.config.real_vocab_size].float()
 
             if temperature > 0:
