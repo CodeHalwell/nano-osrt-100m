@@ -316,18 +316,35 @@ class RecursiveBlockV4(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # Concatenate with cached KV from previous generation steps
+        past_len = past_key_value[0].shape[2] if past_key_value is not None else 0
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
 
         present_kv = (k, v) if use_cache else None
 
-        # is_causal=True works for both prefill (Q_len==K_len) and
-        # single-token decode (Q_len=1, K_len>1) via PyTorch's upper-left
-        # aligned causal mask.  Disable only when decoding a single token
-        # where no masking is needed (minor optimisation).
-        is_causal = (q.shape[2] == k.shape[2])
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        # Preserve autoregressive masking for cached multi-token decode.
+        # - Prefill (Q_len == K_len): use the built-in causal path.
+        # - Single-token decode (Q_len == 1): no mask is needed.
+        # - Cached chunked decode (past_len > 0 and Q_len > 1): provide an
+        #   explicit causal mask shifted by the cache length so earlier new
+        #   tokens cannot attend to later new tokens in the same chunk.
+        q_len = q.shape[2]
+        k_len = k.shape[2]
+        if past_len > 0 and q_len > 1:
+            attn_mask = torch.full(
+                (q_len, k_len),
+                float("-inf"),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            attn_mask = torch.triu(attn_mask, diagonal=1 + past_len)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=False
+            )
+        else:
+            is_causal = (q_len == k_len)
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
         x = x_mod + self.out_proj(attn_out)
