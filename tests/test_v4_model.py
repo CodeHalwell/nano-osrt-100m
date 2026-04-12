@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from nano_osrt.v4_config import NanoOSRTv4Config
-from nano_osrt.v4_model import NanoOSRTv4ForCausalLM, NanoOSRTv4Model
+from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
 
 
 @pytest.fixture()
