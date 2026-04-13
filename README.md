@@ -1,6 +1,6 @@
 # Nano-OSRT
 
-**Omni-Sparse Recursive Titan** -- Recursive weight-sharing transformer language models trained from scratch on Modal serverless GPUs. Two versions: v3 (completed, 104.5M params) and v4 (in development, 208M+ params with MoE).
+**Omni-Sparse Recursive Titan** -- Recursive weight-sharing transformer language models trained from scratch on Modal serverless GPUs. Two versions: v3 (completed, 104.5M params) and v4 (in development, ~306M params with MoE).
 
 ---
 
@@ -39,7 +39,7 @@
 | Attention heads | 24 (head_dim=64) |
 | Tokenizer | Custom 32K BPE (trained on 2GB of text + code + Wikipedia) |
 | Context length | 8192 (progressive: 2048 -> 4096 -> 8192) |
-| Target training data | 50B tokens |
+| Target training data | ~90B tokens if full 300K-step schedule completes |
 | RoPE scaling | NTK-aware for inference beyond training length |
 | KV cache | O(1) per-token inference with incremental decoding |
 
@@ -223,8 +223,9 @@
          |     4. Each token gets exactly 2 experts (overflow ~0%)
          |     5. Weights from clean sigmoid, renormalised
          |
-         |     Expert 0: SwiGLU(1536 -> 1024 -> 1536)  [always active = shared]
-         |     Expert 1-11: SwiGLU(1536 -> 1024 -> 1536)  [2 selected per token]
+         |     Shared expert: SwiGLU(1536 -> 1024 -> 1536)  [always active]
+         |     Routed expert IDs 0-10: SwiGLU(1536 -> 1024 -> 1536)
+         |       [2 selected per token]
          |
          +---> output = shared_out + weighted_sum(capped_expert_outputs)
 ```
@@ -349,7 +350,7 @@ Note that the weights come from the clean sigmoid scores, not from the capacity-
 5. Unsort the fit mask back to original token order and apply assignments.
 6. Update per-expert counts via `scatter_add_`.
 
-This runs in $O(E_r \cdot M \log M)$ where $M$ is the number of eligible tokens (shrinking each iteration as tokens fill their $k$ slots), eliminating the $O(E_r^2)$ inner loop of the naive implementation.
+This runs in $O(K_c \cdot M \log M)$ where $K_c$ is the candidate pool size (default $K_c = E_r = 11$) and $M$ is the number of eligible tokens, shrinking each iteration as tokens fill their $k$ slots. It avoids token-by-token Python assignment while preserving the same deterministic choices as the reference loop.
 
 **Structural guarantees.** With $\gamma = 1.25$ and candidate pool size $= E_r$ (all experts), the capacity cap ensures:
 
@@ -496,13 +497,13 @@ Each tag is a single token in the v4 tokenizer -- no multi-token string matching
   +===========+     +==========+     +========+     +==========+     +======+
   | Tokenizer |---->| Pretrain |---->|  SFT   |---->|  GRPO    |---->| Eval |
   | (32K BPE) |     | (300K    |     | (5K    |     | (2K      |     |      |
-  |  10GB     |     |  steps)  |     |  steps)|     |  steps)  |     |      |
+  |  2GB      |     |  steps)  |     |  steps)|     |  steps)  |     |      |
   +===========+     +==========+     +========+     +==========+     +======+
        |                 |               |               |               |
     Custom          Progressive      Balanced        Verifiable      IFEval
     vocab           2048->8192       math+code       math rewards    GSM8K
     code+text       Lion optimizer   +STEM+general   group_size=16   HumanEval
-    +wiki           50B tokens       HRA adapters    KL penalty      HellaSwag
+    +wiki           ~90B tokens      HRA adapters    KL penalty      HellaSwag
 ```
 
 ---
@@ -528,10 +529,10 @@ Stage 4: Code SFT     -> 7K steps (2 epochs), AdamW + HRA, seq_len 4096
 ### v4 Pipeline (Planned)
 
 ```
-Step 0: Tokenizer     -> Train custom 32K BPE on 10GB text+code+wiki
+Step 0: Tokenizer     -> Train custom 32K BPE on 2GB text+code+wiki
 Step 1: Pretrain      -> 300K steps, progressive seq_len 2048->4096->8192
-  Foundation: TinyStories + CodeParrot (15K steps)
-  Knowledge:  FineWeb-Edu + CodeParrot + Wikipedia (235K steps)
+  Foundation: TinyStories + CodeParrot (10K steps)
+  Knowledge:  FineWeb-Edu + CodeParrot + Wikipedia (240K steps)
   Instruction: SmolTalk + Evol-Code + OpenHermes (50K steps)
 
 Step 2: Balanced SFT  -> 5K steps, math + code + STEM + general
@@ -587,7 +588,7 @@ uv run modal run app.py --stage eval
 ### v4 Training
 
 ```bash
-# Train custom 32K tokenizer (~8 min on A100, ~$2)
+# Train custom 32K tokenizer on H100 (2GB sample)
 uv run modal run --detach app_v4.py --stage tokenizer
 
 # Pre-training (progressive seq_len)
