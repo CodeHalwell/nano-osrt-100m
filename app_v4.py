@@ -51,7 +51,7 @@ tokenizer_vol = modal.Volume.from_name("osrt-v4-tokenizer", create_if_missing=Tr
 
 
 @app.function(
-    gpu="A100",
+    gpu="H100",
     image=image,
     volumes={
         "/vol/checkpoints": vol,
@@ -527,7 +527,7 @@ def grpo():
 
 
 @app.function(
-    gpu="A100",
+    gpu="H100",
     image=image,
     volumes={
         "/vol/checkpoints": vol,

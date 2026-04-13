@@ -314,15 +314,9 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                   f"batch: {current_batch_size} | accum: {grad_accum} | Step: {step}")
             print(f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}")
 
-            # Enable gradient checkpointing for long sequences
-            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            if hasattr(inner, "model") and hasattr(inner.model, "gradient_checkpointing"):
-                if current_seq_len >= 4096:
-                    inner.model.gradient_checkpointing = True
-                    print("    Gradient checkpointing: ENABLED")
-                else:
-                    inner.model.gradient_checkpointing = False
-
+            # (Per-step logic below owns gradient_checkpointing toggling —
+            # it accounts for both seq_len and routing phase. No need to
+            # set it here.)
             if current_loader is not None:
                 del current_loader
             load_t = time.time()
@@ -343,12 +337,48 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # ── Anneal router noise linearly from init to final over
-        #    router_noise_anneal_steps (default 5000). Updates the
-        #    per-MoE noise_std buffer in-place so torch.compile sees a
-        #    fresh tensor each step without recompiling.
+        # ── Routing schedule ──
+        # Three phases:
+        #   [0, soft_warmup_steps):     mode 0 (soft_all),  alpha=0
+        #   [soft_warmup, soft+blend):  mode 1 (blend),     alpha=linear 0→1
+        #   [soft+blend, ∞):            mode 2 (hard_topk), alpha=1
+        # Mode is a Python int → changing it triggers exactly two
+        # torch.compile recompilations per run, which is fine. Alpha is
+        # a scalar buffer → in-place update, no recompile.
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
+        soft_steps = max(model_config.soft_warmup_steps, 0)
+        blend_steps = max(model_config.blend_anneal_steps, 0)
+        if step < soft_steps:
+            target_mode = 0
+            current_alpha = 0.0
+        elif step < soft_steps + blend_steps:
+            target_mode = 1
+            current_alpha = (
+                (step - soft_steps) / blend_steps if blend_steps > 0 else 1.0
+            )
+        else:
+            target_mode = 2
+            current_alpha = 1.0
+        routing_phase = {0: "soft", 1: "blend", 2: "hard"}[target_mode]
+        for blk in base.blocks:
+            blk.moe.routing_mode = target_mode
+            blk.moe.routing_alpha.fill_(current_alpha)
+
+        # Soft / blend phases run every routed expert on every token, which
+        # is ~num_routed× the activation memory of hard top-k. On an 80GB
+        # A100 the uncheckpointed soft pass OOMs (first run crashed at step
+        # 0 with 74GB allocated). Force gradient checkpointing on whenever
+        # routing is not fully hard; also keep it on for long seq_len phases
+        # as before. Toggling a bool triggers at most 2 torch.compile
+        # recompiles per run (soft→blend→hard boundaries).
+        need_ckpt = (target_mode != 2) or (current_seq_len >= 4096)
+        if hasattr(base, "gradient_checkpointing") and base.gradient_checkpointing != need_ckpt:
+            base.gradient_checkpointing = need_ckpt
+
+        # Legacy router noise anneal (defaults to 0.0 → 0.0). Keep the
+        # buffer update here so setting non-zero values in config still
+        # works if someone wants extra jitter during hard phase.
         ns_init = model_config.router_noise_std_init
         ns_final = model_config.router_noise_std_final
         ns_anneal = max(model_config.router_noise_anneal_steps, 1)
@@ -356,6 +386,21 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         current_noise = ns_init + (ns_final - ns_init) * noise_progress
         for blk in base.blocks:
             blk.moe.noise_std.fill_(current_noise)
+
+        # Gumbel-top-k anneal. Linearly decay gumbel_tau from init to
+        # final over router_gumbel_anneal_steps. This is the anti
+        # deterministic-winner-lock-in pressure: while tau > 0, top-k
+        # selection is stochastic and no expert can win by tiny
+        # logit-ordering tie-breaking alone. The anneal window (default
+        # 10K) is intentionally long so the router has time to learn
+        # robust preferences before determinism returns.
+        gt_init = model_config.router_gumbel_tau_init
+        gt_final = model_config.router_gumbel_tau_final
+        gt_anneal = max(model_config.router_gumbel_anneal_steps, 1)
+        gumbel_progress = min(step / gt_anneal, 1.0)
+        current_gumbel_tau = gt_init + (gt_final - gt_init) * gumbel_progress
+        for blk in base.blocks:
+            blk.moe.gumbel_tau.fill_(current_gumbel_tau)
 
         optimizer.zero_grad(set_to_none=True)
         accum_loss = torch.tensor(0.0, device=device)
@@ -398,6 +443,15 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         optimizer.step()
 
+        # ── Balance-bias controller: once-per-step update ──
+        # Each MoELayer has accumulated clean-biased assignment counts
+        # across all 6 recursive-loop calls (and any grad-accum
+        # micro-batches) during the just-completed forward passes. Now
+        # that the optimizer has stepped, compute one bias update per
+        # block from the aggregated counts and reset the accumulator.
+        for blk in base.blocks:
+            blk.moe.apply_balance_update()
+
         # --- Logging ---
         should_log = (
             step % train_cfg.log_interval == 0
@@ -420,17 +474,29 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             # printed to stdout so we catch routing collapse in real time
             # without needing the W&B dashboard.
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            moe_metrics = {}
+            moe_metrics = {
+                "moe/routing_mode": target_mode,
+                "moe/routing_alpha": current_alpha,
+                "moe/gumbel_tau": current_gumbel_tau,
+            }
             # Collected for stdout summary line
             moe_summary = None
             try:
                 base = inner.model if hasattr(inner, "model") else inner
-                block_lb_losses = []
+                block_imp_losses = []
+                block_bias_losses = []
                 block_z_losses = []
                 prob_entropies = []
                 assign_entropies = []
+                clean_assign_entropies = []
+                raw_assign_entropies = []
                 max_fracs = []
                 min_fracs = []
+                clean_max_fracs = []
+                clean_min_fracs = []
+                raw_max_fracs = []
+                raw_min_fracs = []
+                bias_abs_maxes = []
                 dense_gates = []
                 moe_gates = []
                 for bi, blk in enumerate(base.blocks):
@@ -440,19 +506,50 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                     moe_gates.append(mg)
                     moe_metrics[f"moe/dense_gate_b{bi}"] = dg
                     moe_metrics[f"moe/moe_gate_b{bi}"] = mg
-                    if blk.moe.load_balance_loss is not None:
-                        block_lb_losses.append(blk.moe.load_balance_loss.item())
+                    if blk.moe.importance_loss is not None:
+                        block_imp_losses.append(blk.moe.importance_loss.item())
+                    if blk.moe.logit_bias_loss is not None:
+                        block_bias_losses.append(blk.moe.logit_bias_loss.item())
                     if blk.moe.z_loss is not None:
                         block_z_losses.append(blk.moe.z_loss.item())
 
-                    # Per-loop router-prob entropy (can be misleading) +
-                    # per-loop assignment entropy (the real metric).
+                    # Per-loop softmax entropy (soft-phase primary
+                    # signal) + per-loop assignment entropy (hard-phase
+                    # primary signal; during soft phase this holds
+                    # importance entropy as a proxy).
                     for li, ent in enumerate(blk.moe.last_router_entropy):
                         moe_metrics[f"moe/prob_entropy_b{bi}_l{li}"] = ent
                         prob_entropies.append(ent)
                     for li, ent in enumerate(blk.moe.last_assignment_entropy):
                         moe_metrics[f"moe/assign_entropy_b{bi}_l{li}"] = ent
                         assign_entropies.append(ent)
+
+                    # Clean BIASED assignment entropy (inference path:
+                    # router_logits + router_balance_bias, no noise) —
+                    # the decisive health signal.
+                    for li, ent in enumerate(blk.moe.last_clean_assignment_entropy):
+                        moe_metrics[f"moe/clean_assign_entropy_b{bi}_l{li}"] = ent
+                        clean_assign_entropies.append(ent)
+
+                    # Raw assignment entropy (router_logits only, no bias,
+                    # no noise) — diagnostic. May be collapsed even
+                    # when clean_biased is healthy; that's fine if
+                    # the deployed routing path includes the bias.
+                    for li, ent in enumerate(blk.moe.last_raw_assignment_entropy):
+                        moe_metrics[f"moe/raw_assign_entropy_b{bi}_l{li}"] = ent
+                        raw_assign_entropies.append(ent)
+
+                    # Per-block bias magnitude
+                    if hasattr(blk.moe, "router_balance_bias"):
+                        bam = blk.moe.router_balance_bias.abs().max().item()
+                        bias_abs_maxes.append(bam)
+                        moe_metrics[f"moe/bias_abs_max_b{bi}"] = bam
+
+                    # Capacity-capped telemetry
+                    for li, ofr in enumerate(blk.moe.last_overflow_rate):
+                        moe_metrics[f"moe/overflow_rate_b{bi}_l{li}"] = ofr
+                    for li, apt in enumerate(blk.moe.last_assigned_per_token):
+                        moe_metrics[f"moe/assigned_per_token_b{bi}_l{li}"] = apt
 
                     # Per-loop expert usage: track max and min fraction
                     # (tight gap = collapsed routing, wide gap = specialisation)
@@ -465,77 +562,92 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                             max_fracs.append(mx)
                             min_fracs.append(mn)
 
+                    # Clean BIASED per-loop expert usage
+                    for li, fracs in enumerate(blk.moe.last_clean_expert_fraction):
+                        if fracs:
+                            mx = max(fracs)
+                            mn = min(fracs)
+                            moe_metrics[f"moe/clean_expert_max_b{bi}_l{li}"] = mx
+                            moe_metrics[f"moe/clean_expert_min_b{bi}_l{li}"] = mn
+                            clean_max_fracs.append(mx)
+                            clean_min_fracs.append(mn)
+
+                    # RAW (unbiased) per-loop expert usage — diagnostic
+                    for li, fracs in enumerate(blk.moe.last_raw_expert_fraction):
+                        if fracs:
+                            mx = max(fracs)
+                            mn = min(fracs)
+                            moe_metrics[f"moe/raw_expert_max_b{bi}_l{li}"] = mx
+                            moe_metrics[f"moe/raw_expert_min_b{bi}_l{li}"] = mn
+                            raw_max_fracs.append(mx)
+                            raw_min_fracs.append(mn)
+
                 def _mean(xs):
                     return sum(xs) / len(xs) if xs else 0.0
 
-                if block_lb_losses:
-                    moe_metrics["moe/load_balance_loss_mean"] = _mean(block_lb_losses)
+                if block_imp_losses:
+                    moe_metrics["moe/importance_loss_mean"] = _mean(block_imp_losses)
+                if block_bias_losses:
+                    moe_metrics["moe/logit_bias_loss_mean"] = _mean(block_bias_losses)
                 if block_z_losses:
                     moe_metrics["moe/z_loss_mean"] = _mean(block_z_losses)
                 if prob_entropies:
                     moe_metrics["moe/prob_entropy_mean"] = _mean(prob_entropies)
                 if assign_entropies:
                     moe_metrics["moe/assign_entropy_mean"] = _mean(assign_entropies)
+                if clean_assign_entropies:
+                    moe_metrics["moe/clean_assign_entropy_mean"] = _mean(clean_assign_entropies)
+                if raw_assign_entropies:
+                    moe_metrics["moe/raw_assign_entropy_mean"] = _mean(raw_assign_entropies)
                 if max_fracs:
                     moe_metrics["moe/expert_max_mean"] = _mean(max_fracs)
                 if min_fracs:
                     moe_metrics["moe/expert_min_mean"] = _mean(min_fracs)
+                if clean_max_fracs:
+                    moe_metrics["moe/clean_expert_max_mean"] = _mean(clean_max_fracs)
+                if clean_min_fracs:
+                    moe_metrics["moe/clean_expert_min_mean"] = _mean(clean_min_fracs)
+                if raw_max_fracs:
+                    moe_metrics["moe/raw_expert_max_mean"] = _mean(raw_max_fracs)
+                if raw_min_fracs:
+                    moe_metrics["moe/raw_expert_min_mean"] = _mean(raw_min_fracs)
+                if bias_abs_maxes:
+                    moe_metrics["moe/bias_abs_max_mean"] = _mean(bias_abs_maxes)
 
                 moe_summary = {
                     "assign_entropy": _mean(assign_entropies),
+                    "clean_assign_entropy": _mean(clean_assign_entropies),
+                    "raw_assign_entropy": _mean(raw_assign_entropies),
+                    "prob_entropy": _mean(prob_entropies),
                     "expert_max": _mean(max_fracs),
                     "expert_min": _mean(min_fracs),
+                    "clean_expert_max": _mean(clean_max_fracs),
+                    "clean_expert_min": _mean(clean_min_fracs),
+                    "raw_expert_max": _mean(raw_max_fracs),
+                    "raw_expert_min": _mean(raw_min_fracs),
+                    "bias_abs_max": _mean(bias_abs_maxes),
                     "dense_gate": _mean(dense_gates),
                     "moe_gate": _mean(moe_gates),
-                    "lb_loss": _mean(block_lb_losses),
+                    "imp_loss": _mean(block_imp_losses),
+                    "bias_loss": _mean(block_bias_losses),
                     "z_loss": _mean(block_z_losses),
                 }
 
-                # ── Clean-routing diagnostic ──
-                # The noisy numbers above include router_noise_std
-                # perturbation, so they optimistically bias assign_H
-                # upward. Zero the noise buffers, run ONE extra forward
-                # pass on the same data (no gradients), read the
-                # telemetry, then restore the noise schedule. This
-                # gives us the "true" learned routing every log step.
-                clean_assign = None
-                clean_max = None
-                try:
-                    saved_noise = [blk.moe.noise_std.clone() for blk in base.blocks]
-                    for blk in base.blocks:
-                        blk.moe.noise_std.fill_(0.0)
-                    with torch.no_grad():
-                        _ = model(input_ids)
-                    # telemetry was refreshed by the clean forward
-                    clean_assign_entropies = []
-                    clean_max_fracs = []
-                    clean_min_fracs = []
-                    for blk in base.blocks:
-                        clean_assign_entropies.extend(blk.moe.last_assignment_entropy)
-                        for fracs in blk.moe.last_expert_fraction:
-                            if fracs:
-                                clean_max_fracs.append(max(fracs))
-                                clean_min_fracs.append(min(fracs))
-                    clean_assign = _mean(clean_assign_entropies)
-                    clean_max = _mean(clean_max_fracs)
-                    clean_min = _mean(clean_min_fracs)
-                    moe_metrics["moe/clean_assign_entropy_mean"] = clean_assign
-                    moe_metrics["moe/clean_expert_max_mean"] = clean_max
-                    moe_metrics["moe/clean_expert_min_mean"] = clean_min
-                    moe_summary["clean_assign_entropy"] = clean_assign
-                    moe_summary["clean_expert_max"] = clean_max
-                    moe_summary["clean_expert_min"] = clean_min
-                finally:
-                    # ALWAYS restore noise schedule, even if the
-                    # diagnostic forward raised.
-                    for blk, ns in zip(base.blocks, saved_noise):
-                        blk.moe.noise_std.copy_(ns)
-                    # Re-run one noisy forward to repopulate telemetry
-                    # for the next log cycle — otherwise the stored
-                    # last_* lists would reflect the clean forward and
-                    # skew the noisy training metrics next time.
-                    with torch.no_grad():
-                        _ = model(input_ids)
+                # Aggregate capacity-capped telemetry
+                all_overflow = []
+                all_assigned = []
+                all_rank = []
+                for blk in base.blocks:
+                    all_overflow.extend(blk.moe.last_overflow_rate)
+                    all_assigned.extend(blk.moe.last_assigned_per_token)
+                    all_rank.extend(blk.moe.last_candidate_rank_mean)
+                if all_overflow:
+                    moe_metrics["moe/overflow_rate_mean"] = _mean(all_overflow)
+                    moe_metrics["moe/assigned_per_token_mean"] = _mean(all_assigned)
+                    moe_metrics["moe/candidate_rank_mean"] = _mean(all_rank)
+                    moe_summary["overflow_rate"] = _mean(all_overflow)
+                    moe_summary["assigned_per_token"] = _mean(all_assigned)
+                    moe_summary["candidate_rank"] = _mean(all_rank)
             except AttributeError:
                 pass  # model not fully set up yet (first step)
 
@@ -548,39 +660,52 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             )
 
             # Critical MoE health line — prints to stdout so we see
-            # routing collapse immediately in the live Modal log instead
-            # of having to check W&B. Key number is the CLEAN assign_H
-            # (no router noise), which reflects what the router has
-            # actually learned:
-            #   ~2.40 (ln 11) = uniform, healthy
-            #   ~2.00        = mildly concentrated
-            #   ~1.00        = collapsing
-            #   ~0.69 (ln 2) = full top-2 collapse
+            # routing collapse immediately in the live Modal log. Which
+            # metric matters depends on the routing phase:
+            #   soft phase  → prob_H (softmax entropy) is primary;
+            #                 assign_H holds importance entropy (proxy)
+            #   blend phase → both matter; assign_H is from top-k
+            #   hard phase  → assign_H is primary
             if moe_summary is not None:
-                clean_H = moe_summary.get("clean_assign_entropy", float("nan"))
-                clean_max = moe_summary.get("clean_expert_max", float("nan"))
-                clean_min = moe_summary.get("clean_expert_min", float("nan"))
-                noise_std_now = current_noise
+                assign_H = moe_summary["assign_entropy"]
+                clean_H = moe_summary["clean_assign_entropy"]
+                raw_H = moe_summary["raw_assign_entropy"]
+                prob_H = moe_summary["prob_entropy"]
+                clean_max = moe_summary["clean_expert_max"]
+                clean_min = moe_summary["clean_expert_min"]
+                raw_max = moe_summary["raw_expert_max"]
+                raw_min = moe_summary["raw_expert_min"]
+                bias_mag = moe_summary["bias_abs_max"]
+                overflow = moe_summary.get("overflow_rate", 0.0)
+                assigned_tok = moe_summary.get("assigned_per_token", 0.0)
+                cand_rank = moe_summary.get("candidate_rank", 0.0)
                 print(
-                    f"           moe: clean assign_H={clean_H:.3f} "
-                    f"max={clean_max:.3f} "
-                    f"min={clean_min:.3f} | "
-                    f"noisy assign_H={moe_summary['assign_entropy']:.3f} "
-                    f"(noise_std={noise_std_now:.3f}) | "
+                    f"           moe[{routing_phase}]: "
+                    f"capped H={clean_H:.3f} max={clean_max:.3f} min={clean_min:.3f} | "
+                    f"raw H={raw_H:.3f} max={raw_max:.3f} | "
+                    f"overflow={overflow:.4f} assigned/tok={assigned_tok:.2f} rank={cand_rank:.2f} | "
                     f"gates d={moe_summary['dense_gate']:.4f} "
                     f"m={moe_summary['moe_gate']:.4f} | "
-                    f"lb={moe_summary['lb_loss']:.3f} "
-                    f"z={moe_summary['z_loss']:.3f}",
+                    f"imp={moe_summary['imp_loss']:.3f}",
                     flush=True,
                 )
 
-                # ── Early-stop guard ──
-                # Criteria from the review: stop immediately if routing
-                # has collapsed in a way we can't recover from. We apply
-                # these to the CLEAN metrics (not the noisy training
-                # ones) and only after step 50 so random init noise
-                # doesn't trigger false alarms.
-                if step >= 50 and clean_H == clean_H:  # not NaN
+                # ── Phase-aware early-stop guard ──
+                # Judge on CLEAN metrics (deterministic top-k), not the
+                # noisy training-time ones. Gumbel noise can keep the
+                # noisy histogram healthy-looking while the clean one
+                # collapses; the clean is the real inference signal.
+                #
+                # Only enforce once we've reached hard phase AND at
+                # least 50 steps past the blend→hard boundary, so the
+                # router has some post-transition adjustment window
+                # before we start auto-aborting.
+                hard_start = soft_steps + blend_steps
+                if (
+                    target_mode == 2
+                    and step >= hard_start + 50
+                    and clean_H == clean_H  # not NaN
+                ):
                     collapse_reasons = []
                     if clean_H < 1.5:
                         collapse_reasons.append(

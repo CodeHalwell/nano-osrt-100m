@@ -5,9 +5,12 @@ Handles:
 - Multi-dataset weighted sampling within each phase
 - Code + text mixing from the start
 - Instruction format handling (messages column)
+- Resilient streaming: connection drops and corrupt shards are caught
+  and retried instead of killing the training run.
 """
 
 import random
+import time
 
 import torch
 from torch import Tensor
@@ -71,24 +74,59 @@ class V4TokenStream(IterableDataset):
 
         buffer: list[int] = []
 
+        def _reconnect_stream(stream_idx: int) -> None:
+            ds_cfg = self.dataset_configs[stream_idx]
+            load_kwargs = {"split": "train", "streaming": True}
+            if ds_cfg.get("hf_config"):
+                load_kwargs["name"] = ds_cfg["hf_config"]
+            ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
+            ds = ds.shuffle(
+                buffer_size=5_000,
+                seed=seed + rng.randint(0, 100_000),
+            )
+            streams[stream_idx] = iter(ds)
+            print(
+                f"[DataWorker] Reconnected to {ds_cfg['hf_id']}",
+                flush=True,
+            )
+
+        max_retries = 5
+
         while True:
-            # Weighted random dataset selection
             idx = rng.choices(range(len(streams)), weights=weights, k=1)[0]
+            ds_name = self.dataset_configs[idx].get("name", self.dataset_configs[idx]["hf_id"])
 
             try:
                 example = next(streams[idx])
             except StopIteration:
-                # Reload exhausted stream
-                ds_cfg = self.dataset_configs[idx]
-                load_kwargs = {"split": "train", "streaming": True}
-                if ds_cfg.get("hf_config"):
-                    load_kwargs["name"] = ds_cfg["hf_config"]
-                ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
-                ds = ds.shuffle(buffer_size=5_000, seed=seed + rng.randint(0, 10000))
-                streams[idx] = iter(ds)
+                _reconnect_stream(idx)
                 try:
                     example = next(streams[idx])
                 except StopIteration:
+                    continue
+            except Exception as exc:
+                # Connection drops, corrupt shards, HTTP errors —
+                # log, sleep, reconnect, and continue. A flaky remote
+                # gzip shard should never kill a multi-hour Modal job.
+                for attempt in range(1, max_retries + 1):
+                    print(
+                        f"[DataWorker] {ds_name}: {type(exc).__name__}: "
+                        f"{exc} — reconnecting [{attempt}/{max_retries}]",
+                        flush=True,
+                    )
+                    time.sleep(2 * attempt)
+                    try:
+                        _reconnect_stream(idx)
+                        example = next(streams[idx])
+                        break
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                else:
+                    print(
+                        f"[DataWorker] {ds_name}: giving up after "
+                        f"{max_retries} retries, skipping batch",
+                        flush=True,
+                    )
                     continue
 
             # Extract text from example

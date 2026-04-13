@@ -26,28 +26,33 @@
 
 ### v4: Recursive MoE (In Development)
 
-306M physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual.
+306M physical parameters with Mixture of Experts. 3 physical blocks x 6 loops = 18 effective layers. Dense FFN + MoE (1 shared + 11 routed experts, top-2) in parallel residual with capacity-capped routing.
 
 | Property | Value |
 |----------|-------|
 | Physical params | ~306M |
 | Active params/token (transformer body) | ~130M |
-| Total compute (recursive ×6 block applications) | ~1.8B |
+| Total compute (recursive x6 block applications) | ~1.8B |
 | Architecture | 3 blocks x 6 loops = 18 effective layers |
-| MoE | 12 experts (1 shared + 11 routed, top-2) |
+| MoE | 12 experts (1 shared + 11 routed, top-2 capacity-capped) |
 | Hidden dim | 1536 |
 | Attention heads | 24 (head_dim=64) |
-| Tokenizer | Custom 32K BPE (trained on 10GB of text + code + Wikipedia) |
+| Tokenizer | Custom 32K BPE (trained on 2GB of text + code + Wikipedia) |
 | Context length | 8192 (progressive: 2048 -> 4096 -> 8192) |
 | Target training data | 50B tokens |
 | RoPE scaling | NTK-aware for inference beyond training length |
+| KV cache | O(1) per-token inference with incremental decoding |
 
 **Key v4 features:**
-- Loop-aware router with learned loop embeddings (sigmoid gating, DeepSeek-V3 style)
-- Learnable dense/MoE gates for parallel residual scaling
-- Router z-loss (ST-MoE/PaLM) for training stability
-- Batched scatter-gather expert dispatch
-- Gradient checkpointing for long sequences
+- **Capacity-capped routing:** each expert has a hard per-batch token cap (capacity_factor=1.25), structurally preventing any expert from dominating. Tokens scan candidates in descending sigmoid score and are assigned to the first top-k experts with remaining capacity. Same path in training and inference.
+- Loop-aware router with learned loop embeddings (additive, not concat -- halves router params)
+- Row-normalized router init (equal expert norms at step 0)
+- Learnable dense/MoE gates for parallel residual scaling (dense_gate=1.0, moe_gate=0.01 init)
+- Soft warmup (steps 0-500) -> blend (500-1000) -> hard capacity-capped dispatch (1000+)
+- Vectorised capacity assignment (sort + segment-cumsum, race-free)
+- KV cache for O(1) per-token autoregressive generation
+- Gradient checkpointing (auto-enabled during soft/blend phases and for seq_len >= 4096)
+- Resilient HF streaming data loader (auto-reconnect on shard failures)
 - Native single-token tags: `<|think|>`, `<|/think|>`, `<|answer|>`, `<|/answer|>`, `<|user|>`, `<|assistant|>`, `<|system|>`, FIM tokens
 - HuggingFace `PreTrainedModel` compatible from day one
 
@@ -129,7 +134,7 @@
           Input Token IDs (B, S)
                    |
           +--------v--------+
-          |  Token Embedding |  (65536 x 1536)
+          |  Token Embedding |  (32768 x 1536, weight-tied with LM head)
           +---------+-------+
                     |
                     |     +-------------------------------------------+
@@ -145,11 +150,11 @@
    ||  +------------------------------------------------------------+  ||
    ||  |  RecursiveBlockV4                                          |  ||
    ||  |                                                            |  ||
-   ||  |  x_mod = x + scale * (x @ adapter_a[i] @ adapter_b[i])    |  ||
+   ||  |  adapter_out = scale * (x @ adapter_a[i] @ adapter_b[i])  |  ||
    ||  |                                                            |  ||
    ||  |  +== ATTENTION ========================================+   |  ||
    ||  |  | RMSNorm -> QKV (1536->4608) -> RoPE -> Causal SDPA |   |  ||
-   ||  |  | -> Out Proj (1536->1536) + Residual                 |   |  ||
+   ||  |  | -> Out Proj + adapter_out + Residual (parallel)     |   |  ||
    ||  |  +=====================================================+   |  ||
    ||  |                          |                                 |  ||
    ||  |           +--------------+---------------+                 |  ||
@@ -159,11 +164,13 @@
    ||  |  |                   |  |                               |  |  ||
    ||  |  | RMSNorm           |  | RMSNorm                      |  |  ||
    ||  |  | SwiGLU            |  |     +---------------------+  |  |  ||
-   ||  |  | (1536->4096->1536)|  |     |  Loop-Aware Router   |  |  |  ||
-   ||  |  |                   |  |     |  h + loop_emb -> sig  |  |  |  ||
+   ||  |  | (1536->4096->1536)|  |     | Loop-Aware Router    |  |  |  ||
+   ||  |  |                   |  |     | h + loop_emb -> sig  |  |  |  ||
    ||  |  |                   |  |     +----------+----------+  |  |  ||
    ||  |  |                   |  |                |             |  |  ||
-   ||  |  |                   |  |         top-2 selection      |  |  ||
+   ||  |  |                   |  |    capacity-capped top-2     |  |  ||
+   ||  |  |                   |  |    (scan candidates, cap     |  |  ||
+   ||  |  |                   |  |     per-expert token limit)  |  |  ||
    ||  |  |                   |  |        /       |       \     |  |  ||
    ||  |  |                   |  |  +--------+ +-----+ +-----+ |  |  ||
    ||  |  |                   |  |  | Shared | | E_i | | E_j | |  |  ||
@@ -198,23 +205,36 @@
                               Logits (B, S, vocab)
 ```
 
-**MoE routing detail:**
+**MoE routing detail (capacity-capped):**
 
 ```
   Hidden state (B, S, 1536)
          |
-         +---> concat with loop_embedding[loop_idx]  --> (B, S, 3072)
+         +---> add loop_embedding[loop_idx]  --> (B, S, 1536)  [additive, not concat]
          |
-         +---> Router linear (3072 -> 11)  --> sigmoid --> top-2 selection
+         +---> Router linear (1536 -> 11)  --> sigmoid scores
+         |     (row-normalised init: all expert rows same norm)
+         |
+         +---> Capacity-capped candidate scan:
+         |     1. Sort tokens' top-11 candidates by sigmoid score
+         |     2. For each candidate rank, assign tokens to experts
+         |        that still have capacity (vectorised sort + cumcount)
+         |     3. Per-expert cap = ceil(1.25 * N * 2 / 11)
+         |     4. Each token gets exactly 2 experts (overflow ~0%)
+         |     5. Weights from clean sigmoid, renormalised
          |
          |     Expert 0: SwiGLU(1536 -> 1024 -> 1536)  [always active = shared]
-         |     Expert 1: SwiGLU(1536 -> 1024 -> 1536)  \
-         |     Expert 2: SwiGLU(1536 -> 1024 -> 1536)   |
-         |     ...                                       +-- top-2 selected
-         |     Expert 11: SwiGLU(1536 -> 1024 -> 1536)  /
+         |     Expert 1-11: SwiGLU(1536 -> 1024 -> 1536)  [2 selected per token]
          |
-         +---> output = shared_out + weighted_sum(selected_expert_outputs)
+         +---> output = shared_out + weighted_sum(capped_expert_outputs)
 ```
+
+The capacity cap is a structural guarantee -- no expert can receive more than
+~11.4% of assignments regardless of the router's preferences. This solves the
+deterministic top-k winner lock-in problem that caused routing collapse in all
+soft-regularisation approaches (z-loss, Gumbel noise, proportional bias).
+The router is free to learn token-dependent preferences; the cap just prevents
+those preferences from producing imbalanced load.
 
 **Parameter budget (v4, 32K vocab):**
 
@@ -239,6 +259,135 @@ loop-conditioned routing, so the compute budget is comparable to a model
 of roughly ~1.8B FLOPs per token — but with much tighter memorisation
 capacity than a dense 1.8B model. Treat this as iterative refinement on
 a budget, not a 1:1 parameter substitute.
+
+### Mathematical Formulation
+
+#### Notation
+
+Let $B$ denote batch size, $S$ sequence length, $d$ hidden dimension (1536), $H$ number of attention heads (24), $d_h$ head dimension (64), $N_b$ number of physical blocks (3), $L$ number of recursive loops (6), $E$ total experts (12), $E_s$ shared experts (1), $E_r$ routed experts (11), and $k$ experts selected per token (2).
+
+#### 1. Recursive Forward Pass
+
+The model applies $N_b$ physical blocks $L$ times each, yielding $N_b \times L = 18$ effective layers from 3 sets of weights. For loop $\ell \in \{0, \ldots, L-1\}$ and block $b \in \{0, \ldots, N_b-1\}$:
+
+$$\mathbf{x}^{(\ell, b)} = \text{Block}_b\!\left(\mathbf{x}^{(\ell, b-1)},\; \mathbf{A}_{\ell N_b + b},\; \mathbf{B}_{\ell N_b + b},\; \ell\right)$$
+
+where $\mathbf{x}^{(\ell, 0)} = \text{RMSNorm}(\mathbf{x}^{(\ell-1, N_b-1)})$ for $\ell > 0$ (inter-loop normalisation), and $\mathbf{x}^{(0,0)} = \text{Embed}(\text{input\_ids})$. Each block reuses the same parameters $\text{Block}_b$ across all $L$ loops; only the adapter pairs $(\mathbf{A}_i, \mathbf{B}_i)$ and the loop embedding index $\ell$ vary.
+
+#### 2. Per-Pass Residual Adapters
+
+Each of the $N_b \times L = 18$ effective layers has a unique adapter pair $(\mathbf{A}_i, \mathbf{B}_i)$ with $\mathbf{A}_i \in \mathbb{R}^{d \times r}$, $\mathbf{B}_i \in \mathbb{R}^{r \times d}$ (rank $r = 16$). Unlike weight-space LoRA (Hu et al., 2021), these operate in activation space as a parallel residual branch:
+
+$$\mathbf{x}_{\text{adapted}} = \mathbf{x} + \frac{\alpha}{r}\left(\mathbf{x}\,\mathbf{A}_i\,\mathbf{B}_i\right)$$
+
+where $\alpha = 16$, $r = 16$, giving scale $= 1.0$. At initialisation $\mathbf{B}_i = \mathbf{0}$, so the adapter is a no-op and all loops begin identically. Differentiation emerges through gradient flow during training.
+
+#### 3. Attention with RoPE
+
+Within each block, causal multi-head attention with Rotary Position Embeddings (Su et al., 2021):
+
+$$\mathbf{q}, \mathbf{k}, \mathbf{v} = \text{split}\!\left(\mathbf{W}_{qkv}\,\text{RMSNorm}(\mathbf{x})\right)$$
+
+$$\mathbf{q}' = \text{RoPE}(\mathbf{q}, \cos, \sin), \quad \mathbf{k}' = \text{RoPE}(\mathbf{k}, \cos, \sin)$$
+
+$$\text{Attn}(\mathbf{q}', \mathbf{k}', \mathbf{v}) = \text{softmax}\!\left(\frac{\mathbf{q}'\mathbf{k}'^{\!\top}}{\sqrt{d_h}} + \mathbf{M}_{\text{causal}}\right)\mathbf{v}$$
+
+$$\mathbf{x} \leftarrow \mathbf{x} + \mathbf{W}_o\,\text{Attn}(\mathbf{q}', \mathbf{k}', \mathbf{v}) + \mathbf{x}_{\text{adapted}}$$
+
+where the adapter output is added as a parallel branch alongside the attention output. Optional NTK-aware RoPE scaling (Bloc97, 2023) extends context beyond training length by rescaling $\theta_{\text{eff}} = \theta \cdot f^{d/(d-2)}$ for extension factor $f$.
+
+#### 4. Parallel Dense + MoE FFN
+
+The FFN stage runs a dense SwiGLU network and a Mixture of Experts network in parallel, with learnable scalar gates:
+
+$$\mathbf{h}_{\text{dense}} = \text{SwiGLU}_{\text{dense}}(\text{RMSNorm}(\mathbf{x}))$$
+
+$$\mathbf{h}_{\text{moe}} = \text{MoE}(\text{RMSNorm}(\mathbf{x}), \ell)$$
+
+$$\mathbf{x} \leftarrow \mathbf{x} + g_d \cdot \mathbf{h}_{\text{dense}} + g_m \cdot \mathbf{h}_{\text{moe}}$$
+
+where $g_d, g_m$ are learnable scalars initialised to $g_d = 1.0$, $g_m = 0.01$. This "dense-first" initialisation means the model starts as a nearly pure dense network and gradually incorporates MoE output as the router learns meaningful routing.
+
+Each SwiGLU network computes $\text{SwiGLU}(\mathbf{x}) = \mathbf{W}_{\text{down}}(\text{SiLU}(\mathbf{W}_{\text{gate}}\mathbf{x}) \odot \mathbf{W}_{\text{up}}\mathbf{x})$.
+
+#### 5. Loop-Aware Routing
+
+The router produces per-expert scores conditioned on both the hidden state and the current recursive loop index. A learned embedding $\mathbf{e}_\ell \in \mathbb{R}^d$ is added (not concatenated) to the hidden state before projection:
+
+$$\mathbf{s}_{b,t} = \sigma\!\left(\mathbf{W}_R\,(\mathbf{h}_t + \mathbf{e}_\ell)\right) \in \mathbb{R}^{E_r}$$
+
+where $\sigma$ is the element-wise sigmoid function, $\mathbf{W}_R \in \mathbb{R}^{E_r \times d}$ is the router weight matrix, and $\mathbf{h}_t$ is the normalised hidden state for token $t$. Addition (not concatenation) keeps router parameters at $E_r \times d$ rather than $E_r \times 2d$, since $\mathbf{W}_R[\mathbf{h}; \mathbf{e}] = \mathbf{W}_R^{(1)}\mathbf{h} + \mathbf{W}_R^{(2)}\mathbf{e}$ is equivalent under a linear projection.
+
+**Router initialisation.** $\mathbf{W}_R$ is initialised from $\mathcal{N}(0, 0.02)$ then row-normalised so every expert row has equal norm. This prevents any expert from starting with a larger projection magnitude and winning deterministic top-$k$ tie-breaking at step 0. Loop embeddings are initialised from $\mathcal{N}(0, 0.1)$ (5x the default $0.02$) so that routing is loop-dependent from the first step.
+
+#### 6. Capacity-Capped Expert Selection
+
+Standard deterministic top-$k$ selection suffers from self-reinforcing winner lock-in: small initial logit differences cause the same experts to be selected repeatedly, strengthening their weights through gradient, which increases their logit advantage, creating a positive feedback loop that collapses routing to $k$ out of $E_r$ experts within 30-50 training steps. We verified this failure empirically across six approaches: raw top-$k$, additive Gaussian noise, soft all-expert warmup, Gumbel-top-$k$, proportional bias controller, and importance-weighted regularisation. All failed to prevent collapse.
+
+We adopt **capacity-capped candidate routing**, which provides a structural guarantee on load balance. Define the per-expert capacity:
+
+$$C = \left\lceil \gamma \cdot \frac{N \cdot k}{E_r} \right\rceil$$
+
+where $N = B \times S$ is the total number of tokens in the batch, $k = 2$ is the number of experts per token, and $\gamma = 1.25$ is the capacity factor providing 25% slack above the uniform allocation $N \cdot k / E_r$.
+
+**Algorithm.** For each token, we scan its $E_r$ candidate experts in descending order of sigmoid score $\mathbf{s}_{b,t}$ and assign the first $k$ experts that have remaining capacity. Let $\pi_t$ be the permutation sorting token $t$'s scores in descending order, and let $n_j$ be the running count of tokens assigned to expert $j$. Token $t$ is assigned expert $\pi_t(r)$ at candidate rank $r$ if and only if:
+
+$$n_{\pi_t(r)} < C \quad \text{and} \quad |\{j : t \to j\}| < k$$
+
+After assignment, the dispatch weights for token $t$'s selected experts $\{j_1, j_2\}$ are:
+
+$$w_{t,j} = \frac{\sigma((\mathbf{W}_R(\mathbf{h}_t + \mathbf{e}_\ell))_j)}{\sum_{j' \in \{j_1, j_2\}} \sigma((\mathbf{W}_R(\mathbf{h}_t + \mathbf{e}_\ell))_{j'})}$$
+
+Note that the weights come from the clean sigmoid scores, not from the capacity-assignment order. This preserves meaningful gradient flow to the router: the selected experts receive gradient proportional to their sigmoid score, incentivising the router to produce high scores for experts that reduce loss.
+
+**Vectorised implementation.** To avoid a sequential loop over tokens, we process all tokens in parallel per candidate rank using a sort-and-segment-cumsum approach:
+
+1. For candidate rank $r$: gather each eligible token's desired expert ID.
+2. Sort tokens by expert ID (stable sort preserves token order within groups).
+3. Compute within-group position via segment cumsum: detect group boundaries where sorted expert IDs change, compute cumulative count within each group.
+4. Token at within-group position $p$ fits if $p < C - n_j$ (remaining capacity for expert $j$).
+5. Unsort the fit mask back to original token order and apply assignments.
+6. Update per-expert counts via `scatter_add_`.
+
+This runs in $O(E_r \cdot M \log M)$ where $M$ is the number of eligible tokens (shrinking each iteration as tokens fill their $k$ slots), eliminating the $O(E_r^2)$ inner loop of the naive implementation.
+
+**Structural guarantees.** With $\gamma = 1.25$ and candidate pool size $= E_r$ (all experts), the capacity cap ensures:
+
+$$\max_j \frac{n_j}{N \cdot k} \leq \frac{C}{N \cdot k} = \frac{\gamma}{E_r} \approx 0.114$$
+
+This bound holds by construction regardless of the router's learned preferences. The overflow rate (fraction of tokens receiving fewer than $k$ experts) is empirically $0.000$ with $\gamma = 1.25$ and full candidate pool.
+
+#### 7. MoE Output
+
+The MoE layer output combines the shared expert (always active) with the capacity-capped routed output:
+
+$$\text{MoE}(\mathbf{h}, \ell) = \text{FFN}_{\text{shared}}(\mathbf{h}) + \sum_{j \in \text{capped}(t)} w_{t,j} \cdot \text{FFN}_j(\mathbf{h}_t)$$
+
+where $\text{capped}(t)$ denotes the set of (at most $k$) experts assigned to token $t$ by the capacity-capped algorithm.
+
+#### 8. Training Loss
+
+The training objective combines cross-entropy with a differentiable importance balance regulariser:
+
+$$\mathcal{L} = \mathcal{L}_{\text{CE}} + \lambda_{\text{imp}} \cdot \frac{1}{N_b \cdot L} \sum_{\ell, b} \mathcal{L}_{\text{imp}}^{(\ell, b)}$$
+
+where the importance loss for a single MoE application is:
+
+$$\mathcal{L}_{\text{imp}} = E_r \cdot \sum_{j=1}^{E_r} \left(\bar{p}_j\right)^2, \quad \bar{p}_j = \frac{1}{N} \sum_{t=1}^{N} \text{softmax}\!\left(\frac{\mathbf{W}_R(\mathbf{h}_t + \mathbf{e}_\ell)}{\tau}\right)_j$$
+
+This is minimised at $\mathcal{L}_{\text{imp}} = 1.0$ when the softmax marginal is uniform ($\bar{p}_j = 1/E_r$ for all $j$), and grows quadratically with concentration. The default coefficient is $\lambda_{\text{imp}} = 0.05$ with temperature $\tau = 1.0$. Unlike the capacity cap (which constrains hard assignments), the importance loss provides differentiable gradient pressure on the soft probability distribution, encouraging the router to maintain balanced preferences even though the cap prevents imbalanced outcomes.
+
+#### 9. Routing Schedule
+
+Training proceeds through three routing phases:
+
+| Phase | Steps | Routing | Grad Checkpointing |
+|---|---|---|---|
+| Soft warmup | $[0, 500)$ | All $E_r$ experts run on every token, weighted by $\text{softmax}(\mathbf{s}/\tau)$ | On |
+| Blend | $[500, 1000)$ | $\alpha \cdot \text{capped\_hard} + (1-\alpha) \cdot \text{soft}$, $\alpha$ linear $0 \to 1$ | On |
+| Hard | $[1000, \infty)$ | Capacity-capped top-$k$ only | Off (seq < 4096) |
+
+The soft warmup ensures every expert receives gradient from step 0, preventing dead experts before the router has learned any token-dependent preferences. The blend phase provides a smooth transition so the model's loss trajectory is not disrupted by the switch from dense to sparse expert selection. In the hard phase, only the $k$ capacity-capped experts run per token, reducing compute to $\sim$$130$M active parameters per token.
 
 ### Per-Pass Residual Adapters
 
@@ -455,23 +604,26 @@ uv run modal run app_v4.py --stage eval
 ```
 
 **Recommended first run: sanity check, not full send.** Launch the pretrain
-stage, watch the first ~500-1000 steps in W&B, and confirm the following
+stage, watch the first ~100-500 steps in W&B, and confirm the following
 signals before committing more GPU hours:
 
 | What to watch | Healthy signal |
 |---|---|
-| `train/loss` | Drops from ~10.4 baseline (ln 32768) toward ~7-8 within the warmup |
-| `train/tok_per_sec` | Stable at >20K on H100 at seq_len 2048 |
-| `moe/dense_gate_b{0,1,2}` | Starts at 1.0, drifts slowly — not collapsing |
-| `moe/moe_gate_b{0,1,2}` | Starts at 0.01, grows as router learns |
-| `moe/entropy_mean` | ≥ 2.0 (router not collapsing; ln(11) ≈ 2.40 is max) |
-| `moe/expert_max_mean` | < 0.4 (no single expert eating most tokens) |
-| `moe/load_balance_loss_mean` | Stable, not exploding |
+| `train/loss` | Drops from ~10.7 (ln 32768) toward ~7 by step 100 |
+| `train/tok_per_sec` | 12-15K in soft phase, 18-20K in hard phase (H100) |
+| `moe/clean_expert_max_mean` | Pinned at ~0.114 (= capacity cap bound) |
+| `moe/overflow_rate_mean` | 0.000 (every token gets 2 experts) |
+| `moe/assigned_per_token_mean` | 2.00 |
+| `moe/candidate_rank_mean` | < 4.0 (tokens finding capacity without going deep) |
+| `moe/moe_gate_b{0,1,2}` | Starts at 0.01, climbs steadily (MoE becoming useful) |
+| `moe/dense_gate_b{0,1,2}` | Starts at 1.0, gradually decreases (shifting to MoE) |
+| `moe/raw_assign_entropy_mean` | Diagnostic only -- may collapse, that's OK |
 | `eval/loss` | Slowly improving on the held-out FineWeb-Edu stream |
 
-If anything is off — routing collapse, slow tok/s, NaN loss — stop the run
-early, diagnose, and restart. Cheap to iterate, expensive to burn the
-whole budget on a broken run.
+The capacity cap makes routing collapse structurally impossible -- `expert_max`
+cannot exceed `ceil(capacity_factor * N * top_k / num_routed) / (N * top_k)`.
+If you see `overflow_rate > 0.01` or `assigned_per_token < 1.9`, increase
+`router_candidate_k` (default 11 = num_routed) or `router_capacity_factor`.
 
 ---
 
@@ -544,7 +696,9 @@ Additional benchmarks (GSM8K, HellaSwag) pending.
 | HRA (not LoRA) for post-training | Adds substantial capacity (11-20M params) rather than parameter-efficient fine-tuning |
 | Lion optimizer (pre-training) | Halves optimizer VRAM; competitive perplexity at this scale |
 | MoE alongside dense FFN (v4) | Dense path maintains baseline quality; MoE adds specialist capacity |
-| Loop-aware routing (v4) | Router learns to dispatch differently at each recursive pass |
+| Capacity-capped routing (v4) | Structural load balance guarantee; deterministic top-k collapses without it (confirmed across 6+ sanity runs with soft warmup, Gumbel noise, and proportional bias -- all failed) |
+| Loop-aware routing (v4) | Additive loop embeddings; router learns to dispatch differently at each recursive pass |
+| Soft warmup schedule (v4) | Steps 0-500 use all-expert soft dispatch so every expert gets gradient before hard selection starts |
 | Custom tokenizer (v4) | Optimized for code+text distribution; native single-token tags |
 | Progressive seq_len (v4) | Start short (fast), extend long (capability); RoPE naturally supports this |
 
@@ -555,6 +709,7 @@ Additional benchmarks (GSM8K, HellaSwag) pending.
 Training logs to Weights & Biases with per-stage metrics:
 
 - **Pre-training:** loss, lr, vram, tok/s, phase, loop RMS, adapter similarity
+- **MoE routing (v4):** capped/raw assignment entropy, expert max/min fractions, overflow rate, assigned experts per token, candidate rank mean, gate values, importance loss -- all per-block per-loop
 - **SFT:** loss, lr, vram, token utilization
 - **GRPO:** loss, mean reward, accuracy, KL divergence
 
@@ -566,7 +721,7 @@ W&B project: [nano-osrt-100m](https://wandb.ai/codhe-synextra/nano-osrt-100m) | 
 
 | Version | Key Changes |
 |---------|-------------|
-| **v4.0** (dev) | 3 blocks, MoE (12 experts, top-2), 32K custom tokenizer, parallel adapter residual, dense-first MoE gating, additive loop-aware router, progressive seq_len, native tags, HF-native |
+| **v4.0** (dev) | 3 blocks, MoE (12 experts, capacity-capped top-2), 32K custom tokenizer, parallel adapter residual, dense-first MoE gating, additive loop-aware router with row-norm init, soft warmup + blend + hard routing schedule, vectorised capacity-capped dispatch, KV cache, resilient HF data streaming, progressive seq_len, native tags, HF-native |
 | **v3.3** | Code SFT (7K steps, 2 epochs), HRA adapters (+11.2M params), HF inference wrapper, IFEval benchmark |
 | **v3.2** | Post-training pipeline: Math SFT + GRPO + improved reward functions |
 | **v3.1** | RoPE, FP32 master weights, dynamic vocab, SmolTalk formatting |

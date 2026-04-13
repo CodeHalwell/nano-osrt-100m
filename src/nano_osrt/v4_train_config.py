@@ -26,7 +26,7 @@ class V4PretrainConfig:
     log_interval: int = 50
     eval_interval: int = 1_000
     eval_steps: int = 20  # number of batches per eval
-    ckpt_interval: int = 5_000
+    ckpt_interval: int = 1_000
     optimizer_name: str = "lion"
 
     # Weights & Biases
