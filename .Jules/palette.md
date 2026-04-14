@@ -1,0 +1,3 @@
+## 2024-05-14 - Gradio Input Autofocus & Tooltips
+**Learning:** Gradio v6.9.0's `Textbox` supports the `autofocus=True` argument, which significantly improves chat UI UX by focusing on load. For sliders, `info="..."` serves as accessible helper text in lieu of standard HTML tooltips. Testing interactive UI component features via quick sandbox scripts allows evaluating UX boundaries gracefully.
+**Action:** Use `autofocus` on primary inputs and `info` on complex configuration sliders for quick UX wins in Gradio apps without overhauling design. Always clean up evaluation scripts (like `test_gradio.py`) to prevent repo pollution.
