@@ -169,15 +169,17 @@ class MoELayer(nn.Module):
         """
         N = flat_x.shape[0]  # B*S
 
-        # Expand for top-k: each token appears top_k times
-        x_rep = flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*top_k, D)
         idx_flat = flat_indices.reshape(-1)        # (N*top_k,)
         w_flat = flat_weights.reshape(-1, 1)       # (N*top_k, 1)
 
         # Sort by expert for batched execution
         sorted_order = idx_flat.argsort(stable=True)
         sorted_experts = idx_flat[sorted_order]
-        sorted_x = x_rep[sorted_order]
+
+        # Gather original tokens directly to avoid massive expansion allocation
+        sorted_tokens = torch.div(sorted_order, self.top_k, rounding_mode="floor")
+        sorted_x = flat_x[sorted_tokens]
+
         sorted_w = w_flat[sorted_order]
 
         # Find token counts per expert
@@ -196,7 +198,7 @@ class MoELayer(nn.Module):
             offset += count
 
         # Unsort and reduce across top-k
-        result = torch.zeros_like(x_rep)
+        result = torch.zeros((N * self.top_k, D), dtype=flat_x.dtype, device=flat_x.device)
         result[sorted_order] = sorted_out
         # Sum over the top_k dimension
         result = result.view(N, self.top_k, D).sum(dim=1)
