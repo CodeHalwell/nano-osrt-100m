@@ -1,4 +1,4 @@
-"""Tests for NanoOSRT v4 — Recursive MoE model and training helpers."""
+"""Tests for NanoOSRT v4 — Recursive MoE model, KV cache, and training helpers."""
 
 import math
 
@@ -41,7 +41,7 @@ def tiny_v4_config() -> NanoOSRTv4Config:
         expert_hidden=64,
         router_aux_loss_coeff=0.01,
         router_z_loss_coeff=0.001,
-        max_position_embeddings=64,
+        max_position_embeddings=128,
     )
 
 
@@ -265,8 +265,9 @@ class TestRecursiveBlockV4:
         adapter_a = torch.randn(tiny_v4_config.dim, tiny_v4_config.adapter_rank) * 0.01
         adapter_b = torch.zeros(tiny_v4_config.adapter_rank, tiny_v4_config.dim)
         cos, sin = compute_rope_freqs(S, tiny_v4_config.head_dim)
-        out = block(x, adapter_a, adapter_b, 1.0, cos, sin, loop_idx=0)
+        out, present_kv = block(x, adapter_a, adapter_b, 1.0, cos, sin, loop_idx=0)
         assert out.shape == (B, S, tiny_v4_config.dim)
+        assert present_kv is None  # use_cache defaults to False
 
     def test_parallel_ffn_gates_init(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         """Dense and MoE gates should start at 0.5 (combined = 1.0)."""
@@ -283,17 +284,18 @@ class TestNanoOSRTv4Model:
         model = NanoOSRTv4Model(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 8))
-        hidden, loop_rms, lb_loss, z_loss = model(input_ids)
+        hidden, loop_rms, lb_loss, z_loss, presents = model(input_ids)
         assert hidden.shape == (1, 8, tiny_v4_config.dim)
         assert len(loop_rms) == tiny_v4_config.recursive_loops
         assert lb_loss.ndim == 0
         assert z_loss.ndim == 0
+        assert presents is None  # use_cache defaults to False
 
     def test_loop_rms_positive(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4Model(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        _, loop_rms, _, _ = model(input_ids)
+        _, loop_rms, _, _, _ = model(input_ids)
         for rms in loop_rms:
             assert rms.item() > 0
 
@@ -309,7 +311,7 @@ class TestNanoOSRTv4Model:
         model = NanoOSRTv4Model(tiny_v4_config)
         model.train()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 8))
-        _, _, lb_loss, z_loss = model(input_ids)
+        _, _, lb_loss, z_loss, _ = model(input_ids)
         # With 2 blocks × 2 loops = 4 MoE forwards, losses should be > 0
         assert lb_loss.item() > 0
         assert z_loss.item() > 0
@@ -357,6 +359,7 @@ class TestNanoOSRTv4ForCausalLM:
         outputs = model(input_ids)
         assert outputs.loss is None
         assert outputs.logits.shape == (2, 8, tiny_v4_config.vocab_size)
+        assert outputs.past_key_values is None
 
     def test_forward_with_labels(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
@@ -380,7 +383,7 @@ class TestNanoOSRTv4ForCausalLM:
 
         # Get sub-losses by running the inner model
         with torch.no_grad():
-            _, _, lb_loss, z_loss = model.model(input_ids)
+            _, _, lb_loss, z_loss, _ = model.model(input_ids)
 
         # Total loss should be > just cross-entropy (the aux losses add)
         # We can't easily decompose, but loss should be a reasonable number
@@ -390,8 +393,6 @@ class TestNanoOSRTv4ForCausalLM:
     def test_weight_tying(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         """LM head should use the embedding weights (weight-tied)."""
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
-        # Weight-tied: logits = hidden @ embedding.weight.T
-        # Check that embedding weight shapes match what the logits need
         assert model.model.embedding.weight.shape == (
             tiny_v4_config.vocab_size, tiny_v4_config.dim
         )
@@ -432,6 +433,157 @@ class TestNanoOSRTv4ForCausalLM:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         n = sum(p.numel() for p in model.parameters())
         assert n > 0
+
+
+# ── KV cache correctness ─────────────────────────────────────────────
+
+
+class TestKVCache:
+    def test_forward_returns_cache_when_requested(
+        self, tiny_v4_config: NanoOSRTv4Config
+    ) -> None:
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 8))
+        outputs = model(input_ids, use_cache=True)
+
+        # Should have num_blocks * recursive_loops cache entries
+        expected_layers = (
+            tiny_v4_config.num_blocks * tiny_v4_config.recursive_loops
+        )
+        assert outputs.past_key_values is not None
+        assert len(outputs.past_key_values) == expected_layers
+
+        # Each entry is (K, V) with shape (B, heads, S, head_dim)
+        for k, v in outputs.past_key_values:
+            assert k.shape == (
+                1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim,
+            )
+            assert v.shape == (
+                1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim,
+            )
+
+    def test_incremental_matches_full(
+        self, tiny_v4_config: NanoOSRTv4Config
+    ) -> None:
+        """Incremental decoding produces identical logits to full pass."""
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 6))
+
+        # Full forward pass
+        full_outputs = model(input_ids, use_cache=False)
+        full_logits = full_outputs.logits  # (1, 6, vocab)
+
+        # Incremental: prefill 4, then token 5, then token 6
+        prefill_ids = input_ids[:, :4]
+        prefill_out = model(prefill_ids, use_cache=True)
+        cache = prefill_out.past_key_values
+
+        step1_ids = input_ids[:, 4:5]
+        step1_out = model(
+            step1_ids, past_key_values=cache, use_cache=True,
+        )
+        cache = step1_out.past_key_values
+
+        step2_ids = input_ids[:, 5:6]
+        step2_out = model(
+            step2_ids, past_key_values=cache, use_cache=True,
+        )
+
+        torch.testing.assert_close(
+            full_logits[:, 5, :],
+            step2_out.logits[:, 0, :],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        torch.testing.assert_close(
+            full_logits[:, 4, :],
+            step1_out.logits[:, 0, :],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_cache_grows_correctly(
+        self, tiny_v4_config: NanoOSRTv4Config
+    ) -> None:
+        """Cached sequence length grows by 1 each step."""
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
+
+        # Prefill
+        out = model(input_ids, use_cache=True)
+        assert out.past_key_values[0][0].shape[2] == 4
+
+        # Step 1
+        new_token = torch.randint(0, tiny_v4_config.vocab_size, (1, 1))
+        out = model(
+            new_token,
+            past_key_values=out.past_key_values,
+            use_cache=True,
+        )
+        assert out.past_key_values[0][0].shape[2] == 5
+
+        # Step 2
+        new_token = torch.randint(0, tiny_v4_config.vocab_size, (1, 1))
+        out = model(
+            new_token,
+            past_key_values=out.past_key_values,
+            use_cache=True,
+        )
+        assert out.past_key_values[0][0].shape[2] == 6
+
+
+# ── Generate ─────────────────────────────────────────────────────────
+
+
+class TestGenerate:
+    def test_generate_with_cache(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=True,
+        )
+        assert out.shape == (1, 9)  # 4 prompt + 5 generated
+
+    def test_generate_without_cache(
+        self, tiny_v4_config: NanoOSRTv4Config,
+    ) -> None:
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=False,
+        )
+        assert out.shape == (1, 9)
+
+    def test_generate_greedy_deterministic(
+        self, tiny_v4_config: NanoOSRTv4Config
+    ) -> None:
+        """Greedy generation with/without cache produces identical tokens."""
+        model = NanoOSRTv4ForCausalLM(tiny_v4_config)
+        model.eval()
+        input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
+
+        out_cached = model.generate(
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=True,
+        )
+        out_nocache = model.generate(
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=False,
+        )
+        assert torch.equal(out_cached, out_nocache)
 
 
 # ── V4 Training Helpers ─────────────────────────────────────────────────
