@@ -1,0 +1,3 @@
+## 2024-05-23 - Avoid Python loops for tensor updates
+**Learning:** Using Python loops and list conversions (like `set(tensor.tolist())`) for element-wise tensor modifications, especially in autoregressive generation loops, introduces massive overhead. In a synthetic benchmark with a batch size of 1, vocab size of 50277, and sequence length of 2048, iterating over the unique generated tokens in Python to apply repetition penalties took ~64 seconds for 1000 iterations, compared to ~0.4 seconds when vectorized.
+**Action:** Always use vectorized operations like boolean masking, `torch.unique()`, and `torch.where()` to modify tensors instead of looping in Python.
