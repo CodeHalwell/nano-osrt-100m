@@ -56,22 +56,16 @@ class TokenStream(IterableDataset):
 
         if worker_info is not None:
             try:
-                ds = ds.shard(
-                    num_shards=worker_info.num_workers, index=worker_info.id
-                )
+                ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
             except Exception:
-                ds = itertools.islice(
-                    ds, worker_info.id, None, worker_info.num_workers
-                )
+                ds = itertools.islice(ds, worker_info.id, None, worker_info.num_workers)
 
         buffer: list[int] = []
         for example in ds:
             # Handle Phase 3 instruction-tuning format (messages column)
             if "messages" in example:
                 try:
-                    text = tok.apply_chat_template(
-                        example["messages"], tokenize=False
-                    )
+                    text = tok.apply_chat_template(example["messages"], tokenize=False)
                 except Exception:
                     # GPT-NeoX has no default chat template; manual fallback.
                     # EOS after assistant turns teaches the model to stop.
@@ -123,7 +117,13 @@ def make_loader(
     Returns:
         A :class:`DataLoader` yielding ``(input_ids, labels)`` batches.
     """
-    ds = TokenStream(dataset_name, seq_len, tokenizer_name, seed=42 + step_num, dataset_config=dataset_config)
+    ds = TokenStream(
+        dataset_name,
+        seq_len,
+        tokenizer_name,
+        seed=42 + step_num,
+        dataset_config=dataset_config,
+    )
     return DataLoader(
         ds,
         batch_size=batch_size,

@@ -39,6 +39,7 @@ def format_gsm8k(example: dict) -> tuple[str, str, str]:
 def format_numina_math(example: dict) -> tuple[str, str, str]:
     """NuminaMath-CoT: problem + solution with reasoning."""
     import re
+
     question = example.get("problem", "")
     solution = example.get("solution", "")
 
@@ -394,7 +395,10 @@ def make_v4_sft_loader(
         DataLoader yielding (input_ids, labels) batches.
     """
     ds = V4SFTStream(
-        dataset_configs, seq_len, tokenizer, seed,
+        dataset_configs,
+        seq_len,
+        tokenizer,
+        seed,
         user_tag=user_tag,
         assistant_tag=assistant_tag,
         think_open=think_open,

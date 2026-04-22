@@ -193,16 +193,16 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
             freeze_pretrained=cfg.hra_freeze_pretrained,
         )
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)")
+        print(
+            f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)"
+        )
     else:
         total_params = base_params
 
     # Load SFT weights (includes HRA adapter weights from SFT)
     sft_path = cfg.pretrained_checkpoint
     if not os.path.exists(sft_path):
-        raise FileNotFoundError(
-            f"SFT checkpoint not found: {sft_path}. Run SFT first."
-        )
+        raise FileNotFoundError(f"SFT checkpoint not found: {sft_path}. Run SFT first.")
     print(f"Loading SFT weights from {sft_path}...")
     ckpt = torch.load(sft_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
@@ -256,15 +256,16 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
     # ------------------------------------------------------------------
     if cfg.hra_enabled and hra_params:
         param_groups = get_param_groups(
-            model, hra_params,
+            model,
+            hra_params,
             base_lr=cfg.peak_lr,
             hra_lr=cfg.hra_lr,
             weight_decay=cfg.weight_decay,
         )
-        optimizer = torch.optim.AdamW(
-            param_groups, betas=(0.9, 0.95), eps=1e-8
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+        print(
+            f"Using AdamW with differential LR (base={cfg.peak_lr}, hra={cfg.hra_lr})"
         )
-        print(f"Using AdamW with differential LR (base={cfg.peak_lr}, hra={cfg.hra_lr})")
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -349,9 +350,7 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
             # Format prompt
             prompt_text = f"{cfg.user_prefix}{question}\n{cfg.assistant_prefix}"
             prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-            prompt_tensor = torch.tensor(
-                [prompt_ids], dtype=torch.long, device=device
-            )
+            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             prompt_len = len(prompt_ids)
 
             # Generate completions
@@ -440,9 +439,7 @@ def run_grpo(cfg: GRPOConfig, vol, tokenizer_name: str) -> None:
 
         # --- Logging ---
         should_log = (
-            step % cfg.log_interval == 0
-            or step == 0
-            or (step < 50 and step % 5 == 0)
+            step % cfg.log_interval == 0 or step == 0 or (step < 50 and step % 5 == 0)
         )
         if should_log:
             elapsed = time.time() - start_time

@@ -78,9 +78,7 @@ class TestKVCache:
             assert k.shape == (1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim)
             assert v.shape == (1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim)
 
-    def test_incremental_matches_full(
-        self, tiny_v4_config: NanoOSRTv4Config
-    ) -> None:
+    def test_incremental_matches_full(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         """Verify that incremental decoding produces identical logits to a
         full forward pass.  This is the critical correctness test for KV
         cache: given tokens [A, B, C], the logit for position C should be
@@ -123,9 +121,7 @@ class TestKVCache:
             rtol=1e-4,
         )
 
-    def test_cache_grows_correctly(
-        self, tiny_v4_config: NanoOSRTv4Config
-    ) -> None:
+    def test_cache_grows_correctly(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         """Check that the cached sequence length grows by 1 each step."""
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
@@ -154,14 +150,18 @@ class TestGenerate:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        out = model.generate(input_ids, max_new_tokens=5, temperature=1.0, use_cache=True)
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=True
+        )
         assert out.shape == (1, 9)  # 4 prompt + 5 generated
 
     def test_generate_without_cache(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        out = model.generate(input_ids, max_new_tokens=5, temperature=1.0, use_cache=False)
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=False
+        )
         assert out.shape == (1, 9)
 
     def test_generate_greedy_deterministic(
@@ -174,9 +174,15 @@ class TestGenerate:
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
 
         out_cached = model.generate(
-            input_ids.clone(), max_new_tokens=8, temperature=0.0, use_cache=True,
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=True,
         )
         out_nocache = model.generate(
-            input_ids.clone(), max_new_tokens=8, temperature=0.0, use_cache=False,
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=False,
         )
         assert torch.equal(out_cached, out_nocache)

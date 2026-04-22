@@ -157,7 +157,9 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     if cfg.hra_enabled:
         total_params = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)")
+        print(
+            f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)"
+        )
         print(f"  Trainable         : {trainable:>12,}")
     else:
         total_params = base_params
@@ -203,15 +205,16 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     if cfg.hra_enabled and hra_params:
         # Differential LR: pretrained weights at base LR, HRA adapters at higher LR
         param_groups = get_param_groups(
-            model, hra_params,
+            model,
+            hra_params,
             base_lr=cfg.peak_lr,
             hra_lr=cfg.hra_lr,
             weight_decay=cfg.weight_decay,
         )
-        optimizer = torch.optim.AdamW(
-            param_groups, betas=(0.9, 0.95), eps=1e-8
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+        print(
+            f"Using AdamW with differential LR (base={cfg.peak_lr}, hra={cfg.hra_lr})"
         )
-        print(f"Using AdamW with differential LR (base={cfg.peak_lr}, hra={cfg.hra_lr})")
     elif cfg.optimizer_name.lower() == "lion":
         from lion_pytorch import Lion
 
@@ -317,9 +320,7 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits, _ = model(input_ids)
-                active_logits = (
-                    logits[..., : cfg.real_vocab_size].contiguous().float()
-                )
+                active_logits = logits[..., : cfg.real_vocab_size].contiguous().float()
                 loss = F.cross_entropy(
                     active_logits.view(-1, cfg.real_vocab_size),
                     labels.view(-1),
@@ -335,9 +336,7 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
 
         # --- Logging ---
         should_log = (
-            step % cfg.log_interval == 0
-            or step == 0
-            or (step < 50 and step % 5 == 0)
+            step % cfg.log_interval == 0 or step == 0 or (step < 50 and step % 5 == 0)
         )
         if should_log:
             elapsed = time.time() - start_time

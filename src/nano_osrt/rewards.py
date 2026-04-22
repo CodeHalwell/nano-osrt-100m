@@ -42,7 +42,9 @@ def extract_gsm8k_answer(answer_text: str) -> str | None:
     return None
 
 
-def extract_thinking(text: str, think_open: str = "<think>", think_close: str = "</think>") -> str:
+def extract_thinking(
+    text: str, think_open: str = "<think>", think_close: str = "</think>"
+) -> str:
     """Extract the content between think tags."""
     if think_open in text and think_close in text:
         start = text.index(think_open) + len(think_open)
@@ -51,7 +53,9 @@ def extract_thinking(text: str, think_open: str = "<think>", think_close: str = 
     return ""
 
 
-def check_format(text: str, think_open: str = "<think>", think_close: str = "</think>") -> bool:
+def check_format(
+    text: str, think_open: str = "<think>", think_close: str = "</think>"
+) -> bool:
     """Check if the completion uses proper thinking format."""
     return think_open in text and think_close in text
 
@@ -83,7 +87,9 @@ def count_reasoning_steps(thinking: str) -> int:
         return 0
 
     # Count numbered steps (1. 2. 3. or Step 1, Step 2)
-    numbered = re.findall(r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)", thinking, re.IGNORECASE)
+    numbered = re.findall(
+        r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)", thinking, re.IGNORECASE
+    )
     if len(numbered) >= 2:
         return len(numbered)
 
@@ -198,7 +204,7 @@ def compute_group_advantages(rewards: list[float]) -> list[float]:
 
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n
-    std = var ** 0.5
+    std = var**0.5
 
     if std < 1e-8:
         return [0.0] * n

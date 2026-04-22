@@ -27,18 +27,15 @@ class NanoOSRTv4Config(PretrainedConfig):
         dim: int = 1536,
         heads: int = 24,
         head_dim: int = 64,
-        vocab_size: int = 65536,   # 64K vocab — balances tokenisation quality vs param budget
+        vocab_size: int = 65536,  # 64K vocab — balances tokenisation quality vs param budget
         real_vocab_size: int = 65536,
-
         # Recursive structure
         num_blocks: int = 3,
         recursive_loops: int = 6,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
-
         # Dense FFN
         dense_hidden: int = 4096,
-
         # MoE
         num_experts: int = 12,
         num_shared_experts: int = 1,
@@ -47,15 +44,12 @@ class NanoOSRTv4Config(PretrainedConfig):
         expert_hidden: int = 1024,
         router_aux_loss_coeff: float = 0.01,
         router_z_loss_coeff: float = 0.001,
-
         # Sequence length
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
-
         # Training defaults
         initializer_range: float = 0.02,
-
         # Token IDs (must match tokenizer special tokens)
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -71,7 +65,6 @@ class NanoOSRTv4Config(PretrainedConfig):
         user_token_id: int = 11,
         assistant_token_id: int = 12,
         system_token_id: int = 13,
-
         **kwargs,
     ):
         self.dim = dim

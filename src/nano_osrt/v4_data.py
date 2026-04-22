@@ -170,9 +170,7 @@ def make_v4_loader(
     Returns:
         DataLoader yielding (input_ids, labels) batches.
     """
-    ds = V4TokenStream(
-        dataset_configs, seq_len, tokenizer_name, seed=42 + step_num
-    )
+    ds = V4TokenStream(dataset_configs, seq_len, tokenizer_name, seed=42 + step_num)
     return DataLoader(
         ds,
         batch_size=batch_size,

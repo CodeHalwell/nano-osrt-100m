@@ -145,9 +145,7 @@ class TestRecursiveNanoOSRT:
 
     def test_adapter_count(self, tiny_modal_config: ModalConfig) -> None:
         model = RecursiveNanoOSRT(tiny_modal_config)
-        expected = (
-            tiny_modal_config.num_blocks * tiny_modal_config.recursive_loops
-        )
+        expected = tiny_modal_config.num_blocks * tiny_modal_config.recursive_loops
         assert len(model.adapters_a) == expected
         assert len(model.adapters_b) == expected
 

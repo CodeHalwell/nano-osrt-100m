@@ -86,10 +86,7 @@ def get_batch(
     """
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
-        [
-            torch.from_numpy(data[i : i + block_size].astype(np.int64))
-            for i in ix
-        ]
+        [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
     )
     y = torch.stack(
         [
@@ -98,8 +95,9 @@ def get_batch(
         ]
     )
     if "cuda" in str(device):
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
+        x, y = (
+            x.pin_memory().to(device, non_blocking=True),
+            y.pin_memory().to(device, non_blocking=True),
         )
     else:
         x, y = x.to(device), y.to(device)

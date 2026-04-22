@@ -35,12 +35,24 @@ def compute_rope_freqs(
     if dim % 2 != 0:
         raise ValueError(f"RoPE requires even dimension, got dim={dim}")
     freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim)
+        theta
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
+            / dim
+        )
     )
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
+    cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
+    sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
     return cos, sin
 
 
@@ -96,7 +108,10 @@ class MoELayer(nn.Module):
 
         # Routed experts
         self.experts = nn.ModuleList(
-            [ExpertFFN(config.dim, config.expert_hidden) for _ in range(self.num_routed)]
+            [
+                ExpertFFN(config.dim, config.expert_hidden)
+                for _ in range(self.num_routed)
+            ]
         )
 
         # Router: projects hidden state to expert scores
@@ -133,9 +148,12 @@ class MoELayer(nn.Module):
         shared_out = self.shared_expert(x)
 
         # Loop-aware routing with cached index tensor
-        loop_emb = self.loop_embeddings(
-            self.loop_indices[loop_idx]
-        ).unsqueeze(0).unsqueeze(0).expand(B, S, -1)  # (B, S, dim)
+        loop_emb = (
+            self.loop_embeddings(self.loop_indices[loop_idx])
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .expand(B, S, -1)
+        )  # (B, S, dim)
 
         router_input = torch.cat([x, loop_emb], dim=-1)  # (B, S, 2*dim)
         router_logits = self.router(router_input)  # (B, S, num_routed)
@@ -152,14 +170,20 @@ class MoELayer(nn.Module):
 
         # Batched scatter-gather dispatch: each expert runs exactly once
         routed_out = self._dispatch_experts(
-            x.reshape(-1, D), top_k_indices.reshape(-1, self.top_k),
-            top_k_weights.reshape(-1, self.top_k), D,
+            x.reshape(-1, D),
+            top_k_indices.reshape(-1, self.top_k),
+            top_k_weights.reshape(-1, self.top_k),
+            D,
         )
 
         return shared_out + routed_out.view(B, S, D)
 
     def _dispatch_experts(
-        self, flat_x: Tensor, flat_indices: Tensor, flat_weights: Tensor, D: int,
+        self,
+        flat_x: Tensor,
+        flat_indices: Tensor,
+        flat_weights: Tensor,
+        D: int,
     ) -> Tensor:
         """Batch tokens by expert, run each expert once, scatter back.
 
@@ -170,9 +194,11 @@ class MoELayer(nn.Module):
         N = flat_x.shape[0]  # B*S
 
         # Expand for top-k: each token appears top_k times
-        x_rep = flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*top_k, D)
-        idx_flat = flat_indices.reshape(-1)        # (N*top_k,)
-        w_flat = flat_weights.reshape(-1, 1)       # (N*top_k, 1)
+        x_rep = (
+            flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
+        )  # (N*top_k, D)
+        idx_flat = flat_indices.reshape(-1)  # (N*top_k,)
+        w_flat = flat_weights.reshape(-1, 1)  # (N*top_k, 1)
 
         # Sort by expert for batched execution
         sorted_order = idx_flat.argsort(stable=True)
@@ -192,7 +218,9 @@ class MoELayer(nn.Module):
             if count == 0:
                 continue
             expert_in = sorted_x[offset : offset + count]
-            sorted_out[offset : offset + count] = self.experts[eid](expert_in) * sorted_w[offset : offset + count]
+            sorted_out[offset : offset + count] = (
+                self.experts[eid](expert_in) * sorted_w[offset : offset + count]
+            )
             offset += count
 
         # Unsort and reduce across top-k
@@ -203,8 +231,12 @@ class MoELayer(nn.Module):
         return result
 
     def _compute_losses(
-        self, router_logits: Tensor, router_probs: Tensor,
-        top_k_indices: Tensor, B: int, S: int,
+        self,
+        router_logits: Tensor,
+        router_probs: Tensor,
+        top_k_indices: Tensor,
+        B: int,
+        S: int,
     ) -> None:
         """Compute load balancing loss and router z-loss (stored separately).
 
@@ -215,7 +247,9 @@ class MoELayer(nn.Module):
         apply router_aux_loss_coeff and router_z_loss_coeff independently.
         """
         # Fraction of tokens routed to each expert
-        one_hot = F.one_hot(top_k_indices, self.num_routed).float()  # (B, S, top_k, num_routed)
+        one_hot = F.one_hot(
+            top_k_indices, self.num_routed
+        ).float()  # (B, S, top_k, num_routed)
         tokens_per_expert = one_hot.sum(dim=(0, 1, 2))  # (num_routed,)
         fraction_routed = tokens_per_expert / (B * S * self.top_k)
 
@@ -343,7 +377,7 @@ class RecursiveBlockV4(nn.Module):
                 q, k, v, attn_mask=attn_mask, is_causal=False
             )
         else:
-            is_causal = (q_len == k_len)
+            is_causal = q_len == k_len
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
@@ -386,7 +420,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         self.embedding = nn.Embedding(config.vocab_size, config.dim)
 
         # RoPE (non-persistent buffers)
-        cos, sin = compute_rope_freqs(config.max_position_embeddings, config.head_dim, config.rope_theta)
+        cos, sin = compute_rope_freqs(
+            config.max_position_embeddings, config.head_dim, config.rope_theta
+        )
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
@@ -398,12 +434,16 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         # Per-pass adapters (num_blocks × recursive_loops pairs)
         total_pairs = config.num_blocks * config.recursive_loops
         self.adapters_a = nn.ParameterList(
-            [nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
+                for _ in range(total_pairs)
+            ]
         )
         self.adapters_b = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
 
@@ -422,7 +462,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> tuple[Tensor, list[Tensor], Tensor, Tensor, list[tuple[Tensor, Tensor]] | None]:
+    ) -> tuple[
+        Tensor, list[Tensor], Tensor, Tensor, list[tuple[Tensor, Tensor]] | None
+    ]:
         """Forward pass.
 
         Args:
@@ -460,7 +502,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                     )
             if past_key_values[0] is not None:
                 key, value = past_key_values[0]
-                if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                if not isinstance(key, torch.Tensor) or not isinstance(
+                    value, torch.Tensor
+                ):
                     raise ValueError(
                         "Invalid past_key_values: each non-None entry must contain "
                         "torch.Tensor key/value tensors."
@@ -504,25 +548,42 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                 adapter_a = self.adapters_a[idx]
                 adapter_b = self.adapters_b[idx]
 
-                layer_past = past_key_values[idx] if past_key_values is not None else None
+                layer_past = (
+                    past_key_values[idx] if past_key_values is not None else None
+                )
 
                 if use_ckpt:
                     # Gradient checkpointing (training only, never with cache).
                     # Wrap in closure to capture non-tensor args.
                     def _block_fn(
-                        _x, _a, _b, _cos, _sin,
-                        _block=block, _scale=self.adapter_scale, _loop=loop,
+                        _x,
+                        _a,
+                        _b,
+                        _cos,
+                        _sin,
+                        _block=block,
+                        _scale=self.adapter_scale,
+                        _loop=loop,
                     ):
                         return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
 
                     x = gradient_checkpoint(
-                        _block_fn, x, adapter_a, adapter_b, cos, sin,
+                        _block_fn,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        cos,
+                        sin,
                         use_reentrant=False,
                     )
                 else:
                     x, present_kv = block(
-                        x, adapter_a, adapter_b,
-                        self.adapter_scale, cos, sin,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        self.adapter_scale,
+                        cos,
+                        sin,
                         loop_idx=loop,
                         past_key_value=layer_past,
                         use_cache=use_cache,
@@ -581,7 +642,9 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :self.config.real_vocab_size].contiguous().float()
+            shift_logits = (
+                logits[..., :-1, : self.config.real_vocab_size].contiguous().float()
+            )
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.config.real_vocab_size),
@@ -633,7 +696,7 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                 model_input = generated[:, -1:]
             else:
                 # Prefill: full context (capped to max position embeddings)
-                model_input = generated[:, -self.config.max_position_embeddings:]
+                model_input = generated[:, -self.config.max_position_embeddings :]
 
             outputs = self.forward(
                 model_input,
@@ -657,17 +720,20 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                     if cached_len > max_len:
                         past_key_values = [
                             (kv[0][:, :, -max_len:, :], kv[1][:, :, -max_len:, :])
-                            if kv is not None else None
+                            if kv is not None
+                            else None
                             for kv in past_key_values
                         ]
 
-            next_logits = outputs.logits[:, -1, :self.config.real_vocab_size].float()
+            next_logits = outputs.logits[:, -1, : self.config.real_vocab_size].float()
 
             if temperature > 0:
                 next_logits = next_logits / temperature
 
                 if top_k > 0:
-                    topk_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    topk_vals, _ = torch.topk(
+                        next_logits, min(top_k, next_logits.size(-1))
+                    )
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
