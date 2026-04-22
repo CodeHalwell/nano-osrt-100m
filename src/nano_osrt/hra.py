@@ -163,7 +163,10 @@ def get_param_groups(
         List of param group dicts for the optimizer.
     """
     hra_ids = {id(p) for p in hra_params}
-    base_params = [p for p in model.parameters() if p.requires_grad and id(p) not in hra_ids]
+    base_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in hra_ids
+    ]
 
     groups = []
     if base_params:

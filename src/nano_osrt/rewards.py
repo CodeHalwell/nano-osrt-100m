@@ -20,25 +20,32 @@ def extract_numeric_answer(
     """Extract the final numeric answer from model output.
 
     Priority order:
-        1. Content between answer_open / answer_close tags (v4 native tags)
-        2. First number after think_close (v3 format)
+        1. LAST number inside answer_open / answer_close tags
+           (many correct responses say e.g. "After 3 steps, the answer
+           is 12" — returning the first number would score 3, wrong.
+           The last number inside the answer tag is the model's final
+           committed answer.)
+        2. Last number after think_close (v3 format)
         3. Last number in the entire text (fallback)
     """
     # Strategy 1: look inside explicit answer tags
     if answer_open in text and answer_close in text:
         start = text.index(answer_open) + len(answer_open)
-        end = text.index(answer_close, start) if answer_close in text[start:] else len(text)
+        end = (
+            text.index(answer_close, start)
+            if answer_close in text[start:] else len(text)
+        )
         inside = text[start:end]
         numbers = re.findall(r"-?[\d,]+\.?\d*", inside)
         if numbers:
-            return numbers[0].replace(",", "")
+            return numbers[-1].replace(",", "")
 
-    # Strategy 2: first number after the think_close tag
+    # Strategy 2: last number after the think_close tag
     if think_close and think_close in text:
         after_think = text.split(think_close, 1)[1].strip()
         numbers = re.findall(r"-?[\d,]+\.?\d*", after_think)
         if numbers:
-            return numbers[0].replace(",", "")
+            return numbers[-1].replace(",", "")
 
     # Strategy 3: fallback to last number in entire text
     numbers = re.findall(r"-?[\d,]+\.?\d*", text)
@@ -56,7 +63,11 @@ def extract_gsm8k_answer(answer_text: str) -> str | None:
     return None
 
 
-def extract_thinking(text: str, think_open: str = "<think>", think_close: str = "</think>") -> str:
+def extract_thinking(
+    text: str,
+    think_open: str = "<think>",
+    think_close: str = "</think>",
+) -> str:
     """Extract the content between think tags."""
     if think_open in text and think_close in text:
         start = text.index(think_open) + len(think_open)
@@ -65,7 +76,11 @@ def extract_thinking(text: str, think_open: str = "<think>", think_close: str = 
     return ""
 
 
-def check_format(text: str, think_open: str = "<think>", think_close: str = "</think>") -> bool:
+def check_format(
+    text: str,
+    think_open: str = "<think>",
+    think_close: str = "</think>",
+) -> bool:
     """Check if the completion uses proper thinking format."""
     return think_open in text and think_close in text
 
@@ -97,7 +112,10 @@ def count_reasoning_steps(thinking: str) -> int:
         return 0
 
     # Count numbered steps (1. 2. 3. or Step 1, Step 2)
-    numbered = re.findall(r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)", thinking, re.IGNORECASE)
+    numbered = re.findall(
+        r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)",
+        thinking, re.IGNORECASE,
+    )
     if len(numbered) >= 2:
         return len(numbered)
 

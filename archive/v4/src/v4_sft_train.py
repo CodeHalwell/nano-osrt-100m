@@ -265,14 +265,52 @@ def run_v4_sft(model_config: NanoOSRTv4Config, sft_cfg, vol, tokenizer) -> None:
                 f"elapsed {elapsed:.0f}s"
             )
 
+            # --- MoE telemetry (condensed) ---
+            moe_metrics = {}
+            try:
+                inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+                base = inner.model if hasattr(inner, "model") else inner
+                _mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
+                dense_gates, moe_gates, prob_ents, assign_ents = [], [], [], []
+                all_overflow, all_assigned = [], []
+                for bi, blk in enumerate(base.blocks):
+                    dg = blk.dense_gate.item()
+                    mg = blk.moe_gate.item()
+                    dense_gates.append(dg)
+                    moe_gates.append(mg)
+                    moe_metrics[f"moe/dense_gate_b{bi}"] = dg
+                    moe_metrics[f"moe/moe_gate_b{bi}"] = mg
+                    for li, ent in enumerate(blk.moe.last_router_entropy):
+                        prob_ents.append(ent)
+                    for li, ent in enumerate(blk.moe.last_assignment_entropy):
+                        assign_ents.append(ent)
+                    all_overflow.extend(blk.moe.last_overflow_rate)
+                    all_assigned.extend(blk.moe.last_assigned_per_token)
+                moe_metrics["moe/prob_entropy_mean"] = _mean(prob_ents)
+                moe_metrics["moe/assign_entropy_mean"] = _mean(assign_ents)
+                moe_metrics["moe/overflow_rate_mean"] = _mean(all_overflow)
+                moe_metrics["moe/assigned_per_token_mean"] = _mean(all_assigned)
+                moe_metrics["moe/dense_gate_mean"] = _mean(dense_gates)
+                moe_metrics["moe/moe_gate_mean"] = _mean(moe_gates)
+                print(
+                    f"           moe: prob_H={_mean(prob_ents):.3f} "
+                    f"assign_H={_mean(assign_ents):.3f} "
+                    f"overflow={_mean(all_overflow):.4f} "
+                    f"| gates d={_mean(dense_gates):.3f} m={_mean(moe_gates):.3f}"
+                )
+            except AttributeError:
+                pass
+
             if use_wandb:
-                wandb.log({
+                log_dict = {
                     f"{prefix}/loss": accum_loss.item(),
                     f"{prefix}/lr": lr,
                     f"{prefix}/vram_gb": vram_gb,
                     f"{prefix}/token_utilization": tok_util,
                     f"{prefix}/trained_tokens": accum_trained_tokens,
-                }, step=step)
+                }
+                log_dict.update(moe_metrics)
+                wandb.log(log_dict, step=step)
 
         elif step < 100:
             sys.stdout.write(".")

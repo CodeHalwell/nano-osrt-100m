@@ -1,15 +1,29 @@
-"""nano-osrt-100m: A nano-scale Open-Set Reasoning Transformer (~100M parameters)."""
+"""nano-osrt: recursive Mixtral-style MoE transformer (~363M physical params).
 
-from nano_osrt.config import ModelConfig
-from nano_osrt.model import NanoOSRT
+Top-level imports expose the current architecture. Earlier versions (v1/v2/v3
+dense recursive, v4 MoE with dense FFN crutch) are preserved under
+`archive/` for reference but not importable here.
+"""
 
-__all__ = ["ModelConfig", "NanoOSRT"]
-__version__ = "0.1.0"
+from nano_osrt.config import NanoOSRTConfig
+from nano_osrt.model import (
+    ExpertFFN,
+    MoELayer,
+    NanoOSRTForCausalLM,
+    NanoOSRTModel,
+    NanoOSRTPreTrainedModel,
+    RecursiveBlock,
+    orthogonal_expert_init,
+)
 
-# The recursive-block variant and Modal helpers are importable via their
-# fully-qualified module paths:
-#   from nano_osrt.modal_config import ModalConfig
-#   from nano_osrt.recursive_model import RecursiveNanoOSRT
-#   from nano_osrt.rope import apply_rope, compute_rope_freqs
-#   from nano_osrt.modal_data import TokenStream, make_loader
-#   from nano_osrt.modal_train import run_training
+__all__ = [
+    "ExpertFFN",
+    "MoELayer",
+    "NanoOSRTConfig",
+    "NanoOSRTForCausalLM",
+    "NanoOSRTModel",
+    "NanoOSRTPreTrainedModel",
+    "RecursiveBlock",
+    "orthogonal_expert_init",
+]
+__version__ = "0.5.0"

@@ -1,4 +1,9 @@
-"""SFT training loop for nano-osrt-100m chain-of-thought fine-tuning."""
+"""SFT training loop for NanoOSRT.
+
+Balanced fine-tuning: math + code + STEM + general.
+Uses native single-token tags for chat format.
+Supports HRA injection for expanded capacity.
+"""
 
 import glob
 import math
@@ -7,102 +12,33 @@ import sys
 import time
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     import wandb
 except ImportError:
     wandb = None
 
-from nano_osrt.hra import get_param_groups, inject_hra
-from nano_osrt.recursive_model import RecursiveNanoOSRT
-from nano_osrt.sft_config import SFTConfig
+from nano_osrt.config import NanoOSRTConfig
+from nano_osrt.model import NanoOSRTForCausalLM
 from nano_osrt.sft_data import IGNORE_INDEX, make_sft_loader
 
 
-def get_sft_lr(step: int, cfg: SFTConfig) -> float:
-    """Cosine learning-rate with linear warmup for SFT."""
-    if step < cfg.warmup_steps:
-        return cfg.peak_lr * step / cfg.warmup_steps
-    progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
-    return cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
-        1 + math.cos(math.pi * progress)
-    )
+def get_sft_lr(
+    step: int, total_steps: int, warmup: int, peak: float, minimum: float,
+) -> float:
+    """Cosine LR with linear warmup."""
+    if step < warmup:
+        return peak * step / warmup
+    progress = (step - warmup) / max(total_steps - warmup, 1)
+    return minimum + 0.5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
 
 
-def load_pretrained(model: nn.Module, path: str, device: torch.device) -> None:
-    """Load pretrained weights into model (weights only, fresh optimizer)."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Pretrained checkpoint not found: {path}. "
-            "Run pretraining first or provide a valid checkpoint path."
-        )
-
-    print(f"Loading pretrained weights from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-        pretrain_step = ckpt.get("step", "unknown")
-        print(f"  Checkpoint from pretraining step {pretrain_step}")
-    else:
-        state_dict = ckpt
-
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    missing, unexpected = inner.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"  Missing keys (initialized to defaults): {missing}")
-    if unexpected:
-        print(f"  Unexpected keys (ignored): {unexpected}")
-    print("  Pretrained weights loaded successfully.")
-
-
-def save_sft_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    path: str,
-) -> None:
-    """Save an SFT checkpoint."""
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": inner.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "training_stage": "sft",
-        },
-        path,
-    )
-    print(f"  -> SFT checkpoint saved: {path}")
-
-
-def load_sft_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    path: str,
-    device: torch.device,
-) -> int:
-    """Resume SFT from a checkpoint. Returns step to resume from."""
-    if not os.path.exists(path):
-        return 0
-    print(f"Resuming SFT from {path}...")
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    inner.load_state_dict(ckpt["model_state_dict"], strict=False)
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    start_step = ckpt["step"] + 1
-    print(f"Resumed SFT at step {start_step}")
-    return start_step
-
-
-def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
-    """Execute the SFT training loop on Modal."""
+def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
+    """Execute the v5 SFT training loop."""
     device = torch.device("cuda")
 
     print("=" * 60)
-    print("Nano-OSRT 100M — SFT Training (Chain-of-Thought)")
+    print("NanoOSRT — SFT Training (Balanced)")
     print("=" * 60)
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -111,180 +47,175 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
     # ------------------------------------------------------------------
     # Model setup
     # ------------------------------------------------------------------
-    model = RecursiveNanoOSRT(cfg).to(device=device)
-
+    model = NanoOSRTForCausalLM(model_config).to(device=device)
     base_params = sum(p.numel() for p in model.parameters())
-    eff_batch = cfg.batch_size * cfg.grad_accum_steps
-    tok_per_step = eff_batch * cfg.seq_len
 
+    eff_batch = sft_cfg.batch_size * sft_cfg.grad_accum_steps
     print(f"Base parameters     : {base_params:>12,}")
-    print(f"SFT learning rate   : {cfg.peak_lr}")
-    print(f"Micro-batch         : {cfg.batch_size}")
-    print(f"Grad accum steps    : {cfg.grad_accum_steps}")
+    print(f"SFT learning rate   : {sft_cfg.peak_lr}")
     print(f"Effective batch     : {eff_batch}")
-    print(f"Max tokens per step : {tok_per_step:,}")
-    print(f"Total SFT steps     : {cfg.total_steps}")
-    print(f"Optimizer           : {cfg.optimizer_name}")
-    print("Chat format         : user/assistant with <think>...</think>")
+    print(f"Seq len             : {sft_cfg.seq_len}")
+    print(f"Total SFT steps     : {sft_cfg.total_steps}")
+    print(f"HRA enabled         : {sft_cfg.hra_enabled}")
     print()
 
-    # ------------------------------------------------------------------
-    # High Rank Adaptation (HRA) — expand model capacity
-    # ------------------------------------------------------------------
+    # HRA injection (before or after load depending on config)
     hra_params = []
-    if cfg.hra_enabled and getattr(cfg, "hra_before_load", False):
-        # Inject HRA BEFORE loading — needed when checkpoint already has HRA keys
-        print(f"\nInjecting HRA adapters before load (rank={cfg.hra_rank})...")
-        hra_params = inject_hra(
-            model,
-            rank=cfg.hra_rank,
-            scale=cfg.hra_scale,
-            freeze_pretrained=cfg.hra_freeze_pretrained,
+    if sft_cfg.hra_enabled and getattr(sft_cfg, "hra_before_load", False):
+        from nano_osrt.hra import inject_hra
+        print(f"Injecting HRA before load (rank={sft_cfg.hra_rank})...")
+        hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
+                                freeze_pretrained=sft_cfg.hra_freeze_pretrained)
+
+    # Load pretrained weights — SFT MUST start from a real pretrained
+    # checkpoint. Running SFT on a randomly-initialised model would waste
+    # compute and silently produce a garbage model.
+    ckpt_path = sft_cfg.pretrained_checkpoint
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"SFT refuses to start: pretrained checkpoint not found at {ckpt_path}. "
+            "Run pretrain first (modal run app_v4.py --stage pretrain)."
         )
 
-    load_pretrained(model, cfg.pretrained_checkpoint, device)
-
-    if cfg.hra_enabled and not getattr(cfg, "hra_before_load", False):
-        # Inject HRA AFTER loading — for fresh pretrained checkpoints
-        print(f"\nInjecting HRA adapters (rank={cfg.hra_rank})...")
-        hra_params = inject_hra(
-            model,
-            rank=cfg.hra_rank,
-            scale=cfg.hra_scale,
-            freeze_pretrained=cfg.hra_freeze_pretrained,
-        )
-
-    if cfg.hra_enabled:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Total parameters  : {total_params:>12,} (+{total_params - base_params:,} HRA)")
-        print(f"  Trainable         : {trainable:>12,}")
+    print(f"Loading weights from {ckpt_path}...")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
+    if unexpected:
+        print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
+    if not missing and not unexpected:
+        print("  Clean load: all keys matched.")
     else:
-        total_params = base_params
+        print("  Partial load: review the keys above if this is unexpected.")
 
-    print("\nCompiling model with torch.compile...")
-    compile_start = time.time()
+    if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
+        from nano_osrt.hra import inject_hra
+        print(f"Injecting HRA after load (rank={sft_cfg.hra_rank})...")
+        hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
+                                freeze_pretrained=sft_cfg.hra_freeze_pretrained)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters    : {total_params:>12,}")
+
+    print("\nCompiling model...")
+    compile_t = time.time()
     model = torch.compile(model)
-    print(f"Model compile done in {time.time() - compile_start:.1f}s")
+    print(f"Compile done in {time.time() - compile_t:.1f}s")
 
     # ------------------------------------------------------------------
-    # Weights & Biases
+    # W&B
     # ------------------------------------------------------------------
-    use_wandb = cfg.wandb_log and wandb is not None
+    use_wandb = sft_cfg.wandb_log and wandb is not None
     if use_wandb:
         wandb_kwargs = {
-            "project": cfg.wandb_project,
-            "name": cfg.wandb_run_name,
+            "project": sft_cfg.wandb_project,
+            "name": sft_cfg.wandb_run_name,
             "config": {
                 "stage": "sft",
-                "base_params": base_params,
                 "total_params": total_params,
-                "hra_enabled": cfg.hra_enabled,
-                "hra_rank": cfg.hra_rank if cfg.hra_enabled else 0,
-                "hra_extra_params": total_params - base_params,
-                "peak_lr": cfg.peak_lr,
-                "hra_lr": cfg.hra_lr if cfg.hra_enabled else 0,
-                "batch_size": cfg.batch_size,
-                "grad_accum_steps": cfg.grad_accum_steps,
-                "total_steps": cfg.total_steps,
-                "optimizer": cfg.optimizer_name,
-                "datasets": [d["name"] for d in cfg.datasets],
+                "hra_enabled": sft_cfg.hra_enabled,
+                "datasets": [d["name"] for d in sft_cfg.datasets],
             },
         }
-        if cfg.wandb_run_id:
-            wandb_kwargs["id"] = cfg.wandb_run_id
+        if sft_cfg.wandb_run_id:
+            wandb_kwargs["id"] = sft_cfg.wandb_run_id
             wandb_kwargs["resume"] = "allow"
         wandb.init(**wandb_kwargs)
         print("W&B logging enabled.")
 
     # ------------------------------------------------------------------
-    # Optimizer (fresh — no pretrain optimizer state)
+    # Optimizer
     # ------------------------------------------------------------------
-    if cfg.hra_enabled and hra_params:
-        # Differential LR: pretrained weights at base LR, HRA adapters at higher LR
-        param_groups = get_param_groups(
-            model, hra_params,
-            base_lr=cfg.peak_lr,
-            hra_lr=cfg.hra_lr,
-            weight_decay=cfg.weight_decay,
+    if sft_cfg.hra_enabled and hra_params:
+        from nano_osrt.hra import get_param_groups
+        param_groups = get_param_groups(model, hra_params,
+                                        base_lr=sft_cfg.peak_lr,
+                                        hra_lr=sft_cfg.hra_lr,
+                                        weight_decay=sft_cfg.weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+        print(
+            f"AdamW with differential LR (base={sft_cfg.peak_lr}, "
+            f"hra={sft_cfg.hra_lr})"
         )
-        optimizer = torch.optim.AdamW(
-            param_groups, betas=(0.9, 0.95), eps=1e-8
-        )
-        print(f"Using AdamW with differential LR (base={cfg.peak_lr}, hra={cfg.hra_lr})")
-    elif cfg.optimizer_name.lower() == "lion":
-        from lion_pytorch import Lion
-
-        optimizer = Lion(
-            model.parameters(), lr=cfg.peak_lr, weight_decay=cfg.weight_decay
-        )
-        print(f"Using Lion (wd={cfg.weight_decay})")
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.peak_lr,
-            weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-        )
-        print(f"Using AdamW (wd={cfg.weight_decay})")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=sft_cfg.peak_lr,
+                                       weight_decay=sft_cfg.weight_decay,
+                                       betas=(0.9, 0.95), eps=1e-8)
 
     # ------------------------------------------------------------------
-    # Resume from SFT checkpoint if available
+    # Resume.
+    # Two resumable patterns (matches pretrain):
+    #   osrt_v5_{prefix}_step_N.pt          — interval save
+    #   osrt_v5_{prefix}_rescue_step_N.pt   — 23h boundary save
+    # When steps tie, rescue wins (same "latest optimizer state" argument
+    # as pretrain).
     # ------------------------------------------------------------------
-    prefix = getattr(cfg, "stage_prefix", "sft")
-    sft_rescue_path = f"/vol/checkpoints/osrt100m_{prefix}_rescue.pt"
-    ckpt_dir = "/vol/checkpoints"
-    best_ckpt = sft_rescue_path
+    prefix = getattr(sft_cfg, "stage_prefix", "sft")
+    ckpt_dir = "/vol/checkpoints/v5"
+    os.makedirs(ckpt_dir, exist_ok=True)
     best_step = -1
-
-    if os.path.isdir(ckpt_dir):
-        for f in glob.glob(os.path.join(ckpt_dir, f"osrt100m_{prefix}_step_*.pt")):
+    best_ckpt: str | None = None
+    for pattern in (
+        f"{ckpt_dir}/osrt_v5_{prefix}_step_*.pt",
+        f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_*.pt",
+    ):
+        for f in glob.glob(pattern):
             try:
                 s = int(f.rsplit("_", 1)[1].split(".")[0])
-                if s > best_step:
-                    best_step = s
-                    best_ckpt = f
             except (ValueError, IndexError):
                 continue
+            if s > best_step or (s == best_step and "rescue" in f):
+                best_step = s
+                best_ckpt = f
 
     start_step = 0
-    if best_step > 0:
-        print(f"Found SFT checkpoint at step {best_step}: {best_ckpt}")
-        start_step = load_sft_checkpoint(model, optimizer, best_ckpt, device)
+    if best_step > 0 and best_ckpt is not None:
+        print(f"Found {prefix} checkpoint at step {best_step}: {best_ckpt}")
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        inner.load_state_dict(ckpt["model_state_dict"], strict=False)
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception:
+            pass
+        start_step = ckpt["step"] + 1
+        print(f"Resumed at step {start_step}")
 
     # ------------------------------------------------------------------
-    # Data loader
+    # Data
     # ------------------------------------------------------------------
     print("\nLoading SFT datasets...")
     load_t = time.time()
     loader = make_sft_loader(
-        dataset_configs=cfg.datasets,
-        seq_len=cfg.seq_len,
-        tokenizer_name=tokenizer_name,
-        batch_size=cfg.batch_size,
+        dataset_configs=sft_cfg.datasets,
+        seq_len=sft_cfg.seq_len,
+        tokenizer=tokenizer,
+        batch_size=sft_cfg.batch_size,
         seed=42 + start_step,
-        think_open=cfg.think_open,
-        think_close=cfg.think_close,
-        user_prefix=cfg.user_prefix,
-        assistant_prefix=cfg.assistant_prefix,
+        user_tag=sft_cfg.user_tag,
+        assistant_tag=sft_cfg.assistant_tag,
+        think_open=sft_cfg.think_open,
+        think_close=sft_cfg.think_close,
+        answer_open=sft_cfg.answer_open,
+        answer_close=sft_cfg.answer_close,
     )
     loader_iter = iter(loader)
-    print(f"SFT DataLoader ready in {time.time() - load_t:.1f}s")
+    print(f"DataLoader ready in {time.time() - load_t:.1f}s")
 
     # ------------------------------------------------------------------
-    # SFT Training loop
+    # Training loop
     # ------------------------------------------------------------------
     start_time = time.time()
     step = start_step
 
-    while step < cfg.total_steps:
-        lr = get_sft_lr(step, cfg)
+    while step < sft_cfg.total_steps:
+        lr = get_sft_lr(step, sft_cfg.total_steps, sft_cfg.warmup_steps,
+                         sft_cfg.peak_lr, sft_cfg.min_lr)
         for pg in optimizer.param_groups:
-            if cfg.hra_enabled and pg.get("group_name") == "hra":
-                # HRA LR follows same cosine shape but scaled to hra_lr
-                hra_ratio = cfg.hra_lr / cfg.peak_lr
-                pg["lr"] = lr * hra_ratio
+            if sft_cfg.hra_enabled and pg.get("group_name") == "hra":
+                pg["lr"] = lr * (sft_cfg.hra_lr / sft_cfg.peak_lr)
             else:
                 pg["lr"] = lr
 
@@ -292,50 +223,43 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
         accum_loss = torch.tensor(0.0, device=device)
         accum_trained_tokens = 0
 
-        for _micro in range(cfg.grad_accum_steps):
+        for _micro in range(sft_cfg.grad_accum_steps):
             try:
                 input_ids, labels = next(loader_iter)
             except StopIteration:
                 loader = make_sft_loader(
-                    dataset_configs=cfg.datasets,
-                    seq_len=cfg.seq_len,
-                    tokenizer_name=tokenizer_name,
-                    batch_size=cfg.batch_size,
+                    dataset_configs=sft_cfg.datasets,
+                    seq_len=sft_cfg.seq_len,
+                    tokenizer=tokenizer,
+                    batch_size=sft_cfg.batch_size,
                     seed=42 + step,
-                    think_open=cfg.think_open,
-                    think_close=cfg.think_close,
-                    user_prefix=cfg.user_prefix,
-                    assistant_prefix=cfg.assistant_prefix,
+                    user_tag=sft_cfg.user_tag,
+                    assistant_tag=sft_cfg.assistant_tag,
+                    think_open=sft_cfg.think_open,
+                    think_close=sft_cfg.think_close,
+                    answer_open=sft_cfg.answer_open,
+                    answer_close=sft_cfg.answer_close,
                 )
                 loader_iter = iter(loader)
                 input_ids, labels = next(loader_iter)
 
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-
             accum_trained_tokens += (labels != IGNORE_INDEX).sum().item()
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits, _ = model(input_ids)
-                active_logits = (
-                    logits[..., : cfg.real_vocab_size].contiguous().float()
-                )
-                loss = F.cross_entropy(
-                    active_logits.view(-1, cfg.real_vocab_size),
-                    labels.view(-1),
-                    ignore_index=IGNORE_INDEX,
-                )
-                scaled_loss = loss / cfg.grad_accum_steps
+                outputs = model(input_ids, labels=labels)
+                loss = outputs.loss / sft_cfg.grad_accum_steps
 
-            scaled_loss.backward()
-            accum_loss += loss.detach() / cfg.grad_accum_steps
+            loss.backward()
+            accum_loss += outputs.loss.detach() / sft_cfg.grad_accum_steps
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), sft_cfg.grad_clip)
         optimizer.step()
 
         # --- Logging ---
         should_log = (
-            step % cfg.log_interval == 0
+            step % sft_cfg.log_interval == 0
             or step == 0
             or (step < 50 and step % 5 == 0)
         )
@@ -343,31 +267,68 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
             elapsed = time.time() - start_time
             vram_gb = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
-
-            total_positions = eff_batch * cfg.seq_len
-            token_util = (
-                accum_trained_tokens / total_positions if total_positions > 0 else 0
+            total_positions = eff_batch * sft_cfg.seq_len
+            tok_util = (
+                accum_trained_tokens / total_positions
+                if total_positions > 0 else 0
             )
 
             print(
-                f"step {step:>6d}/{cfg.total_steps} | "
+                f"step {step:>6d}/{sft_cfg.total_steps} | "
                 f"loss {accum_loss.item():.4f} | lr {lr:.2e} | "
-                f"vram {vram_gb:.1f}GB | "
-                f"tok_util {token_util:.1%} | "
+                f"vram {vram_gb:.1f}GB | tok_util {tok_util:.1%} | "
                 f"elapsed {elapsed:.0f}s"
             )
 
-            if use_wandb:
-                wandb.log(
-                    {
-                        "sft/loss": accum_loss.item(),
-                        "sft/lr": lr,
-                        "sft/vram_gb": vram_gb,
-                        "sft/token_utilization": token_util,
-                        "sft/trained_tokens": accum_trained_tokens,
-                    },
-                    step=step,
+            # --- MoE telemetry (condensed, v5 names) ---
+            # v5 has no dense_gate (no dense FFN) — only moe_gate on the
+            # routed branch. The MoE layer exposes clean_* metrics with
+            # Gumbel noise stripped, which is what matters at SFT time
+            # (noise schedule is inherited from pretrain but should have
+            # annealed to ~0 by then).
+            moe_metrics: dict = {}
+            try:
+                inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+                base = inner.model if hasattr(inner, "model") else inner
+
+                def _mean(xs: list[float]) -> float:
+                    return sum(xs) / len(xs) if xs else 0.0
+
+                moe_gates: list[float] = []
+                prob_ents: list[float] = []
+                assign_ents: list[float] = []
+                drop_rates: list[float] = []
+                for bi, blk in enumerate(base.blocks):
+                    mg = blk.moe_gate.item()
+                    moe_gates.append(mg)
+                    moe_metrics[f"moe/moe_gate_b{bi}"] = mg
+                    prob_ents.extend(blk.moe.last_clean_per_token_entropy)
+                    assign_ents.extend(blk.moe.last_clean_assignment_entropy)
+                    drop_rates.extend(blk.moe.last_drop_rate)
+                moe_metrics["moe/clean_per_token_entropy_mean"] = _mean(prob_ents)
+                moe_metrics["moe/clean_assignment_entropy_mean"] = _mean(assign_ents)
+                moe_metrics["moe/drop_rate_mean"] = _mean(drop_rates)
+                moe_metrics["moe/moe_gate_mean"] = _mean(moe_gates)
+                print(
+                    f"           moe: pte={_mean(prob_ents):.3f} "
+                    f"assn={_mean(assign_ents):.3f} "
+                    f"drop={_mean(drop_rates):.4f} "
+                    f"gate={_mean(moe_gates):.3f}"
                 )
+            except AttributeError:
+                pass
+
+            if use_wandb:
+                log_dict = {
+                    f"{prefix}/loss": accum_loss.item(),
+                    f"{prefix}/lr": lr,
+                    f"{prefix}/vram_gb": vram_gb,
+                    f"{prefix}/token_utilization": tok_util,
+                    f"{prefix}/trained_tokens": accum_trained_tokens,
+                }
+                log_dict.update(moe_metrics)
+                wandb.log(log_dict, step=step)
+
         elif step < 100:
             sys.stdout.write(".")
             sys.stdout.flush()
@@ -376,16 +337,39 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
                 sys.stdout.flush()
 
         # --- Checkpoints ---
-        if step > 0 and step % cfg.ckpt_interval == 0:
-            path = f"/vol/checkpoints/osrt100m_{prefix}_step_{step}.pt"
-            save_sft_checkpoint(model, optimizer, step, path)
+        if step > 0 and step % sft_cfg.ckpt_interval == 0:
+            path = f"{ckpt_dir}/osrt_v5_{prefix}_step_{step}.pt"
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            torch.save({
+                "step": step,
+                "model_state_dict": inner.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "training_stage": prefix,
+            }, path)
             vol.commit()
+            print(f"  -> Checkpoint saved: {path}")
 
-        # --- 23h Modal safety ---
+        # --- 23h safety ---
+        # Include step number in rescue filename so the resume scanner
+        # can rank it alongside numbered checkpoints. Without this the
+        # scanner either misses rescue files entirely or can't break
+        # ties against same-step interval saves.
         if time.time() - start_time > 82_800:
-            save_sft_checkpoint(model, optimizer, step, sft_rescue_path)
+            rescue_path = (
+                f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
+            )
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            torch.save({
+                "step": step,
+                "model_state_dict": inner.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "training_stage": prefix,
+            }, rescue_path)
             vol.commit()
-            print(f"\n23h boundary. SFT rescue checkpoint at step {step}.")
+            print(
+                f"\n23h boundary. Rescue checkpoint at step {step}: "
+                f"{rescue_path}",
+            )
             if use_wandb:
                 wandb.finish()
             return
@@ -394,18 +378,15 @@ def run_sft(cfg: SFTConfig, vol, tokenizer_name: str) -> None:
 
     # --- Final ---
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    final_path = f"/vol/checkpoints/osrt100m_{prefix}_final.pt"
-    torch.save(
-        {
-            "model_state_dict": inner.state_dict(),
-            "training_stage": "sft",
-            "total_steps": cfg.total_steps,
-        },
-        final_path,
-    )
+    final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
+    torch.save({
+        "model_state_dict": inner.state_dict(),
+        "training_stage": prefix,
+        "total_steps": sft_cfg.total_steps,
+    }, final_path)
     vol.commit()
     elapsed_total = time.time() - start_time
-    print(f"\nSFT complete. {step:,} steps in {elapsed_total / 3600:.1f}h")
-    print(f"Final SFT model: {final_path}")
+    print(f"\n{prefix.upper()} complete. {step:,} steps in {elapsed_total / 3600:.1f}h")
+    print(f"Final model: {final_path}")
     if use_wandb:
         wandb.finish()

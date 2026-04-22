@@ -100,7 +100,7 @@ def train_tokenizer():
 
 
 @app.function(
-    gpu="H100",
+    gpu="B200",
     image=image,
     volumes={
         "/vol/checkpoints": vol,
@@ -197,6 +197,43 @@ def sft():
 
     sft_cfg = V4SFTConfig()
     run_v4_sft(model_config, sft_cfg, vol, tok)
+
+
+# =============================================================================
+# MoE RECOVERY (wake up the dead router)
+# =============================================================================
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    timeout=86400,
+)
+def moe_recover():
+    """Router+experts fine-tune experiment: wake up a dead MoE router."""
+    from transformers import AutoTokenizer
+
+    from nano_osrt.v4_config import NanoOSRTv4Config
+    from nano_osrt.v4_moe_recover import run_v4_moe_recover
+    from nano_osrt.v4_train_config import V4MoERecoverConfig
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    model_config = NanoOSRTv4Config(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    cfg = V4MoERecoverConfig()
+    run_v4_moe_recover(model_config, cfg, vol, tokenizer_name="/vol/tokenizer")
 
 
 # =============================================================================
@@ -804,6 +841,8 @@ def main(stage: str = "pretrain"):
         sft.remote()
     elif stage == "grpo":
         grpo.remote()
+    elif stage == "moe_recover":
+        moe_recover.remote()
     elif stage == "eval":
         results = evaluate.remote("ifeval,gsm8k,hellaswag")
         print("\nResults:")

@@ -1,7 +1,7 @@
 [project]
-name = "nano-osrt-100m"
-version = "0.1.0"
-description = "A nano-scale (~100M parameter) Open-Set Reasoning Transformer"
+name = "nano-osrt"
+version = "0.5.0"
+description = "Recursive Mixtral-style MoE transformer (~363M physical params, ~192M active)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -25,10 +25,8 @@ dependencies = [
     "gradio>=6.9.0",
     "wandb>=0.25.1",
     "pandas>=3.0.1",
+    "lion-pytorch>=0.2.0",
 ]
-
-[project.scripts]
-train = "scripts.train:main"
 
 [build-system]
 requires = ["hatchling"]

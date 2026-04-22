@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a custom 32K BPE tokenizer for NanoOSRT v4.
+"""Train a custom 32K BPE tokenizer for NanoOSRT.
 
 Default uses HuggingFace byte-level BPE. Optionally falls through to
 SuperBPE (COLM 2025) if the 'superbpe' package is installed for the
@@ -343,7 +343,7 @@ def _create_hf_tokenizer_config(output_dir: str, special_tokens: list[str]) -> N
 
     # tokenizer_config.json
     config = {
-        "model_type": "nano-osrt-v4",
+        "model_type": "nano-osrt",
         "tokenizer_class": "PreTrainedTokenizerFast",
         "bos_token": "<|begin_of_text|>",
         "eos_token": "<|end_of_text|>",
@@ -403,14 +403,14 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train custom 64K tokenizer for NanoOSRT v4")
+    parser = argparse.ArgumentParser(description="Train custom 64K tokenizer for NanoOSRT")
     parser.add_argument("--vocab-size", type=int, default=32768, help="Target vocabulary size (32K default, TC-aligned)")
     parser.add_argument("--sample-size", type=int, default=50_000_000, help="Training text size in chars (~50MB default)")
-    parser.add_argument("--output", type=str, default="./tokenizer-v4", help="Output directory")
+    parser.add_argument("--output", type=str, default="./tokenizer", help="Output directory")
     parser.add_argument("--data-path", type=str, default=None, help="Pre-existing training text file (skip download)")
     args = parser.parse_args()
 
-    print("NanoOSRT v4 — Custom Tokenizer Training")
+    print("NanoOSRT — Custom Tokenizer Training")
     print("=" * 50)
 
     # Get training data
