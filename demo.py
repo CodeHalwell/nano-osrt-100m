@@ -161,6 +161,7 @@ def create_demo():
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    autofocus=True,
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
