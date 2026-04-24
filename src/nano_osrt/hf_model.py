@@ -34,12 +34,24 @@ def _compute_rope_freqs(
     if dim % 2 != 0:
         raise ValueError(f"RoPE requires even dimension, got dim={dim}")
     freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim)
+        theta
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
+            / dim
+        )
     )
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
+    cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
+    sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
     return cos, sin
 
 
@@ -56,7 +68,14 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class HRALinear(nn.Module):
     """Linear + parallel high-rank adapter: y = W @ x + scale * (x @ A @ B)."""
 
-    def __init__(self, in_features: int, out_features: int, rank: int, scale: float = 1.0, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        scale: float = 1.0,
+        bias: bool = False,
+    ):
         super().__init__()
         self.original = nn.Linear(in_features, out_features, bias=bias)
         self.scale = scale
@@ -137,8 +156,13 @@ class RecursiveBlock(nn.Module):
         self.ffn = SwiGLU(dim)
 
     def forward(
-        self, x: Tensor, adapter_a: Tensor, adapter_b: Tensor,
-        adapter_scale: float, rope_cos: Tensor, rope_sin: Tensor,
+        self,
+        x: Tensor,
+        adapter_a: Tensor,
+        adapter_b: Tensor,
+        adapter_scale: float,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
     ) -> Tensor:
         B, S, D = x.shape
         x_mod = x + adapter_scale * (x @ adapter_a @ adapter_b)
@@ -190,10 +214,16 @@ class NanoOSRTForCausalLM(nn.Module):
 
         total_pairs = config.num_blocks * config.recursive_loops
         self.adapters_a = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.dim, config.adapter_rank)) for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.dim, config.adapter_rank))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapters_b = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.adapter_rank, config.dim)) for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
         self.norm_loop = nn.RMSNorm(config.dim)
@@ -209,15 +239,21 @@ class NanoOSRTForCausalLM(nn.Module):
             for name in ("qkv", "out_proj"):
                 layer = getattr(block, name)
                 new_layer = HRALinear(
-                    layer.in_features, layer.out_features,
-                    rank=rank, scale=scale, bias=layer.original.bias is not None,
+                    layer.in_features,
+                    layer.out_features,
+                    rank=rank,
+                    scale=scale,
+                    bias=layer.original.bias is not None,
                 )
                 setattr(block, name, new_layer)
             for name in ("w_gate", "w_up", "w_down"):
                 layer = getattr(block.ffn, name)
                 new_layer = HRALinear(
-                    layer.in_features, layer.out_features,
-                    rank=rank, scale=scale, bias=layer.original.bias is not None,
+                    layer.in_features,
+                    layer.out_features,
+                    rank=rank,
+                    scale=scale,
+                    bias=layer.original.bias is not None,
                 )
                 setattr(block.ffn, name, new_layer)
 
@@ -230,8 +266,14 @@ class NanoOSRTForCausalLM(nn.Module):
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
-                x = block(x, self.adapters_a[idx], self.adapters_b[idx],
-                          self.adapter_scale, cos, sin)
+                x = block(
+                    x,
+                    self.adapters_a[idx],
+                    self.adapters_b[idx],
+                    self.adapter_scale,
+                    cos,
+                    sin,
+                )
             if loop < self.config.recursive_loops - 1:
                 x = self.norm_loop(x)
 
@@ -256,25 +298,28 @@ class NanoOSRTForCausalLM(nn.Module):
 
         for _ in range(max_new_tokens):
             # Truncate to max seq_len
-            context = generated[:, -self.config.seq_len:]
+            context = generated[:, -self.config.seq_len :]
             out = self.forward(context)
-            next_logits = out["logits"][:, -1, :self.config.real_vocab_size].float()
+            next_logits = out["logits"][:, -1, : self.config.real_vocab_size].float()
 
             # Repetition penalty: reduce logits for tokens already generated
             if repetition_penalty != 1.0:
-                for token_id in set(generated[0].tolist()):
-                    if token_id < next_logits.shape[-1]:
-                        if next_logits[0, token_id] > 0:
-                            next_logits[0, token_id] /= repetition_penalty
-                        else:
-                            next_logits[0, token_id] *= repetition_penalty
+                # ⚡ Bolt: Vectorized repetition penalty to avoid slow .tolist() and python loop
+                gen_tokens = generated[0].unique()
+                valid_tokens = gen_tokens[gen_tokens < next_logits.shape[-1]]
+                scores = next_logits[0, valid_tokens]
+                next_logits[0, valid_tokens] = torch.where(
+                    scores > 0, scores / repetition_penalty, scores * repetition_penalty
+                )
 
             if temperature > 0:
                 next_logits = next_logits / temperature
 
                 # Top-k filtering
                 if top_k > 0:
-                    topk_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    topk_vals, _ = torch.topk(
+                        next_logits, min(top_k, next_logits.size(-1))
+                    )
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 # Top-p (nucleus) filtering
@@ -305,13 +350,16 @@ class NanoOSRTForCausalLM(nn.Module):
         # Also save as safetensors if available
         try:
             from safetensors.torch import save_file
+
             save_file(self.state_dict(), os.path.join(save_dir, "model.safetensors"))
         except ImportError:
             pass
         print(f"Model saved to {save_dir}")
 
     @classmethod
-    def from_pretrained(cls, path: str, device: str = "cpu", dtype: torch.dtype | None = None) -> "NanoOSRTForCausalLM":
+    def from_pretrained(
+        cls, path: str, device: str = "cpu", dtype: torch.dtype | None = None
+    ) -> "NanoOSRTForCausalLM":
         """Load model from a directory with config.json and model weights."""
         config = NanoOSRTConfig.from_pretrained(path)
         model = cls(config)
@@ -322,6 +370,7 @@ class NanoOSRTForCausalLM(nn.Module):
 
         if os.path.exists(safetensors_path):
             from safetensors.torch import load_file
+
             state_dict = load_file(safetensors_path, device=device)
         elif os.path.exists(pt_path):
             state_dict = torch.load(pt_path, map_location=device, weights_only=True)
