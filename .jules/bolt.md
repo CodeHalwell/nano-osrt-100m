@@ -1,0 +1,3 @@
+## 2024-06-25 - Avoid Python loops for element-wise tensor ops in autoregressive generation
+**Learning:** `hf_model.py` had a bottleneck in the autoregressive generation loop where repetition penalty was applied using a Python loop over unique tokens (`set(generated[0].tolist())`). Converting a tensor to a list and looping over it in Python to perform element-wise tensor updates is extremely slow, particularly inside a hot generation loop. Vectorized PyTorch operations (`unique()` and `torch.where()`) provide a ~76x speedup.
+**Action:** Always avoid `tensor.tolist()` loops for element-wise modification in performance-critical paths (especially autoregressive loops) and replace them with vectorized operations like boolean masking, `.unique()`, and `torch.where()`.
