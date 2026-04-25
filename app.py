@@ -26,7 +26,16 @@ app = modal.App("nano-osrt")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "build-essential")
-    .env({"TORCH_LOGS": "perf_hints", "PYTHONUNBUFFERED": "1"})
+    .env({
+        "TORCH_LOGS": "perf_hints",
+        "PYTHONUNBUFFERED": "1",
+        # Disable HF tokenizers-rs thread pool before fork. Otherwise
+        # DataLoader(num_workers=2) deadlocks when the child inherits a
+        # locked mutex whose owning thread no longer exists. Confirmed
+        # failure mode: sanity run stuck at "Fetching first batch..."
+        # for 45 min with no output until manually stopped.
+        "TOKENIZERS_PARALLELISM": "false",
+    })
     .pip_install(
         "torch==2.10.0+cu128",
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
@@ -179,7 +188,11 @@ def sanity():
         total_steps = 1200
         warmup_steps = 3000
         log_interval = 50
-        eval_interval = 500
+        # Eval disabled for sanity: we only care about whether the new
+        # architecture trains. Running eval would pay the ~15 min
+        # 100M-record FineWeb skip that primes the held-out cache, and
+        # sanity isn't long enough to collide with that offset anyway.
+        eval_interval = 10_000_000
         ckpt_interval = 500
         # Foundation-matched schedule: LR warms for 3000 steps, and router
         # noise anneals over 4000 so exploration survives peak LR.
@@ -210,7 +223,14 @@ def sanity():
 
     run_training(
         model_config, train_cfg, vol, tokenizer_path,
-        ckpt_dir="/vol/checkpoints/v5-extended-sanity",
+        # Loop-level bias + raw-router aux validation. Bias is now
+        # shaped recursive_loops × num_routed_experts (was block-level),
+        # so loop-specific imbalances can't cancel in aggregate. Aux
+        # regularizes pre-bias raw router probs, so bias can't mask
+        # raw concentration. Fresh ckpt dir because bias buffer shape
+        # changed — resume from the prior (block-level) ckpts would
+        # fail the state_dict shape check.
+        ckpt_dir="/vol/checkpoints/v5-sanity-biasloop",
     )
 
 
@@ -412,6 +432,7 @@ def grpo():
     from nano_osrt.hra import get_param_groups, inject_hra
     from nano_osrt.model import NanoOSRTForCausalLM
     from nano_osrt.rewards import compute_group_advantages, compute_reward
+    from nano_osrt.train import apply_router_balance_updates
     from nano_osrt.train_config import GRPOConfig
 
     device = torch.device("cuda")
@@ -720,6 +741,7 @@ def grpo():
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
+        apply_router_balance_updates(model)
 
         # Logging
         if step % cfg.log_interval == 0 or step == 0:

@@ -7,6 +7,7 @@ Recursive Mixtral-style MoE transformer. 363M physical params, ~192M active per 
 - **Dense FFN: removed.** Shared expert (SwiGLU, hidden=4096) replaces it as the always-on path.
 - **Routed experts:** 8 × SwiGLU(hidden=2048), top-2 softmax with renormalised gates.
 - **Balance loss:** Switch-style `E · Σ(f·p)` — penalises imbalance without forcing uniformity.
+- **Balance bias controller:** persistent per-loop/per-expert routing bias pushes overloaded experts down and cold experts up.
 - **Router exploration:** Gumbel top-k noise, tau 0.5 → 0 over 4000 steps (outlasts LR warmup so cold experts can't die during the peak-LR window).
 - **Orthogonal per-expert init:** breaks symmetry at step 0, survives HF `post_init()`.
 - **Eval-time drop-free capacity:** chunk-stable inference by construction.

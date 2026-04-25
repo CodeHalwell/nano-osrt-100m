@@ -40,7 +40,7 @@
 | Aux loss | importance (enforces uniform) | **Switch balance (f_i × p_i)** | Penalises imbalance without enforcing uniformity |
 | Capacity factor | 1.25 (tight) | **2.0** | Loose enough that router preferences actually matter |
 | Soft warmup / blend | yes | **removed** | Didn't prevent collapse |
-| Balance bias controller | yes | **removed** | Oscillated, didn't help |
+| Balance bias controller | yes | **reintroduced, slower** | Three v5 sanities showed aux loss delays but does not prevent LR-ramp collapse |
 | Gumbel noise | yes | **annealed early only** | Prevents first-20-step expert death, then decays before health gate |
 | Expert init | random | **orthogonal per-expert** | Break symmetry structurally |
 
@@ -214,6 +214,7 @@ This gives each expert a different feature subspace to start from. Gradients pus
 - **Orthogonal init**: experts start in different feature subspaces, not identical random noise (and survives HF post_init)
 - **Loose capacity (2.0)**: router preferences actually determine routing in training; eval mode disables drops entirely so generation is chunk-stable
 - **Annealed Gumbel top-k**: keeps all experts sampled through LR warmup, then decays before the 5k router-health gate
+- **Per-loop/per-expert balance bias**: non-gradient controller counter-rotates clean top-k load imbalance once per optimizer step; bias is persistent and part of the deployed routing path. The controller is loop-specific because capacity/drop is enforced per MoE call.
 
 The success check at step 5k uses four clean-router metrics together (`clean_per_token_entropy`, `clean_raw_max_prob`, `clean_top_margin`, `clean_marginal_entropy`) — see the Phase 1 criteria above. A single-metric check (e.g. marginal entropy alone) would have missed v4's failure because batch-marginal entropy stayed high while per-token entropy also stayed high (router never committed).
 
@@ -223,7 +224,7 @@ If those four don't move in the right direction by step 5k, the issue is deeper 
 
 ## What to keep an eye on
 
-1. **Early expert collapse** — router finding a small expert subset that works for almost everything. The 200-step sanity runs hit this with `router_aux_loss_coeff=0.01`, improved but did not fully solve it at `0.03`, and showed diminishing returns at `0.1`. The Foundation run showed a 1,000-step Gumbel anneal still collapses when noise expires before LR warmup ends, so the current fix is `router_aux_loss_coeff=0.03` plus Gumbel top-k anneal `0.5 → 0.0` over 4,000 steps.
+1. **Early expert collapse** — router finding a small expert subset that works for almost everything. The 1200-step v5 sanities showed `router_aux_loss_coeff=0.03`, `0.10` on noisy routing, and `0.10` on clean routing all eventually collapsed during LR warmup. Current fix is raw-router Switch aux plus a loop-specific DeepSeek-style per-expert balance-bias controller.
 2. **Expert capacity vs. task diversity** — 8 experts is the right number for this model size, but if specialisation doesn't emerge, 4 experts × hidden=4096 is a fallback.
 3. **Shared expert dominating** — if the shared expert does 95% of the work and routed experts remain weak, shrink shared expert hidden to 2048.
 4. **Cross-loop routing consistency** — same router reused across 6 loops; check if it learns loop-specific preferences via loop_embedding.

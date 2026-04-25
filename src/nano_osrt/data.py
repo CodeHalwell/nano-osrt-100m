@@ -268,6 +268,15 @@ def make_loader(
     # phase transitions — new loaders still spawn fresh workers, but
     # within a phase we don't tear them down for every step's reload.
     # prefetch_factor=2 keeps a small queue of ready batches per worker.
+    #
+    # multiprocessing_context="spawn" is critical. The default on Linux
+    # is fork, which inherits the parent's threadpool state — tokenizers-rs
+    # threads, torch's intra-op pool, wandb sync thread, HF datasets' xet
+    # client — any of which holds a mutex at fork time and silently
+    # deadlocks the child. Observed failure mode: worker stuck before its
+    # first print, DataLoader iter() blocks forever. Spawn starts fresh
+    # interpreters and re-imports modules cleanly; TokenStream's simple
+    # fields (list[dict], int, str) serialise cleanly across the boundary.
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -276,4 +285,5 @@ def make_loader(
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=2,
+        multiprocessing_context="spawn",
     )

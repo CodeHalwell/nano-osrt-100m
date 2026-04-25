@@ -6,8 +6,8 @@ Architecture changes from v4:
   - Top-2 softmax routing (Mixtral-style), renormalised gates.
   - Switch balance loss: num_experts * sum(f_i * p_i).
     NO importance loss (it enforced uniformity and killed v4's router).
-    NO bias controller, NO soft warmup. Training can anneal Gumbel top-k noise
-    to keep experts alive during the first routing steps.
+    Uses a DeepSeek-style balance-bias controller plus annealed Gumbel top-k
+    noise to keep experts alive while the router learns token preferences.
   - Capacity factor 2.0, tokens exceeding capacity skip that expert's branch.
   - Orthogonal per-expert initialisation breaks symmetry at step 0.
 
@@ -147,8 +147,9 @@ class MoELayer(nn.Module):
     Key differences from v4's MoELayer:
       - Switch balance loss: N * sum(f_i * p_i) — minimises at uniform without
         enforcing it on router probs.
-      - No importance/z/bias loss.
-      - No soft warmup or blend — sparse routing from step 0.
+      - No importance/z loss and no soft warmup/blend — sparse routing from
+        step 0.
+      - Optional persistent balance bias directly controls expert load.
       - Optional training-only Gumbel top-k noise, annealed by the trainer.
       - Dropped tokens (exceeded per-expert capacity) skip that expert's branch
         for this batch.
@@ -186,6 +187,43 @@ class MoELayer(nn.Module):
         self.register_buffer(
             "gumbel_tau",
             torch.tensor(config.router_gumbel_tau_init, dtype=torch.float32),
+        )
+
+        # Per-loop, per-expert additive load-balancing bias. This is part of
+        # the routing mechanism, not an optimizer parameter: it is applied in
+        # train/eval selection and saved in checkpoints, then updated once per
+        # optimizer step by the training loop via apply_balance_update().
+        #
+        # Capacity is enforced per MoE call, so loop-specific load imbalance
+        # must be corrected per loop. A single block-level bias can look
+        # balanced in aggregate while individual loop calls overflow.
+        self.bias_enabled = config.router_balance_bias_enabled
+        self.bias_update_rate = config.router_balance_bias_update_rate
+        self.bias_ema_rate = config.router_balance_bias_ema_rate
+        self.bias_max = config.router_balance_bias_max
+        self.register_buffer(
+            "router_balance_bias",
+            torch.zeros(self.num_loops, self.num_routed, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "balance_count_accum",
+            torch.zeros(self.num_loops, self.num_routed, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "balance_total_accum",
+            torch.zeros(self.num_loops, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "expert_ema_fraction",
+            torch.full(
+                (self.num_loops, self.num_routed),
+                1.0 / self.num_routed,
+                dtype=torch.float32,
+            ),
+            persistent=False,
         )
 
         # NOTE: orthogonal expert init is NOT applied here because HF's
@@ -240,6 +278,46 @@ class MoELayer(nn.Module):
                 expert, seed=self._moe_seed * 1000 + ei, gain=1.0,
             )
 
+    @torch._dynamo.disable
+    @torch.no_grad()
+    def _accumulate_balance_counts(self, top_idx: Tensor, loop_idx: int) -> None:
+        """Accumulate clean top-k assignment counts for the bias controller."""
+        if not self.bias_enabled:
+            return
+        flat = top_idx.reshape(-1)
+        counts = torch.bincount(flat, minlength=self.num_routed).float()
+        self.balance_count_accum[loop_idx].add_(counts)
+        self.balance_total_accum[loop_idx].add_(counts.sum())
+
+    @torch.no_grad()
+    def apply_balance_update(self) -> None:
+        """Update per-expert routing bias once from accumulated clean load."""
+        if not self.bias_enabled:
+            return
+        active = self.balance_total_accum > 0
+        if not active.any():
+            return
+
+        current_frac = self.expert_ema_fraction.clone()
+        current_frac[active] = (
+            self.balance_count_accum[active]
+            / self.balance_total_accum[active].unsqueeze(-1)
+        )
+        self.expert_ema_fraction[active] = torch.lerp(
+            self.expert_ema_fraction[active],
+            current_frac[active],
+            self.bias_ema_rate,
+        )
+
+        target = 1.0 / self.num_routed
+        delta = torch.zeros_like(self.router_balance_bias)
+        delta[active] = current_frac[active] - target
+        self.router_balance_bias.add_(delta, alpha=-self.bias_update_rate)
+        self.router_balance_bias.clamp_(-self.bias_max, self.bias_max)
+
+        self.balance_count_accum.zero_()
+        self.balance_total_accum.zero_()
+
     def forward(self, x: Tensor, loop_idx: int) -> tuple[Tensor, Tensor]:
         """Forward pass through MoE.
 
@@ -265,19 +343,28 @@ class MoELayer(nn.Module):
         loop_emb = self.loop_embeddings.weight[loop_idx].view(1, 1, D)
         router_input = x + loop_emb
         router_logits = self.router(router_input.reshape(N, D))  # (N, E)
+        raw_router_probs = F.softmax(router_logits, dim=-1)
+        if self.bias_enabled:
+            loop_bias = self.router_balance_bias[loop_idx].view(1, -1)
+            clean_logits = router_logits + loop_bias
+        else:
+            clean_logits = router_logits
 
-        clean_probs = F.softmax(router_logits, dim=-1)  # (N, E)
+        # "Clean" means deterministic deployed routing: bias applied, no
+        # Gumbel. Raw un-biased logits are diagnostic only once the controller
+        # is enabled.
+        clean_probs = F.softmax(clean_logits, dim=-1)  # (N, E)
 
         # Training-time noisy top-k exploration. This prevents experts that
         # lose the first few router updates from going permanently cold. The
         # trainer anneals gumbel_tau to zero before the 5k health gate, so the
         # final pass is evaluated on the clean router.
-        selection_logits = router_logits
+        selection_logits = clean_logits
         if self.training:
-            u = torch.rand_like(router_logits).clamp_(1e-6, 1.0 - 1e-6)
+            u = torch.rand_like(clean_logits).clamp_(1e-6, 1.0 - 1e-6)
             gumbel = -torch.log(-torch.log(u))
-            tau = cast(Tensor, self.gumbel_tau).to(dtype=router_logits.dtype)
-            selection_logits = router_logits + tau * gumbel
+            tau = cast(Tensor, self.gumbel_tau).to(dtype=clean_logits.dtype)
+            selection_logits = clean_logits + tau * gumbel
 
         # Softmax probabilities
         probs = F.softmax(selection_logits, dim=-1)  # (N, E)
@@ -287,6 +374,9 @@ class MoELayer(nn.Module):
         clean_raw_top_probs, clean_top_idx = clean_probs.topk(
             self.top_k, dim=-1,
         )
+        _, raw_balance_top_idx = raw_router_probs.topk(self.top_k, dim=-1)
+        if self.training:
+            self._accumulate_balance_counts(clean_top_idx, loop_idx)
 
         # Renormalise so the K chosen gates sum to 1. Without this, the MoE
         # output would be down-weighted when K > 1 just because softmax is
@@ -309,19 +399,36 @@ class MoELayer(nn.Module):
         else:
             capacity = N * self.top_k  # effectively unlimited (one pair per slot)
 
-        # Switch balance loss extended to top-k:
+        # Dispatch/noisy assignment stats. These keep the existing telemetry
+        # semantics: last_expert_fraction and marginal_entropy describe the
+        # actual noisy dispatch path while Gumbel exploration is enabled.
+        dispatch_one_hot = F.one_hot(top_idx, num_classes=self.num_routed)
+        f = dispatch_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+        p = probs.float().mean(dim=0)
+
+        # Switch balance loss extended to top-k. Compute it on the RAW router
+        # logits, not the noisy dispatch path or the bias-corrected clean path.
+        # Gumbel is exploration and bias is an external controller; the aux
+        # gradient must still push the learned router itself away from collapse.
+        # Dispatch below still uses bias+Gumbel top_idx/probs.
         #   f_i = fraction of token-expert pairs routed to expert i.
         #         Count each top-k membership, divide by N*K so sum(f)=1.
         #   p_i = mean softmax prob for expert i (sums to 1).
         #   loss = E * sum(f_i * p_i). Minimum at uniform = 1.0.
-        one_hot = F.one_hot(top_idx, num_classes=self.num_routed)  # (N, K, E)
+        raw_balance_one_hot = F.one_hot(
+            raw_balance_top_idx, num_classes=self.num_routed,
+        )
         # Compute balance loss in fp32. Under bf16 autocast, f·p can
         # underflow late in training when both are near 1/E (= 0.125 for
         # E=8); fp32 keeps the product and sum precise so the gradient
         # signal survives into long runs.
-        f = one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)  # (E,) fp32
-        p = probs.float().mean(dim=0)                            # (E,) fp32
-        self.balance_loss = self.num_routed * (f * p).sum()
+        raw_balance_f = (
+            raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+        )
+        raw_balance_p = raw_router_probs.float().mean(dim=0)
+        self.balance_loss = self.num_routed * (
+            raw_balance_f * raw_balance_p
+        ).sum()
 
         # Dispatch: for each expert, gather every token that picked it at
         # ANY top-k rank, apply capacity, run expert, scatter-add into output

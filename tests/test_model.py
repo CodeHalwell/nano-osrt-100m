@@ -73,6 +73,15 @@ def test_config_rejects_negative_gumbel_tau():
         tiny_config(router_gumbel_tau_init=-0.1)
 
 
+def test_config_rejects_bad_balance_bias_settings():
+    with pytest.raises(ValueError, match="router_balance_bias_update_rate"):
+        tiny_config(router_balance_bias_update_rate=-0.1)
+    with pytest.raises(ValueError, match="router_balance_bias_ema_rate"):
+        tiny_config(router_balance_bias_ema_rate=1.5)
+    with pytest.raises(ValueError, match="router_balance_bias_max"):
+        tiny_config(router_balance_bias_max=-1.0)
+
+
 def test_config_rejects_bad_head_dim():
     with pytest.raises(ValueError, match="divisible"):
         tiny_config(dim=100, heads=7)
@@ -313,6 +322,140 @@ def test_moe_balance_loss_penalises_collapse():
     # after softmax). loss = E * sum(f_i * p_i) ≈ 8 * 2 * (0.5 * 0.5) = 4.0
     # Minimum loss at uniform is 1.0, so this is a clear penalty.
     assert loss > 3.0, f"Collapse loss {loss}, expected > 3.0"
+
+
+def test_moe_balance_loss_uses_raw_router_under_gumbel():
+    """Aux loss should penalise raw-router collapse even when Gumbel
+    exploration spreads noisy dispatch and bias may alter clean selection.
+
+    Regression target: if balance loss is computed from noisy selection logits,
+    Gumbel-routed cold experts can make the aux term look healthier than the
+    learned raw router actually is.
+    """
+    torch.manual_seed(0)
+    cfg = tiny_config(
+        num_routed_experts=8,
+        top_k_experts=2,
+        router_gumbel_tau_init=20.0,
+    )
+    moe = MoELayer(cfg)
+    moe.train(True)
+
+    class ConstLogits(torch.nn.Module):
+        def __init__(self, e: int) -> None:
+            super().__init__()
+            self.e = e
+        def forward(self, h: torch.Tensor) -> torch.Tensor:
+            logits = torch.zeros(
+                (h.shape[0], self.e),
+                device=h.device, dtype=h.dtype,
+            )
+            logits[:, 0] = 5.0
+            logits[:, 1] = 5.0
+            return logits
+
+    moe.router = ConstLogits(cfg.num_routed_experts)
+    with torch.no_grad():
+        moe.gumbel_tau.fill_(20.0)
+    x = torch.randn(16, 32, cfg.dim)
+    _ = moe(x, loop_idx=0)
+    loss = moe.balance_loss.item()
+    assert loss > 3.5, (
+        f"Raw-router collapse should stay strongly penalised under Gumbel; "
+        f"got balance loss {loss:.3f}"
+    )
+
+
+def test_balance_bias_controller_accumulates_and_applies():
+    """Skewed clean assignments should push popular experts down and unused up."""
+    cfg = tiny_config(
+        num_routed_experts=4,
+        top_k_experts=2,
+        router_balance_bias_enabled=True,
+        router_balance_bias_update_rate=0.2,
+        router_balance_bias_max=0.5,
+    )
+    moe = MoELayer(cfg)
+    assert torch.all(moe.router_balance_bias == 0.0)
+
+    skewed = torch.zeros(32, cfg.top_k_experts, dtype=torch.long)
+    skewed[:, 0] = 0
+    skewed[:, 1] = 1
+    for _ in range(6):
+        moe._accumulate_balance_counts(skewed, loop_idx=0)
+
+    assert torch.all(moe.router_balance_bias == 0.0)
+    assert moe.balance_total_accum[0].item() > 0
+    moe.apply_balance_update()
+
+    assert moe.router_balance_bias[0, 0].item() < 0
+    assert moe.router_balance_bias[0, 1].item() < 0
+    assert moe.router_balance_bias[0, 2].item() > 0
+    assert moe.router_balance_bias[0, 3].item() > 0
+    assert torch.all(moe.router_balance_bias[1:] == 0.0)
+    assert moe.router_balance_bias.abs().max().item() <= 0.5 + 1e-6
+    assert torch.all(moe.balance_count_accum == 0.0)
+    assert torch.all(moe.balance_total_accum == 0.0)
+
+    bias_before = moe.router_balance_bias.clone()
+    moe.apply_balance_update()
+    assert torch.allclose(moe.router_balance_bias, bias_before)
+
+
+def test_balance_bias_affects_clean_topk_selection():
+    """Clean routing should include the persistent balance bias."""
+    cfg = tiny_config(
+        num_routed_experts=4,
+        top_k_experts=2,
+        router_gumbel_tau_init=0.0,
+        router_balance_bias_enabled=True,
+    )
+    moe = MoELayer(cfg)
+    moe.train(False)
+
+    class ConstLogits(torch.nn.Module):
+        def forward(self, h: torch.Tensor) -> torch.Tensor:
+            logits = torch.empty(h.shape[0], 4, device=h.device, dtype=h.dtype)
+            logits[:, 0] = -1.0
+            logits[:, 1] = 0.5
+            logits[:, 2] = 2.0
+            logits[:, 3] = 0.0
+            return logits
+
+    moe.router = ConstLogits()
+    x = torch.randn(2, 8, cfg.dim)
+    with torch.no_grad():
+        moe.router_balance_bias.zero_()
+        _ = moe(x, loop_idx=0)
+        unbiased_f = moe.last_clean_expert_fraction[0]
+        moe.router_balance_bias[0].copy_(torch.tensor([0.0, 0.0, -5.0, 0.0]))
+        _ = moe(x, loop_idx=0)
+        biased_f = moe.last_clean_expert_fraction[0]
+
+    assert unbiased_f[2] > 0.49
+    assert biased_f[2] == 0.0
+    assert biased_f[1] > 0.49
+
+
+def test_balance_bias_persists_in_state_dict():
+    cfg = tiny_config(num_routed_experts=4, top_k_experts=2)
+    model = NanoOSRTForCausalLM(cfg)
+    bias = torch.tensor([
+        [0.1, -0.2, 0.3, -0.4],
+        [-0.3, 0.2, -0.1, 0.4],
+    ])
+    model.model.blocks[0].moe.router_balance_bias.copy_(bias)
+
+    state = model.state_dict()
+    found = [k for k in state if "router_balance_bias" in k]
+    assert found, "router_balance_bias not in state_dict"
+
+    model2 = NanoOSRTForCausalLM(cfg)
+    model2.load_state_dict(state)
+    assert torch.allclose(
+        model2.model.blocks[0].moe.router_balance_bias,
+        bias,
+    )
 
 
 def test_moe_drop_rate_low_at_loose_cap():

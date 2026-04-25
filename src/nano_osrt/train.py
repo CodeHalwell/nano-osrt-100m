@@ -2,12 +2,12 @@
 
 Simpler than v4_train.py because v5 removes:
   - Soft warmup / blend / routing_mode switching
-  - Balance bias controller (DeepSeek-style)
   - router_noise anneal
 
 What remains: cosine LR, phase transitions (seq_len + dataset swap),
 eval, checkpointing, W&B, compile, resume, 23h rescue, and annealed
-Gumbel top-k exploration to prevent early dead experts.
+Gumbel top-k exploration plus a DeepSeek-style per-expert bias controller
+to prevent early dead experts.
 
 v5-specific telemetry (new metrics, all logged to W&B and stdout):
   - per_token_entropy — the real router-sharpness signal
@@ -69,6 +69,14 @@ def set_router_gumbel_tau(model: nn.Module, tau: float) -> None:
     base = inner.model if hasattr(inner, "model") else inner
     for block in base.blocks:
         block.moe.gumbel_tau.fill_(tau)
+
+
+def apply_router_balance_updates(model: nn.Module) -> None:
+    """Apply once-per-step balance-bias updates on compiled or eager models."""
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    base = inner.model if hasattr(inner, "model") else inner
+    for block in base.blocks:
+        block.moe.apply_balance_update()
 
 
 def get_phase(step: int, cfg: PretrainConfig) -> tuple[str, dict]:
@@ -255,6 +263,9 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     clean_expert_maxes: list[float] = []
     clean_expert_mins: list[float] = []
     balance_losses: list[float] = []
+    bias_abs_maxes: list[float] = []
+    bias_ema_maxes: list[float] = []
+    bias_ema_mins: list[float] = []
 
     metrics: dict = {}
     for bi, blk in enumerate(base.blocks):
@@ -264,6 +275,18 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
 
         if blk.moe.balance_loss is not None:
             balance_losses.append(blk.moe.balance_loss.item())
+        if hasattr(blk.moe, "router_balance_bias"):
+            bias_abs_max = blk.moe.router_balance_bias.abs().max().item()
+            bias_abs_maxes.append(bias_abs_max)
+            metrics[f"moe/bias_abs_max_b{bi}"] = bias_abs_max
+        if hasattr(blk.moe, "expert_ema_fraction"):
+            ema = blk.moe.expert_ema_fraction
+            ema_max = ema.max().item()
+            ema_min = ema.min().item()
+            bias_ema_maxes.append(ema_max)
+            bias_ema_mins.append(ema_min)
+            metrics[f"moe/bias_ema_max_b{bi}"] = ema_max
+            metrics[f"moe/bias_ema_min_b{bi}"] = ema_min
 
         for li, v in enumerate(blk.moe.last_per_token_entropy):
             metrics[f"moe/per_token_entropy_b{bi}_l{li}"] = v
@@ -332,6 +355,9 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     metrics["moe/clean_expert_max_mean"] = _mean(clean_expert_maxes)
     metrics["moe/clean_expert_min_mean"] = _mean(clean_expert_mins)
     metrics["moe/balance_loss_mean"] = _mean(balance_losses)
+    metrics["moe/bias_abs_max_mean"] = _mean(bias_abs_maxes)
+    metrics["moe/bias_ema_max_mean"] = _mean(bias_ema_maxes)
+    metrics["moe/bias_ema_min_mean"] = _mean(bias_ema_mins)
 
     summary = {
         "per_token_H": _mean(per_token_ents),
@@ -351,6 +377,9 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
         "clean_expert_max": _mean(clean_expert_maxes),
         "clean_expert_min": _mean(clean_expert_mins),
         "balance_loss": _mean(balance_losses),
+        "bias_abs_max": _mean(bias_abs_maxes),
+        "bias_ema_max": _mean(bias_ema_maxes),
+        "bias_ema_min": _mean(bias_ema_mins),
     }
     return metrics, summary
 
@@ -398,6 +427,9 @@ def _average_moe_snapshots(
         "clean_expert_max": avg.get("moe/clean_expert_max_mean", 0.0),
         "clean_expert_min": avg.get("moe/clean_expert_min_mean", 0.0),
         "balance_loss": avg.get("moe/balance_loss_mean", 0.0),
+        "bias_abs_max": avg.get("moe/bias_abs_max_mean", 0.0),
+        "bias_ema_max": avg.get("moe/bias_ema_max_mean", 0.0),
+        "bias_ema_min": avg.get("moe/bias_ema_min_mean", 0.0),
     }
     return avg, summary
 
@@ -486,6 +518,11 @@ def run_training(
     print(f"Total steps         : {train_cfg.total_steps}")
     print(f"Aux loss coeff      : {model_config.router_aux_loss_coeff}")
     print(
+        f"Balance bias        : {model_config.router_balance_bias_enabled} "
+        f"(rate={model_config.router_balance_bias_update_rate}, "
+        f"max={model_config.router_balance_bias_max})"
+    )
+    print(
         f"Router Gumbel tau   : {train_cfg.router_gumbel_tau_init} -> "
         f"{train_cfg.router_gumbel_tau_final} over "
         f"{train_cfg.router_gumbel_anneal_steps} steps"
@@ -515,6 +552,13 @@ def run_training(
                 "shared_expert_hidden": model_config.shared_expert_hidden,
                 "capacity_factor": model_config.router_capacity_factor,
                 "aux_loss_coeff": model_config.router_aux_loss_coeff,
+                "balance_bias_enabled": (
+                    model_config.router_balance_bias_enabled
+                ),
+                "balance_bias_update_rate": (
+                    model_config.router_balance_bias_update_rate
+                ),
+                "balance_bias_max": model_config.router_balance_bias_max,
                 "router_gumbel_tau_init": train_cfg.router_gumbel_tau_init,
                 "router_gumbel_tau_final": train_cfg.router_gumbel_tau_final,
                 "router_gumbel_anneal_steps": (
@@ -754,6 +798,7 @@ def run_training(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         optimizer.step()
+        apply_router_balance_updates(model)
 
         # Average snapshots once per step. Used for both logging and the
         # early-stop gate so both see the same grad-accum-averaged values.
@@ -797,6 +842,7 @@ def run_training(
                 f"margin={moe_summary['top_margin']:.3f} "
                 f"drop={moe_summary['drop_rate']:.4f} "
                 f"gate={moe_summary['moe_gate']:.3f} "
+                f"bias={moe_summary['bias_abs_max']:.3f} "
                 f"emax={moe_summary['expert_max']:.3f} "
                 f"emin={moe_summary['expert_min']:.3f} "
                 f"bal={moe_summary['balance_loss']:.3f}",

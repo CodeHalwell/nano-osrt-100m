@@ -21,6 +21,7 @@ except ImportError:
 from nano_osrt.config import NanoOSRTConfig
 from nano_osrt.model import NanoOSRTForCausalLM
 from nano_osrt.sft_data import IGNORE_INDEX, make_sft_loader
+from nano_osrt.train import apply_router_balance_updates
 
 
 def get_sft_lr(
@@ -256,6 +257,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), sft_cfg.grad_clip)
         optimizer.step()
+        apply_router_balance_updates(model)
 
         # --- Logging ---
         should_log = (

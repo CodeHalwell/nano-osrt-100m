@@ -4,7 +4,8 @@
 MoE only (1 shared + 8 routed experts, top-2 routing).
 No dense FFN — shared expert replaces it.
 Switch-style balance loss (minimises at uniform without enforcing it).
-No importance loss, no bias controller, no soft warmup.
+DeepSeek-style per-expert balance bias controller.
+No importance loss, no soft warmup.
 Training can use annealed Gumbel top-k noise to prevent early dead experts.
 Orthogonal per-expert initialisation breaks symmetry at step 0.
 
@@ -53,7 +54,7 @@ class NanoOSRTConfig(PretrainedConfig):
         expert_hidden: int = 2048,          # routed experts
         shared_expert_hidden: int = 4096,   # shared expert (replaces dense FFN)
 
-        # --- Routing (Switch-style) ---
+        # --- Routing (Switch-style + explicit load controller) ---
         # Balance loss: num_experts * sum(f_i * p_i) where
         #   f_i = fraction of tokens routed to expert i (hard assignment)
         #   p_i = mean softmax prob for expert i
@@ -64,10 +65,35 @@ class NanoOSRTConfig(PretrainedConfig):
         #
         # v5 sanity runs showed the original Switch default (0.01) let the
         # 8-expert router collapse to roughly two active experts. 0.03 moved
-        # it to roughly three active experts without hurting task loss. Higher
-        # coeffs had diminishing returns, so early Gumbel exploration handles
-        # dead-expert prevention while this coeff maintains pressure.
-        router_aux_loss_coeff: float = 0.03,
+        # it to roughly three active experts without hurting task loss, but
+        # the 1200-step sanity (W&B run 08o88sq0) showed partial collapse
+        # resurfacing once LR reached ~25% of peak: drop rate 0.6%→12%,
+        # clean marginal entropy 1.97→1.46, one expert to ~1.5% of tokens.
+        # Bumped to 0.10 after sanity showed 0.03 was too weak. The
+        # clean-path variant still collapsed, so this aux now acts on raw
+        # pre-bias router logits while the explicit bias controller below
+        # handles deployed clean-routing load.
+        router_aux_loss_coeff: float = 0.10,
+
+        # --- Balance-bias controller (DeepSeek-style) ---
+        # Per-expert additive bias applied to router logits as part of the
+        # routing mechanism in both train and eval. Bias is per recursive loop
+        # because capacity/drop is enforced per MoE call; aggregating all loops
+        # into one block-level bias lets loop-specific imbalances cancel. The
+        # bias is updated once per optimizer step from observed clean top-k load:
+        #   bias -= update_rate * (current_fraction - uniform_fraction)
+        # Over-used experts get pushed down; under-used experts get lifted.
+        #
+        # This is intentionally non-gradient control: the three 1200-step v5
+        # sanity runs showed Switch aux loss, even on the clean path, can
+        # delay but not prevent task-gradient concentration onto a favorite
+        # subset once LR ramps. The bias directly counter-rotates that load
+        # imbalance. Since it is persistent and applied at eval, clean router
+        # health means "router logits + loop-specific balance bias, no Gumbel".
+        router_balance_bias_enabled: bool = True,
+        router_balance_bias_update_rate: float = 0.10,
+        router_balance_bias_ema_rate: float = 0.05,
+        router_balance_bias_max: float = 1.5,
 
         # Training-time noisy top-k. The training loop anneals this buffer;
         # default stays 0.0 so unit tests and standalone/eval forwards are
@@ -133,6 +159,10 @@ class NanoOSRTConfig(PretrainedConfig):
         self.shared_expert_hidden = shared_expert_hidden
 
         self.router_aux_loss_coeff = router_aux_loss_coeff
+        self.router_balance_bias_enabled = router_balance_bias_enabled
+        self.router_balance_bias_update_rate = router_balance_bias_update_rate
+        self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
+        self.router_balance_bias_max = router_balance_bias_max
         self.router_gumbel_tau_init = router_gumbel_tau_init
         self.router_capacity_factor = router_capacity_factor
         self.expert_orthogonal_init = expert_orthogonal_init
@@ -217,6 +247,21 @@ class NanoOSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_aux_loss_coeff must be >= 0, got "
                 f"{self.router_aux_loss_coeff}"
+            )
+        if self.router_balance_bias_update_rate < 0:
+            raise ValueError(
+                f"router_balance_bias_update_rate must be >= 0, got "
+                f"{self.router_balance_bias_update_rate}"
+            )
+        if not 0 <= self.router_balance_bias_ema_rate <= 1:
+            raise ValueError(
+                f"router_balance_bias_ema_rate must be in [0, 1], got "
+                f"{self.router_balance_bias_ema_rate}"
+            )
+        if self.router_balance_bias_max < 0:
+            raise ValueError(
+                f"router_balance_bias_max must be >= 0, got "
+                f"{self.router_balance_bias_max}"
             )
         if self.router_gumbel_tau_init < 0:
             raise ValueError(
