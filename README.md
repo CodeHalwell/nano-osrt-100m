@@ -23,7 +23,7 @@ src/nano_osrt/
 ├── model.py          # NanoOSRTModel / NanoOSRTForCausalLM, MoE dispatch, generate
 ├── data.py           # Streaming pretrain loader (FineWeb-Edu, CodeParrot, Wikipedia)
 ├── sft_data.py       # SFT data with packing + structural-tag format
-├── train.py          # Pretrain loop (Lion, Gumbel anneal, 5k early-stop gate)
+├── train.py          # Pretrain loop (Muon hybrid, Gumbel anneal, 5k early-stop gate)
 ├── train_config.py   # PretrainConfig / SFTConfig / GRPOConfig
 ├── sft_train.py      # HRA-adapted SFT loop
 ├── hra.py            # High-rank adapters (SFT capacity injection)
@@ -38,6 +38,7 @@ archive/              # v1/v2/v3/v4 code preserved for reference
 ```bash
 modal run --detach app.py --stage sanity     # 1200-step smoke test
 modal run --detach app.py --stage sweep      # Gumbel schedule sweep
+modal run --detach app.py --stage ablate     # Optimizer × routing 2x2 (cells A/B/C/D, 1200 steps each)
 modal run --detach app.py --stage pretrain   # Full curriculum (Foundation → Knowledge → Instruction)
 modal run --detach app.py --stage sft        # Balanced SFT on the pretrained checkpoint
 modal run --detach app.py --stage grpo       # GRPO RL with verifiable math rewards

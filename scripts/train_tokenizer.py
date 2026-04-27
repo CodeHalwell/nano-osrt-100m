@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import os
 import subprocess
 import sys
@@ -29,12 +30,7 @@ import tempfile
 import time
 
 # Try SuperBPE first, fall back to HuggingFace tokenizers
-USE_SUPERBPE = False
-try:
-    import superbpe
-    USE_SUPERBPE = True
-except ImportError:
-    pass
+USE_SUPERBPE = importlib.util.find_spec("superbpe") is not None
 
 
 def sample_training_data(sample_size: int = 2_000_000_000, seed: int = 42) -> str:
@@ -62,7 +58,12 @@ def sample_training_data(sample_size: int = 2_000_000_000, seed: int = 42) -> st
     """
     from datasets import load_dataset
 
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        delete=False,
+        encoding="utf-8",
+    )
 
     sources = [
         {
@@ -193,11 +194,18 @@ def sample_training_data(sample_size: int = 2_000_000_000, seed: int = 42) -> st
         f"({total_chars / 1e9:.2f} GB) in {elapsed:.0f}s -> {tmp.name}"
     )
 
-    if total_chars < 100_000_000:  # <100MB is too little even for 32K BPE
+    # Gate scales with what was requested: a small `--sample-size` for
+    # quick tests should pass when most of the request lands, while a 2GB
+    # default run shouldn't accept a network failure that returned 50MB.
+    # Half of requested is the threshold; an absolute floor catches the
+    # case where the user asked for almost nothing.
+    min_required = max(min(sample_size // 2, 100_000_000), 1_000_000)
+    if total_chars < min_required:
         raise RuntimeError(
-            f"Sampling produced only {total_chars:,} chars (<100MB). "
+            f"Sampling produced only {total_chars:,} chars "
+            f"(< {min_required:,} required for sample_size={sample_size:,}). "
             "Network to HF Hub is probably broken. Retry later or "
-            "lower the target further."
+            "lower --sample-size further."
         )
 
     return tmp.name
@@ -269,7 +277,10 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
     # Post-processor: add BOS/EOS
     tokenizer.post_processor = processors.TemplateProcessing(
         single="<|begin_of_text|> $A <|end_of_text|>",
-        pair="<|begin_of_text|> $A <|end_of_text|> <|begin_of_text|> $B:1 <|end_of_text|>:1",
+        pair=(
+            "<|begin_of_text|> $A <|end_of_text|> "
+            "<|begin_of_text|> $B:1 <|end_of_text|>:1"
+        ),
         special_tokens=[
             ("<|begin_of_text|>", 1),
             ("<|end_of_text|>", 2),
@@ -377,9 +388,17 @@ def _verify_tokenizer(output_dir: str) -> None:
 
     test_cases = [
         "Hello, world!",
-        "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)",
+        (
+            "def fibonacci(n):\n"
+            "    if n <= 1:\n"
+            "        return n\n"
+            "    return fibonacci(n-1) + fibonacci(n-2)"
+        ),
         "The derivative of x^2 is 2x.",
-        "<|user|>What is 2+2?<|assistant|><|think|>2+2 equals 4<|/think|><|answer|>4<|/answer|>",
+        (
+            "<|user|>What is 2+2?<|assistant|><|think|>"
+            "2+2 equals 4<|/think|><|answer|>4<|/answer|>"
+        ),
         "import torch\nimport torch.nn as nn\n\nclass MyModel(nn.Module):\n    pass",
     ]
 
@@ -403,11 +422,33 @@ def _verify_tokenizer(output_dir: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train custom 64K tokenizer for NanoOSRT")
-    parser.add_argument("--vocab-size", type=int, default=32768, help="Target vocabulary size (32K default, TC-aligned)")
-    parser.add_argument("--sample-size", type=int, default=50_000_000, help="Training text size in chars (~50MB default)")
-    parser.add_argument("--output", type=str, default="./tokenizer", help="Output directory")
-    parser.add_argument("--data-path", type=str, default=None, help="Pre-existing training text file (skip download)")
+    parser = argparse.ArgumentParser(
+        description="Train custom 64K tokenizer for NanoOSRT"
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=32768,
+        help="Target vocabulary size (32K default, TC-aligned)",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=2_000_000_000,
+        help="Training text size in chars (~2GB default - sweet spot for 32K BPE)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./tokenizer",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Pre-existing training text file (skip download)",
+    )
     args = parser.parse_args()
 
     print("NanoOSRT — Custom Tokenizer Training")

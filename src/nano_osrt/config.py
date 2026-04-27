@@ -9,8 +9,8 @@ No importance loss, no soft warmup.
 Training can use annealed Gumbel top-k noise to prevent early dead experts.
 Orthogonal per-expert initialisation breaks symmetry at step 0.
 
-Architecture: ~413M physical params, ~242M active per token (59%),
-~1.5B effective via recursive weight sharing.
+Architecture: ~363M physical params, ~192M active per token (52.9%),
+~1.15B effective via recursive weight sharing.
 """
 
 from transformers import PretrainedConfig
@@ -74,6 +74,26 @@ class NanoOSRTConfig(PretrainedConfig):
         # pre-bias router logits while the explicit bias controller below
         # handles deployed clean-routing load.
         router_aux_loss_coeff: float = 0.10,
+
+        # --- Router Z-loss (numerical safety + early router health) ---
+        # Penalty on the router's pre-softmax log-partition:
+        #   L_z = mean_token (logsumexp(router_logits))^2
+        # Two effects: (1) keeps logit magnitudes bounded so bf16/fp8
+        # softmax exponentials don't overflow, and (2) keeps early
+        # softmax distributions flatter, so cold experts retain a
+        # non-zero gradient through the LR warmup. The standard ST-MoE
+        # value is ~1e-3; small enough not to compete with task loss but
+        # large enough to keep raw logit magnitudes O(1).
+        router_z_loss_coeff: float = 1e-3,
+
+        # --- Sequence-wise balance loss (DeepSeek-V3 §5.2) ---
+        # Per-sequence Switch-style loss penalising imbalance INSIDE a
+        # single sequence. Useful at long context where one document can
+        # dominate one micro-batch even when the global batch is
+        # balanced. Default 0.0 — opt in once the global aux is stable.
+        # When non-zero, a small value (1e-3 to 1e-2) is enough; the
+        # global aux loss does the heavy lifting.
+        router_seq_balance_loss_coeff: float = 0.0,
 
         # --- Balance-bias controller (DeepSeek-style) ---
         # Per-expert additive bias applied to router logits as part of the
@@ -159,6 +179,8 @@ class NanoOSRTConfig(PretrainedConfig):
         self.shared_expert_hidden = shared_expert_hidden
 
         self.router_aux_loss_coeff = router_aux_loss_coeff
+        self.router_z_loss_coeff = router_z_loss_coeff
+        self.router_seq_balance_loss_coeff = router_seq_balance_loss_coeff
         self.router_balance_bias_enabled = router_balance_bias_enabled
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
@@ -247,6 +269,16 @@ class NanoOSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_aux_loss_coeff must be >= 0, got "
                 f"{self.router_aux_loss_coeff}"
+            )
+        if self.router_z_loss_coeff < 0:
+            raise ValueError(
+                f"router_z_loss_coeff must be >= 0, got "
+                f"{self.router_z_loss_coeff}"
+            )
+        if self.router_seq_balance_loss_coeff < 0:
+            raise ValueError(
+                f"router_seq_balance_loss_coeff must be >= 0, got "
+                f"{self.router_seq_balance_loss_coeff}"
             )
         if self.router_balance_bias_update_rate < 0:
             raise ValueError(

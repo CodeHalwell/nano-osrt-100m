@@ -55,32 +55,50 @@ class TokenStream(IterableDataset):
         seed = self.seed if worker_info is None else self.seed + worker_info.id
         rng = random.Random(seed)
 
-        # Load all dataset streams
-        streams = []
-        weights = []
-        for ds_cfg in self.dataset_configs:
-            print(f"[DataWorker] Connecting to {ds_cfg['hf_id']}...")
-            # Per-config split (defaults to "train"). The eval loader
-            # passes split="validation" when the dataset has one, or
-            # uses skip=N on the train split to carve out a disjoint
-            # subset. Previously the hardcoded "train" silently
-            # measured a training shuffle as "eval".
+        # Build (or rebuild) one stream with bounded retries. Used both
+        # for the initial connect AND mid-run reconnect so a transient
+        # HF Hub error during stream setup doesn't kill the whole run.
+        # The ablate stage hit this exact failure: cell A worked but
+        # cell B's load_dataset raised "Cannot send a request, as the
+        # client has been closed" before yielding a single batch.
+        def _open_stream(stream_idx: int, seed_offset: int = 0):
+            ds_cfg = self.dataset_configs[stream_idx]
             load_kwargs = {
                 "split": ds_cfg.get("split", "train"),
                 "streaming": True,
             }
             if ds_cfg.get("hf_config"):
                 load_kwargs["name"] = ds_cfg["hf_config"]
-            ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
-            # Optional `skip` offset for held-out evaluation on datasets
-            # without a validation split (e.g. FineWeb-Edu). With a
-            # training shuffle buffer of 5k examples, a skip of 5M+
-            # examples leaves effectively zero collision with any
-            # realistic training run.
-            skip_n = ds_cfg.get("skip", 0)
-            if skip_n > 0:
-                ds = ds.skip(skip_n)
-            ds = ds.shuffle(buffer_size=5_000, seed=seed)
+            last_exc = None
+            for attempt in range(1, 6):  # 5 attempts max
+                try:
+                    ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
+                    skip_n = ds_cfg.get("skip", 0)
+                    if skip_n > 0:
+                        ds = ds.skip(skip_n)
+                    return ds.shuffle(
+                        buffer_size=5_000, seed=seed + seed_offset,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    print(
+                        f"[DataWorker] {ds_cfg['hf_id']} setup attempt "
+                        f"{attempt}/5 failed: {type(exc).__name__}: "
+                        f"{str(exc)[:120]} — retrying...",
+                        flush=True,
+                    )
+                    time.sleep(2 * attempt)
+            raise RuntimeError(
+                f"Failed to open stream for {ds_cfg['hf_id']} after 5 "
+                f"attempts: {last_exc}",
+            )
+
+        # Load all dataset streams
+        streams = []
+        weights = []
+        for stream_idx, ds_cfg in enumerate(self.dataset_configs):
+            print(f"[DataWorker] Connecting to {ds_cfg['hf_id']}...")
+            ds = _open_stream(stream_idx)
             streams.append(iter(ds))
             weights.append(ds_cfg["weight"])
             print(f"[DataWorker] Stream ready for {ds_cfg['hf_id']}")
@@ -113,24 +131,14 @@ class TokenStream(IterableDataset):
         buffer: list[int] = []
 
         def _reconnect_stream(stream_idx: int) -> None:
-            ds_cfg = self.dataset_configs[stream_idx]
-            load_kwargs = {
-                "split": ds_cfg.get("split", "train"),
-                "streaming": True,
-            }
-            skip_n = ds_cfg.get("skip", 0)
-            if ds_cfg.get("hf_config"):
-                load_kwargs["name"] = ds_cfg["hf_config"]
-            ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
-            if skip_n > 0:
-                ds = ds.skip(skip_n)
-            ds = ds.shuffle(
-                buffer_size=5_000,
-                seed=seed + rng.randint(0, 100_000),
-            )
+            # Mid-run reconnect uses the same retry-aware open path as
+            # initial setup, plus a randomised seed offset so the
+            # reshuffle doesn't replay identical examples.
+            ds = _open_stream(stream_idx, seed_offset=rng.randint(1, 100_000))
             streams[stream_idx] = iter(ds)
             print(
-                f"[DataWorker] Reconnected to {ds_cfg['hf_id']}",
+                f"[DataWorker] Reconnected to "
+                f"{self.dataset_configs[stream_idx]['hf_id']}",
                 flush=True,
             )
 
@@ -190,10 +198,13 @@ class TokenStream(IterableDataset):
             while len(buffer) >= self.seq_len + 1:
                 chunk = buffer[: self.seq_len + 1]
                 buffer = buffer[self.seq_len :]
-                yield (
-                    torch.tensor(chunk[:-1], dtype=torch.long),
-                    torch.tensor(chunk[1:], dtype=torch.long),
-                )
+                # Labels are aligned with input_ids — the model shifts
+                # internally (model.py:895-897). Yielding chunk[1:] here
+                # would double-shift, so position i would be trained to
+                # predict token at i+2 instead of i+1. SFT yields aligned
+                # labels too, so this matches the rest of the stack.
+                input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                yield input_ids, input_ids.clone()
 
     def _extract_text(self, example: dict, tok) -> str:
         """Extract text from various dataset formats."""

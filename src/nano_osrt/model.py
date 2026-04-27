@@ -26,6 +26,7 @@ Default config (measured on the actual model):
 """
 
 import math
+from contextlib import contextmanager
 from typing import cast
 
 import torch
@@ -75,6 +76,12 @@ def compute_rope_freqs(
 
 
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # RoPE buffers are stored in fp32 for stable precompute, but attention runs
+    # under bf16 autocast. Cast here so q/k do not get promoted back to fp32.
+    if cos.dtype != x.dtype or cos.device != x.device:
+        cos = cos.to(device=x.device, dtype=x.dtype)
+    if sin.dtype != x.dtype or sin.device != x.device:
+        sin = sin.to(device=x.device, dtype=x.dtype)
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     x_rot = torch.cat([-x2, x1], dim=-1)
@@ -225,14 +232,20 @@ class MoELayer(nn.Module):
             ),
             persistent=False,
         )
+        self.balance_accum_enabled = True
 
         # NOTE: orthogonal expert init is NOT applied here because HF's
         # post_init() walks the module tree and calls _init_weights on every
         # nn.Linear, which would stomp the orthogonal weights. Apply via
         # apply_orthogonal_init() after post_init() has finished.
 
-        # Per-layer loss (set during forward, read by wrapper)
+        # Per-layer losses (set during forward, read by wrapper).
+        # balance_loss   — Switch global imbalance, scaled by aux coeff.
+        # z_loss         — (logsumexp router_logits)^2; bounds magnitude.
+        # seq_balance_loss — Per-sequence Switch; opt-in long-context safety.
         self.balance_loss: Tensor | None = None
+        self.z_loss: Tensor | None = None
+        self.seq_balance_loss: Tensor | None = None
 
         # Telemetry — plain Python lists, zero cost.
         # per_token_entropy: mean_token entropy of softmax (real sharpness signal).
@@ -263,6 +276,24 @@ class MoELayer(nn.Module):
         self.last_drop_rate: list[float] = [0.0] * config.recursive_loops
         self.last_raw_max_prob: list[float] = [0.0] * config.recursive_loops
         self.last_top_margin: list[float] = [0.0] * config.recursive_loops
+        self.last_prebias_per_token_entropy: list[float] = [
+            0.0
+        ] * config.recursive_loops
+        self.last_prebias_marginal_entropy: list[float] = [
+            0.0
+        ] * config.recursive_loops
+        self.last_prebias_assignment_entropy: list[float] = [
+            0.0
+        ] * config.recursive_loops
+        self.last_prebias_expert_fraction: list[list[float]] = [
+            [0.0] * self.num_routed for _ in range(config.recursive_loops)
+        ]
+        self.last_prebias_raw_max_prob: list[float] = [
+            0.0
+        ] * config.recursive_loops
+        self.last_prebias_top_margin: list[float] = [
+            0.0
+        ] * config.recursive_loops
         self.last_clean_raw_max_prob: list[float] = [0.0] * config.recursive_loops
         self.last_clean_top_margin: list[float] = [0.0] * config.recursive_loops
 
@@ -333,8 +364,10 @@ class MoELayer(nn.Module):
         N = B * S
         x_flat = x.reshape(N, D)
 
-        # Reset loss (prevents stale values in eval)
+        # Reset losses (prevents stale values in eval)
         self.balance_loss = None
+        self.z_loss = None
+        self.seq_balance_loss = None
 
         # Shared expert (always active, not gated by caller's moe_gate)
         shared_out = self.shared_expert(x)
@@ -374,8 +407,10 @@ class MoELayer(nn.Module):
         clean_raw_top_probs, clean_top_idx = clean_probs.topk(
             self.top_k, dim=-1,
         )
-        _, raw_balance_top_idx = raw_router_probs.topk(self.top_k, dim=-1)
-        if self.training:
+        prebias_raw_top_probs, raw_balance_top_idx = raw_router_probs.topk(
+            self.top_k, dim=-1,
+        )
+        if self.training and self.balance_accum_enabled:
             self._accumulate_balance_counts(clean_top_idx, loop_idx)
 
         # Renormalise so the K chosen gates sum to 1. Without this, the MoE
@@ -429,6 +464,36 @@ class MoELayer(nn.Module):
         self.balance_loss = self.num_routed * (
             raw_balance_f * raw_balance_p
         ).sum()
+
+        # Router Z-loss (ST-MoE §3.2): mean_token (logsumexp(logits))^2.
+        # Bounds the absolute magnitude of router logits so bf16/fp8
+        # softmax exponentials don't overflow, and keeps early softmax
+        # distributions flatter so cold experts retain non-zero gradient
+        # through LR warmup. Computed on raw router logits (pre-bias,
+        # pre-Gumbel) so the penalty acts on the learned router itself.
+        # fp32 for the same precision reasons as balance_loss above.
+        z = torch.logsumexp(router_logits.float(), dim=-1)  # (N,)
+        self.z_loss = (z ** 2).mean()
+
+        # Sequence-wise balance loss (DeepSeek-V3 §5.2). Penalises
+        # imbalance INSIDE each individual sequence, complementing the
+        # global balance_loss above. Useful at long context (Phase 3
+        # seq_len=8192) where one document can dominate one micro-batch
+        # even when the global batch averages to balanced. Computed
+        # under no_grad would defeat the purpose — we want the per-seq
+        # gradient to push the router away from intra-sequence collapse.
+        # Uses the same raw (un-noised) routing decisions as
+        # balance_loss for a coherent gradient signal.
+        seq_one_hot = raw_balance_one_hot.float().view(
+            B, S, self.top_k, self.num_routed,
+        )
+        f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
+        p_seq = raw_router_probs.float().view(B, S, self.num_routed).mean(
+            dim=1,
+        )                                                       # (B, E)
+        self.seq_balance_loss = self.num_routed * (
+            f_seq * p_seq
+        ).sum(dim=-1).mean()
 
         # Dispatch: for each expert, gather every token that picked it at
         # ANY top-k rank, apply capacity, run expert, scatter-add into output
@@ -522,6 +587,37 @@ class MoELayer(nn.Module):
             self.last_raw_max_prob[loop_idx] = raw_max
             self.last_top_margin[loop_idx] = top_margin
 
+            prebias_log_probs = torch.log(raw_router_probs.clamp_min(1e-10))
+            prebias_per_token_ent = -(
+                raw_router_probs * prebias_log_probs
+            ).sum(dim=-1)
+            prebias_p = raw_router_probs.float().mean(dim=0)
+            prebias_p_log = torch.log(prebias_p.clamp_min(1e-10))
+            prebias_marginal_ent = -(prebias_p * prebias_p_log).sum().item()
+            prebias_one_hot = F.one_hot(
+                raw_balance_top_idx, num_classes=self.num_routed,
+            ).to(raw_router_probs.dtype)
+            prebias_f = prebias_one_hot.sum(dim=(0, 1)) / (N * self.top_k)
+            prebias_f_log = torch.log(prebias_f.clamp_min(1e-10))
+            prebias_assign_ent = -(prebias_f * prebias_f_log).sum().item()
+            prebias_raw_max = prebias_raw_top_probs[:, 0].mean().item()
+            if self.top_k >= 2:
+                prebias_top_margin = (
+                    prebias_raw_top_probs[:, 0]
+                    - prebias_raw_top_probs[:, 1]
+                ).mean().item()
+            else:
+                prebias_top_margin = prebias_raw_top_probs[:, 0].mean().item()
+
+            self.last_prebias_per_token_entropy[loop_idx] = (
+                prebias_per_token_ent.mean().item()
+            )
+            self.last_prebias_marginal_entropy[loop_idx] = prebias_marginal_ent
+            self.last_prebias_assignment_entropy[loop_idx] = prebias_assign_ent
+            self.last_prebias_expert_fraction[loop_idx] = prebias_f.tolist()
+            self.last_prebias_raw_max_prob[loop_idx] = prebias_raw_max
+            self.last_prebias_top_margin[loop_idx] = prebias_top_margin
+
             clean_log_probs = torch.log(clean_probs.clamp_min(1e-10))
             clean_per_token_ent = -(clean_probs * clean_log_probs).sum(dim=-1)
             clean_p = clean_probs.mean(dim=0)
@@ -559,6 +655,16 @@ class MoELayer(nn.Module):
 # ── Recursive Block ─────────────────────────────────────────────────────
 
 
+@contextmanager
+def _balance_accumulation(moe: MoELayer, enabled: bool):
+    previous = moe.balance_accum_enabled
+    moe.balance_accum_enabled = enabled
+    try:
+        yield
+    finally:
+        moe.balance_accum_enabled = previous
+
+
 class RecursiveBlock(nn.Module):
     """Physical transformer block: attention + MoE (no dense FFN).
 
@@ -579,17 +685,36 @@ class RecursiveBlock(nn.Module):
         # Attention
         self.norm_attn = nn.RMSNorm(config.dim)
         self.qkv = nn.Linear(config.dim, config.dim * 3, bias=False)
+        # QK-Norm: per-head RMSNorm on q and k before RoPE+SDPA. Bounds
+        # attention logits so they don't explode in bf16/fp8 — protects
+        # the downstream MoE router from inheriting pathological hidden
+        # states. Per-head (head_dim) is the standard formulation; sharing
+        # the norm parameter across heads keeps the addition lightweight
+        # (~head_dim params per block) and matches Gemma2/Chameleon.
+        self.norm_q = nn.RMSNorm(config.head_dim)
+        self.norm_k = nn.RMSNorm(config.head_dim)
         self.out_proj = nn.Linear(config.dim, config.dim, bias=False)
 
         # MoE (shared + routed), pre-norm
         self.norm_moe = nn.RMSNorm(config.dim)
         self.moe = MoELayer(config, moe_seed=block_idx)
 
-        # Single gate on the MoE branch. Starts at 1.0 (unlike v4's 0.01)
-        # because there's no dense crutch to hide behind — we want the
-        # MoE contribution full-strength from step 0, or the model will
-        # learn to ignore it.
-        self.moe_gate = nn.Parameter(torch.tensor(1.0))
+        # Gate on the MoE (routed) branch. Reparameterised through
+        # softplus so the EFFECTIVE gate is always > 0:
+        #   effective = softplus(moe_gate) = log(1 + exp(moe_gate))
+        # The raw parameter is initialised to log(e - 1) ≈ 0.5413 so
+        # softplus(raw) ≈ 1.0 at step 0 (matches the previous unbounded
+        # 1.0 init). Without this constraint the scalar can drift
+        # negative under task gradient and zero out the routed branch
+        # entirely, recreating the v4 "dense crutch" failure mode where
+        # the always-on shared expert does all the work and routed
+        # experts receive no learning signal.
+        # Read `effective_moe_gate()` (or compute F.softplus(moe_gate)
+        # at use sites) to get the actual gate value.
+        self.moe_gate = nn.Parameter(torch.tensor(math.log(math.e - 1.0)))
+
+    def effective_moe_gate(self) -> Tensor:
+        return F.softplus(self.moe_gate)
 
     def forward(
         self,
@@ -615,8 +740,15 @@ class RecursiveBlock(nn.Module):
         q = q.view(B, S, self.heads, self.head_dim)
         k = k.view(B, S, self.heads, self.head_dim)
         v = v.view(B, S, self.heads, self.head_dim)
-        q = apply_rope(q, rope_cos, rope_sin)
-        k = apply_rope(k, rope_cos, rope_sin)
+        # QK-Norm: applied BEFORE RoPE so the rotation operates on
+        # already-bounded vectors. Cached K from prior decode steps was
+        # rotated post-norm at insertion time, so applying norm only to
+        # the new K (which is what happens here, before the cat with
+        # past_key_value below) keeps the cache consistent.
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+        q = apply_rope(q, rope_cos.to(q.dtype), rope_sin.to(q.dtype))
+        k = apply_rope(k, rope_cos.to(k.dtype), rope_sin.to(k.dtype))
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         past_len = past_key_value[0].shape[2] if past_key_value is not None else 0
@@ -650,7 +782,7 @@ class RecursiveBlock(nn.Module):
         # carry its weight at all times; routed experts blend in as the
         # router learns useful specialisation.
         h_shared, h_routed = self.moe(self.norm_moe(x), loop_idx)
-        x = x + h_shared + self.moe_gate * h_routed
+        x = x + h_shared + self.effective_moe_gate() * h_routed
 
         return x, present_kv
 
@@ -726,12 +858,16 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> tuple[Tensor, list[Tensor], Tensor, list[tuple[Tensor, Tensor]] | None]:
+    ) -> tuple[
+        Tensor, list[Tensor], Tensor, Tensor, Tensor,
+        list[tuple[Tensor, Tensor]] | None,
+    ]:
         """Forward pass.
 
-        Returns: (hidden, loop_rms, balance_loss_total, presents).
-        balance_loss is summed across all (num_blocks * recursive_loops) MoE
-        applications and normalised in the wrapper.
+        Returns:
+            (hidden, loop_rms, balance_loss, z_loss, seq_balance_loss, presents)
+        Each loss is the SUM across all (num_blocks * recursive_loops) MoE
+        applications. The wrapper normalises by that count.
         """
         x = self.embedding(input_ids)
         S = input_ids.shape[1]
@@ -787,6 +923,8 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
 
         loop_rms: list[Tensor] = []
         total_balance_loss = torch.tensor(0.0, device=x.device)
+        total_z_loss = torch.tensor(0.0, device=x.device)
+        total_seq_balance_loss = torch.tensor(0.0, device=x.device)
 
         use_ckpt = self.gradient_checkpointing and self.training
         if use_ckpt and (use_cache or past_key_values is not None):
@@ -811,9 +949,16 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                     ):
                         return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
 
+                    def _context_fn(_block=block):
+                        return (
+                            _balance_accumulation(_block.moe, True),
+                            _balance_accumulation(_block.moe, False),
+                        )
+
                     x = gradient_checkpoint(
                         _block_fn, x, adapter_a, adapter_b, cos, sin,
                         use_reentrant=False,
+                        context_fn=_context_fn,
                     )
                 else:
                     x, present_kv = block(
@@ -826,16 +971,29 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                     if presents is not None:
                         presents.append(present_kv)
 
-                # Accumulate Switch balance loss
+                # Accumulate router auxiliary losses (Switch balance,
+                # Z-loss, sequence-wise balance). Each is set as a
+                # side-effect on the MoE module during forward; the
+                # wrapper normalises by the number of MoE applications.
                 if block.moe.balance_loss is not None:
                     total_balance_loss = total_balance_loss + block.moe.balance_loss
+                if block.moe.z_loss is not None:
+                    total_z_loss = total_z_loss + block.moe.z_loss
+                if block.moe.seq_balance_loss is not None:
+                    total_seq_balance_loss = (
+                        total_seq_balance_loss + block.moe.seq_balance_loss
+                    )
 
             loop_rms.append(x.float().pow(2).mean().sqrt())
             if loop < self.config.recursive_loops - 1:
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
-        return x, loop_rms, total_balance_loss, presents
+        return (
+            x, loop_rms,
+            total_balance_loss, total_z_loss, total_seq_balance_loss,
+            presents,
+        )
 
 
 class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
@@ -861,6 +1019,10 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         self.last_task_loss: Tensor | None = None
         self.last_balance_loss: Tensor | None = None
         self.last_balance_loss_normalised: Tensor | None = None
+        self.last_z_loss: Tensor | None = None
+        self.last_z_loss_normalised: Tensor | None = None
+        self.last_seq_balance_loss: Tensor | None = None
+        self.last_seq_balance_loss_normalised: Tensor | None = None
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
@@ -876,7 +1038,11 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden, loop_rms, balance_loss, presents = self.model(
+        (
+            hidden, loop_rms,
+            balance_loss, z_loss, seq_balance_loss,
+            presents,
+        ) = self.model(
             input_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -889,6 +1055,10 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         self.last_task_loss = None
         self.last_balance_loss = None
         self.last_balance_loss_normalised = None
+        self.last_z_loss = None
+        self.last_z_loss_normalised = None
+        self.last_seq_balance_loss = None
+        self.last_seq_balance_loss_normalised = None
 
         loss = None
         if labels is not None:
@@ -900,18 +1070,26 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # Normalise balance loss by num MoE applications so the coefficient
-            # matches per-layer weight (not per-whole-model sum).
+            # Normalise each aux loss by num MoE applications so the
+            # coefficient matches per-layer weight (not per-whole-model sum).
             n_moe_layers = self.config.num_blocks * self.config.recursive_loops
             balance_norm = balance_loss / n_moe_layers
+            z_norm = z_loss / n_moe_layers
+            seq_balance_norm = seq_balance_loss / n_moe_layers
 
-            # Total loss: add balance aux loss ONLY during training. Eval loss
-            # must be pure task CE so eval perplexity and held-out comparisons
-            # aren't polluted by a hyperparameter (aux coeff). Training loops
-            # that want the balance signal at eval time should read
-            # last_balance_loss_normalised instead.
+            # Total loss: add aux losses ONLY during training. Eval loss must
+            # be pure task CE so eval perplexity and held-out comparisons
+            # aren't polluted by hyperparameter choices. Training loops that
+            # want the aux signals at eval time should read the
+            # last_*_normalised attributes instead.
             if self.training:
-                loss = task_loss + self.config.router_aux_loss_coeff * balance_norm
+                loss = (
+                    task_loss
+                    + self.config.router_aux_loss_coeff * balance_norm
+                    + self.config.router_z_loss_coeff * z_norm
+                    + self.config.router_seq_balance_loss_coeff
+                    * seq_balance_norm
+                )
             else:
                 loss = task_loss
 
@@ -919,6 +1097,10 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             self.last_task_loss = task_loss.detach()
             self.last_balance_loss = balance_loss.detach()
             self.last_balance_loss_normalised = balance_norm.detach()
+            self.last_z_loss = z_loss.detach()
+            self.last_z_loss_normalised = z_norm.detach()
+            self.last_seq_balance_loss = seq_balance_loss.detach()
+            self.last_seq_balance_loss_normalised = seq_balance_norm.detach()
 
         # Cast to FloatTensor to satisfy HF's type stubs. The runtime types
         # are correct — logits comes from F.linear on a float hidden state,
@@ -991,24 +1173,20 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             if step_idx > 0:
                 # Decode: pass only the newest token + existing cache.
                 new_tok = generated[:, -1:]
-                past_len = 0
-                if past_key_values and past_key_values[0] is not None:
-                    past_len = past_key_values[0][0].shape[2]
-                if past_len + 1 > self.config.max_position_embeddings:
-                    # Cache exceeded positional range: left-truncate each
-                    # layer's cache so the oldest positions fall off.
-                    trim = past_len + 1 - self.config.max_position_embeddings
-                    trimmed: PastKV = []
-                    assert past_key_values is not None
-                    for kv in past_key_values:
-                        if kv is None:
-                            trimmed.append(None)
-                        else:
-                            k_tr, v_tr = kv
-                            trimmed.append(
-                                (k_tr[:, :, trim:, :], v_tr[:, :, trim:, :])
-                            )
-                    past_key_values = trimmed
+                # Don't trim past_key_values when the cache exceeds
+                # max_position_embeddings — left-truncating the cache
+                # shifts the absolute RoPE indices that the forward
+                # derives from past_key_values[0].shape[2] (model.py:761
+                # past_length read), so cached K (rotated at original
+                # absolute positions) and the new K (rotated at the
+                # post-trim shifted index) end up in different
+                # positional bases and attention breaks.
+                # The forward already handles required_seq_len > the
+                # precomputed RoPE range by recomputing on demand
+                # (model.py:773-786), so letting the cache grow
+                # naturally is safe. Memory cost grows with generation
+                # length; if that becomes a constraint, the right fix
+                # is sliding-window with re-rotation, not a naive trim.
                 out = self.forward(
                     new_tok,
                     past_key_values=past_key_values,
@@ -1020,18 +1198,30 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                     logits_tensor[:, -1, :self.config.real_vocab_size].float()
                 )
 
-            # Repetition penalty (disabled by default). Applied per-batch-row
-            # so batch>1 works. Skipped when coeff==1.0 for speed.
+            # Repetition penalty (disabled by default). Vectorised so the
+            # cost stays O(B*T) on-device instead of O(B*|set|) Python-loop
+            # overhead per decode step. gather pulls each previously-seen
+            # token's current logit, scales it, and scatters back. When a
+            # token id appears multiple times in `generated[b]` the same
+            # scaled value is written for every occurrence, so last-write-
+            # wins on scatter is safe — semantically identical to the
+            # original "apply once per unique id" loop.
             if repetition_penalty != 1.0:
-                B = generated.shape[0]
                 vocab = logits_last.shape[-1]
-                for b in range(B):
-                    for token_id in set(generated[b].tolist()):
-                        if token_id < vocab:
-                            if logits_last[b, token_id] > 0:
-                                logits_last[b, token_id] /= repetition_penalty
-                            else:
-                                logits_last[b, token_id] *= repetition_penalty
+                # Mask out-of-vocab tokens so gather doesn't touch them.
+                gen_clamped = generated.clamp(max=vocab - 1)
+                in_vocab = (generated < vocab)
+                score = torch.gather(logits_last, 1, gen_clamped)
+                penalised = torch.where(
+                    score > 0,
+                    score / repetition_penalty,
+                    score * repetition_penalty,
+                )
+                # Where the gathered position was out-of-vocab, write the
+                # original score back (no-op) so scatter doesn't corrupt
+                # in-vocab logits with garbage from clamped indices.
+                penalised = torch.where(in_vocab, penalised, score)
+                logits_last.scatter_(1, gen_clamped, penalised)
 
             if temperature > 0:
                 next_logits = logits_last / temperature

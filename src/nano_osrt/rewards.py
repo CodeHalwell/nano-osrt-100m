@@ -28,9 +28,14 @@ def extract_numeric_answer(
         2. Last number after think_close (v3 format)
         3. Last number in the entire text (fallback)
     """
-    # Strategy 1: look inside explicit answer tags
+    # Strategy 1: look inside explicit answer tags. Use rindex on the
+    # opening tag so a model that emits multiple <|answer|>...<|/answer|>
+    # pairs (e.g. self-correcting mid-completion) gets credit for its
+    # FINAL committed answer, not the first attempt. With rindex, end is
+    # always the first close after the last open — correct for nested or
+    # repeated tag pairs.
     if answer_open in text and answer_close in text:
-        start = text.index(answer_open) + len(answer_open)
+        start = text.rindex(answer_open) + len(answer_open)
         end = (
             text.index(answer_close, start)
             if answer_close in text[start:] else len(text)

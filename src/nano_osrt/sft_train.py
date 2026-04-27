@@ -21,7 +21,7 @@ except ImportError:
 from nano_osrt.config import NanoOSRTConfig
 from nano_osrt.model import NanoOSRTForCausalLM
 from nano_osrt.sft_data import IGNORE_INDEX, make_sft_loader
-from nano_osrt.train import apply_router_balance_updates
+from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
 
 
 def get_sft_lr(
@@ -81,15 +81,10 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     print(f"Loading weights from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
-    if unexpected:
-        print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
-    if not missing and not unexpected:
-        print("  Clean load: all keys matched.")
-    else:
-        print("  Partial load: review the keys above if this is unexpected.")
+    load_model_state_or_raise(
+        model, state_dict, context=f"SFT pretrained load from {ckpt_path}",
+    )
+    print("  Clean load: all keys matched.")
 
     if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
         from nano_osrt.hra import inject_hra
@@ -176,7 +171,11 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
         print(f"Found {prefix} checkpoint at step {best_step}: {best_ckpt}")
         ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-        inner.load_state_dict(ckpt["model_state_dict"], strict=False)
+        load_model_state_or_raise(
+            inner,
+            ckpt["model_state_dict"],
+            context=f"{prefix} resume from {best_ckpt}",
+        )
         try:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         except Exception:
@@ -301,7 +300,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
                 assign_ents: list[float] = []
                 drop_rates: list[float] = []
                 for bi, blk in enumerate(base.blocks):
-                    mg = blk.moe_gate.item()
+                    mg = blk.effective_moe_gate().item()
                     moe_gates.append(mg)
                     moe_metrics[f"moe/moe_gate_b{bi}"] = mg
                     prob_ents.extend(blk.moe.last_clean_per_token_entropy)

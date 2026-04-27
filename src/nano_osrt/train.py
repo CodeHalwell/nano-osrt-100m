@@ -45,13 +45,42 @@ from nano_osrt.train_config import PretrainConfig
 
 
 def get_lr(step: int, cfg: PretrainConfig) -> float:
-    """Cosine LR with linear warmup."""
+    """Cosine LR with linear warmup, returning the AdamW/Lion peak_lr."""
     if step < cfg.warmup_steps:
         return cfg.peak_lr * step / cfg.warmup_steps
     progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
     return cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
         1 + math.cos(math.pi * progress)
     )
+
+
+def _set_param_group_lrs(
+    optimizer, step: int, cfg: PretrainConfig,
+) -> float:
+    """Apply the cosine schedule to every param group, respecting the
+    per-group `_peak_lr` / `_min_lr` tags written at construction.
+
+    Returns the AdamW/Lion-scale LR for logging. Muon groups (when
+    present) have their own peak_lr/min_lr stored on the group dict and
+    are scaled along the same cosine ratio so all optimizers reach
+    their min at the end of training.
+    """
+    if step < cfg.warmup_steps:
+        ratio = step / cfg.warmup_steps
+        for pg in optimizer.param_groups:
+            peak = pg.get("_peak_lr", cfg.peak_lr)
+            pg["lr"] = peak * ratio
+        return cfg.peak_lr * ratio
+
+    progress = (step - cfg.warmup_steps) / max(
+        cfg.total_steps - cfg.warmup_steps, 1,
+    )
+    cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
+    for pg in optimizer.param_groups:
+        peak = pg.get("_peak_lr", cfg.peak_lr)
+        floor = pg.get("_min_lr", cfg.min_lr)
+        pg["lr"] = floor + (peak - floor) * cosine_half
+    return cfg.min_lr + (cfg.peak_lr - cfg.min_lr) * cosine_half
 
 
 def get_router_gumbel_tau(step: int, cfg: PretrainConfig) -> float:
@@ -108,6 +137,25 @@ def save_checkpoint(
     print(f"  -> Checkpoint saved: {path}")
 
 
+def load_model_state_or_raise(
+    model: nn.Module,
+    state_dict: dict,
+    context: str,
+) -> None:
+    """Load model weights and fail on any key drift."""
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    missing, unexpected = inner.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        missing_sample = ", ".join(missing[:8])
+        unexpected_sample = ", ".join(unexpected[:8])
+        raise RuntimeError(
+            f"{context}: checkpoint/model key mismatch. "
+            f"missing={len(missing)} [{missing_sample}], "
+            f"unexpected={len(unexpected)} [{unexpected_sample}]. "
+            "Use an explicit migration or start a fresh checkpoint directory."
+        )
+
+
 def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -119,20 +167,15 @@ def load_checkpoint(
         return 0
     print(f"Resuming from {path}...")
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    missing, unexpected = inner.load_state_dict(
-        ckpt["model_state_dict"], strict=False,
+    load_model_state_or_raise(
+        model,
+        ckpt["model_state_dict"],
+        context=f"pretrain resume from {path}",
     )
-    if missing:
-        print(f"  Missing keys: {len(missing)}")
-        print("  Skipping optimizer state (parameter count changed)")
-    else:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        except (ValueError, RuntimeError) as e:
-            print(f"  Optimizer state mismatch, starting fresh: {e}")
-    if unexpected:
-        print(f"  Unexpected keys: {len(unexpected)}")
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    except (ValueError, RuntimeError) as e:
+        print(f"  Optimizer state mismatch, starting fresh: {e}")
     start_step = ckpt["step"] + 1
     print(f"  Resumed at step {start_step}")
     return start_step
@@ -262,6 +305,13 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     expert_mins: list[float] = []
     clean_expert_maxes: list[float] = []
     clean_expert_mins: list[float] = []
+    prebias_per_token_ents: list[float] = []
+    prebias_marginal_ents: list[float] = []
+    prebias_assign_ents: list[float] = []
+    prebias_raw_max_probs: list[float] = []
+    prebias_top_margins: list[float] = []
+    prebias_expert_maxes: list[float] = []
+    prebias_expert_mins: list[float] = []
     balance_losses: list[float] = []
     bias_abs_maxes: list[float] = []
     bias_ema_maxes: list[float] = []
@@ -269,7 +319,12 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
 
     metrics: dict = {}
     for bi, blk in enumerate(base.blocks):
-        mg = blk.moe_gate.item()
+        # Log the EFFECTIVE gate (post-softplus) — the raw parameter is
+        # an unconstrained pre-image and doesn't reflect the actual
+        # routed-branch scaling. softplus(raw) is what multiplies h_routed
+        # in RecursiveBlock.forward, so that's what matters for
+        # interpreting "is the routed branch contributing".
+        mg = blk.effective_moe_gate().item()
         moe_gates.append(mg)
         metrics[f"moe/moe_gate_b{bi}"] = mg
 
@@ -338,6 +393,34 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
                 clean_expert_maxes.append(mx)
                 clean_expert_mins.append(mn)
 
+        # Prebias raw-router telemetry — exposed by the model when the
+        # bias controller is enabled. Guarded with hasattr so older
+        # checkpoints / tests without the attribute don't crash.
+        if hasattr(blk.moe, "last_prebias_per_token_entropy"):
+            for li, v in enumerate(blk.moe.last_prebias_per_token_entropy):
+                metrics[f"moe/prebias_per_token_entropy_b{bi}_l{li}"] = v
+                prebias_per_token_ents.append(v)
+            for li, v in enumerate(blk.moe.last_prebias_marginal_entropy):
+                metrics[f"moe/prebias_marginal_entropy_b{bi}_l{li}"] = v
+                prebias_marginal_ents.append(v)
+            for li, v in enumerate(blk.moe.last_prebias_assignment_entropy):
+                metrics[f"moe/prebias_assignment_entropy_b{bi}_l{li}"] = v
+                prebias_assign_ents.append(v)
+            for li, v in enumerate(blk.moe.last_prebias_raw_max_prob):
+                metrics[f"moe/prebias_raw_max_prob_b{bi}_l{li}"] = v
+                prebias_raw_max_probs.append(v)
+            for li, v in enumerate(blk.moe.last_prebias_top_margin):
+                metrics[f"moe/prebias_top_margin_b{bi}_l{li}"] = v
+                prebias_top_margins.append(v)
+            for li, fracs in enumerate(blk.moe.last_prebias_expert_fraction):
+                if fracs:
+                    mx = max(fracs)
+                    mn = min(fracs)
+                    metrics[f"moe/prebias_expert_max_b{bi}_l{li}"] = mx
+                    metrics[f"moe/prebias_expert_min_b{bi}_l{li}"] = mn
+                    prebias_expert_maxes.append(mx)
+                    prebias_expert_mins.append(mn)
+
     metrics["moe/per_token_entropy_mean"] = _mean(per_token_ents)
     metrics["moe/marginal_entropy_mean"] = _mean(marginal_ents)
     metrics["moe/assignment_entropy_mean"] = _mean(assign_ents)
@@ -358,6 +441,13 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     metrics["moe/bias_abs_max_mean"] = _mean(bias_abs_maxes)
     metrics["moe/bias_ema_max_mean"] = _mean(bias_ema_maxes)
     metrics["moe/bias_ema_min_mean"] = _mean(bias_ema_mins)
+    metrics["moe/prebias_per_token_entropy_mean"] = _mean(prebias_per_token_ents)
+    metrics["moe/prebias_marginal_entropy_mean"] = _mean(prebias_marginal_ents)
+    metrics["moe/prebias_assignment_entropy_mean"] = _mean(prebias_assign_ents)
+    metrics["moe/prebias_raw_max_prob_mean"] = _mean(prebias_raw_max_probs)
+    metrics["moe/prebias_top_margin_mean"] = _mean(prebias_top_margins)
+    metrics["moe/prebias_expert_max_mean"] = _mean(prebias_expert_maxes)
+    metrics["moe/prebias_expert_min_mean"] = _mean(prebias_expert_mins)
 
     summary = {
         "per_token_H": _mean(per_token_ents),
@@ -380,6 +470,13 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
         "bias_abs_max": _mean(bias_abs_maxes),
         "bias_ema_max": _mean(bias_ema_maxes),
         "bias_ema_min": _mean(bias_ema_mins),
+        "prebias_per_token_H": _mean(prebias_per_token_ents),
+        "prebias_marginal_H": _mean(prebias_marginal_ents),
+        "prebias_assign_H": _mean(prebias_assign_ents),
+        "prebias_raw_max": _mean(prebias_raw_max_probs),
+        "prebias_top_margin": _mean(prebias_top_margins),
+        "prebias_expert_max": _mean(prebias_expert_maxes),
+        "prebias_expert_min": _mean(prebias_expert_mins),
     }
     return metrics, summary
 
@@ -430,12 +527,25 @@ def _average_moe_snapshots(
         "bias_abs_max": avg.get("moe/bias_abs_max_mean", 0.0),
         "bias_ema_max": avg.get("moe/bias_ema_max_mean", 0.0),
         "bias_ema_min": avg.get("moe/bias_ema_min_mean", 0.0),
+        "prebias_per_token_H": avg.get(
+            "moe/prebias_per_token_entropy_mean", 0.0,
+        ),
+        "prebias_marginal_H": avg.get(
+            "moe/prebias_marginal_entropy_mean", 0.0,
+        ),
+        "prebias_assign_H": avg.get(
+            "moe/prebias_assignment_entropy_mean", 0.0,
+        ),
+        "prebias_raw_max": avg.get("moe/prebias_raw_max_prob_mean", 0.0),
+        "prebias_top_margin": avg.get("moe/prebias_top_margin_mean", 0.0),
+        "prebias_expert_max": avg.get("moe/prebias_expert_max_mean", 0.0),
+        "prebias_expert_min": avg.get("moe/prebias_expert_min_mean", 0.0),
     }
     return avg, summary
 
 
 def _check_early_stop_criteria(
-    step: int, summary: dict, cfg: PretrainConfig,
+    step: int, summary: dict, cfg: PretrainConfig, model_cfg: NanoOSRTConfig,
 ) -> list[str]:
     """Return list of failing criteria (empty means all pass)."""
     failures: list[str] = []
@@ -466,6 +576,36 @@ def _check_early_stop_criteria(
             f"clean_marginal_entropy {marginal_h:.3f} < "
             f"{cfg.min_marginal_entropy:.3f} (dead/overloaded experts)"
         )
+    prebias_marginal_h = summary.get("prebias_marginal_H", marginal_h)
+    min_prebias_marginal = getattr(
+        cfg, "min_prebias_marginal_entropy", cfg.min_marginal_entropy,
+    )
+    if prebias_marginal_h < min_prebias_marginal:
+        failures.append(
+            f"prebias_marginal_entropy {prebias_marginal_h:.3f} < "
+            f"{min_prebias_marginal:.3f} "
+            "(learned router collapsed before balance bias)"
+        )
+    prebias_expert_min = summary.get("prebias_expert_min", 1.0)
+    min_prebias_expert = getattr(cfg, "min_prebias_expert_fraction", 0.0)
+    if prebias_expert_min < min_prebias_expert:
+        failures.append(
+            f"prebias_expert_min {prebias_expert_min:.4f} < "
+            f"{min_prebias_expert:.4f} "
+            "(one or more experts are dead before balance bias)"
+        )
+    bias_limit = (
+        model_cfg.router_balance_bias_max
+        * getattr(cfg, "max_bias_saturation_fraction", 1.0)
+    )
+    if model_cfg.router_balance_bias_enabled and bias_limit > 0:
+        bias_abs_max = summary.get("bias_abs_max", 0.0)
+        if bias_abs_max > bias_limit:
+            failures.append(
+                f"router_balance_bias_abs_max {bias_abs_max:.3f} > "
+                f"{bias_limit:.3f} "
+                "(bias controller is near saturation and may be masking collapse)"
+            )
     return failures
 
 
@@ -575,44 +715,96 @@ def run_training(
         wandb.init(**wandb_kwargs)
         print("W&B logging enabled.")
 
-    # Optimizer — router/loop_embeddings get wd=0 (they're routing-sensitive)
+    # Optimizer — router/loop_embeddings get wd=0 (they're routing-sensitive).
+    # Three branches today:
+    #   "lion"  — single Lion over all params (router gets a wd=0 group)
+    #   "muon"  — hybrid Muon (2D matrix weights) + AdamW (embeddings,
+    #             norms, scalars, router/loop_embeddings)
+    #   else    — AdamW fallback
     inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    router_params = []
-    other_params = []
-    for name, param in inner_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "router" in name or "loop_embeddings" in name:
-            router_params.append(param)
-        else:
-            other_params.append(param)
 
-    print(
-        f"Param groups: {len(other_params)} standard, "
-        f"{len(router_params)} router (wd=0)"
-    )
-
-    if train_cfg.optimizer_name.lower() == "lion":
-        from lion_pytorch import Lion
-        optimizer = Lion(
-            [
-                {"params": other_params, "weight_decay": train_cfg.weight_decay},
-                {"params": router_params, "weight_decay": 0.0},
-            ],
-            lr=train_cfg.peak_lr,
+    if train_cfg.optimizer_name.lower() == "muon":
+        from nano_osrt.muon import (
+            HybridMuonAdamW,
+            Muon,
+            build_param_groups,
         )
-        print(f"Using Lion (wd={train_cfg.weight_decay}, router_wd=0.0)")
-    else:
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": other_params, "weight_decay": train_cfg.weight_decay},
-                {"params": router_params, "weight_decay": 0.0},
-            ],
+
+        muon_params, adamw_groups = build_param_groups(
+            inner_model.named_parameters(),
+            weight_decay=train_cfg.weight_decay,
+        )
+        # Muon LR is much smaller-magnitude than Lion/AdamW because the
+        # Newton-Schulz update is normalised. Keep it as a separate
+        # config knob so users can A/B without nuking the Lion peak_lr.
+        muon_lr = getattr(train_cfg, "muon_lr", train_cfg.peak_lr)
+        muon = Muon(
+            muon_params,
+            lr=muon_lr,
+            momentum=0.95,
+            nesterov=True,
+            weight_decay=train_cfg.weight_decay,
+        )
+        adamw = torch.optim.AdamW(
+            adamw_groups,
             lr=train_cfg.peak_lr,
             betas=(0.9, 0.95),
             eps=1e-8,
         )
-        print(f"Using AdamW (wd={train_cfg.weight_decay}, router_wd=0.0)")
+        # Tag each group with its peak/min for the cosine schedule.
+        muon_min = getattr(train_cfg, "muon_min_lr", muon_lr * 0.1)
+        for pg in muon.param_groups:
+            pg["_peak_lr"] = muon_lr
+            pg["_min_lr"] = muon_min
+        for pg in adamw.param_groups:
+            pg["_peak_lr"] = train_cfg.peak_lr
+            pg["_min_lr"] = train_cfg.min_lr
+        optimizer = HybridMuonAdamW(muon, adamw)
+        n_muon = len(muon_params)
+        n_adamw = sum(len(g["params"]) for g in adamw_groups)
+        print(
+            f"Using Muon+AdamW hybrid: {n_muon} matrix tensors → Muon "
+            f"(lr={muon_lr}), {n_adamw} other tensors → AdamW "
+            f"(lr={train_cfg.peak_lr}, wd={train_cfg.weight_decay} "
+            f"on non-norm/non-embed only)"
+        )
+    else:
+        router_params = []
+        other_params = []
+        for name, param in inner_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "router" in name or "loop_embeddings" in name:
+                router_params.append(param)
+            else:
+                other_params.append(param)
+
+        print(
+            f"Param groups: {len(other_params)} standard, "
+            f"{len(router_params)} router (wd=0)"
+        )
+
+        if train_cfg.optimizer_name.lower() == "lion":
+            from lion_pytorch import Lion
+            optimizer = Lion(
+                [
+                    {"params": other_params, "weight_decay": train_cfg.weight_decay},
+                    {"params": router_params, "weight_decay": 0.0},
+                ],
+                lr=train_cfg.peak_lr,
+            )
+            print(f"Using Lion (wd={train_cfg.weight_decay}, router_wd=0.0)")
+        else:
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": other_params, "weight_decay": train_cfg.weight_decay},
+                    {"params": router_params, "weight_decay": 0.0},
+                ],
+                lr=train_cfg.peak_lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            )
+            print(f"Using AdamW (wd={train_cfg.weight_decay}, router_wd=0.0)")
 
     # Checkpoint resume.
     # Three kinds of checkpoints with different naming:
@@ -723,10 +915,10 @@ def run_training(
                 "batch_size", train_cfg.batch_size,
             )
 
-        lr = get_lr(step, train_cfg)
+        # Schedule writes per-group LRs honouring _peak_lr / _min_lr
+        # tags, returning the AdamW/Lion-scale LR for stdout/W&B logs.
+        lr = _set_param_group_lrs(optimizer, step, train_cfg)
         router_gumbel_tau = get_router_gumbel_tau(step, train_cfg)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
         set_router_gumbel_tau(model, router_gumbel_tau)
 
         # Gradient checkpointing: on for long seq_len to save memory.
@@ -858,6 +1050,16 @@ def run_training(
                 f"emin={moe_summary['clean_expert_min']:.3f}",
                 flush=True,
             )
+            print(
+                f"           prebias: "
+                f"pte={moe_summary['prebias_per_token_H']:.3f} "
+                f"marg={moe_summary['prebias_marginal_H']:.3f} "
+                f"raw_max={moe_summary['prebias_raw_max']:.3f} "
+                f"margin={moe_summary['prebias_top_margin']:.3f} "
+                f"emax={moe_summary['prebias_expert_max']:.3f} "
+                f"emin={moe_summary['prebias_expert_min']:.3f}",
+                flush=True,
+            )
 
             if use_wandb:
                 log_dict = {
@@ -906,7 +1108,9 @@ def run_training(
             # Use the grad-accum-averaged summary from this step — not a
             # single-batch snapshot — so the gate isn't tripped by sample
             # noise on a 16k-token micro-batch.
-            failures = _check_early_stop_criteria(step, moe_summary, train_cfg)
+            failures = _check_early_stop_criteria(
+                step, moe_summary, train_cfg, model_config,
+            )
             if failures:
                 print(
                     f"\n>>> EARLY STOP at step {step}: "

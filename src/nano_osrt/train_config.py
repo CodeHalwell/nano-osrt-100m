@@ -11,6 +11,87 @@ Progressive curriculum:
 Post-training:
   SFT:  Balanced math + code + STEM + general (native tag format)
   GRPO: Verifiable math rewards
+
+
+# Optimizer × routing ablation (Foundation-matched cells)
+# ──────────────────────────────────────────────────────────────────────
+
+Ran A/B/C to 1200 steps in `--stage ablate`; stopped D at step 600
+once its task loss remained tied with C but the raw router had already
+collapsed. Headline numbers:
+
+| Cell | Optimizer | Aux  | Best / seen task | prebias emin | bal  |
+|------|-----------|-----:|-----------------:|-------------:|-----:|
+| A    | Lion      | 0.10 |             ~7.0 |       ~0.002 | ~1.2 |
+| B    | Lion      | 0.0  |             ~7.6 |        0.000 | ~3.9 |
+| C    | Muon      | 0.10 |         **3.43** |    **0.105** | 1.02 |
+| D    | Muon      | 0.0  |   4.66 @ step 600|       ~0.001 | ~2.3 |
+
+Three load-bearing conclusions that drive the v5 defaults:
+
+1. Muon is a ~4-nat task-loss win at this scale, regardless of routing
+   scheme. C and D both hit task < 5.0 by step 450; A and B were still
+   at ~7.2 there.
+2. Gradient aux loss is necessary for router health regardless of
+   optimizer — bias controller alone collapses the raw router under
+   both Lion and Muon. The DeepSeek-V3 "auxiliary-loss-free" claim
+   does not hold at 363M params on this curriculum.
+3. C (Muon + aux) is the production recipe: best loss, best balance,
+   best emin, best margin. D gets C's loss but with B-style collapse
+   on the raw router, which would degrade once task complexity grows
+   beyond what 2-3 active experts can fit (Phases 2/3).
+
+Defaults below reflect this. To rerun the ablation, use --stage ablate.
+
+
+# Optional A/B configurations
+# ──────────────────────────────────────────────────────────────────────
+
+DeepSeek-style aux-loss-free routing (research only; failed here)
+-----------------------------------------------------------------
+v5 ships with both a gradient-driven Switch balance aux loss
+(coefficient `router_aux_loss_coeff`, default 0.10) and a
+non-gradient per-loop bias controller (`router_balance_bias_*`).
+DeepSeek-V3 reports that the bias controller alone is sufficient on
+their 671B model, and that removing the gradient aux loss eliminates
+the well-known specialisation-vs-balance tradeoff (the gradient term
+forces uniformity even when token-context says it shouldn't).
+
+The v5 ablation rejected that recipe at 363M params: both bias-only
+cells collapsed the raw pre-bias router. Cell D proved why clean
+metrics are not enough: Muon kept task loss near Cell C through step
+600, but prebias emin fell to ~0.001 and the model was effectively
+using only a small expert subset. Treat aux-loss-free runs as research
+or failure-reproduction only unless the routing algorithm itself
+changes.
+
+To reproduce aux-loss-free routing on this codebase, override the model
+config when constructing it:
+
+    model_config = NanoOSRTConfig(
+        router_aux_loss_coeff=0.0,        # disable gradient aux
+        router_balance_bias_enabled=True, # keep bias controller
+        router_balance_bias_update_rate=0.10,
+        ...,
+    )
+
+The clean four-metric Phase-1 health gate is not sufficient for this
+experiment because the bias controller can hide collapse. Watch the
+raw metrics instead:
+`moe/prebias_marginal_entropy_mean`,
+`moe/prebias_expert_min_mean`,
+`moe/prebias_raw_max_prob_mean`, and
+`moe/prebias_top_margin_mean`.
+If `moe/prebias_expert_min_mean` falls near zero while task loss still
+looks good, the recipe has failed even if clean balance appears healthy.
+
+Sweep template (drop into app.py near the existing `sweep` stage)::
+
+    sweep_configs = [
+        {"name": "aux_only",  "aux": 0.10, "bias": True},   # current default
+        {"name": "bias_only", "aux": 0.0,  "bias": True},   # DeepSeek-style
+        {"name": "both_low",  "aux": 0.03, "bias": True},   # belt + braces
+    ]
 """
 
 
@@ -30,12 +111,35 @@ class PretrainConfig:
     eval_interval: int = 1_000
     eval_steps: int = 20           # number of batches per eval
     ckpt_interval: int = 1_000
-    optimizer_name: str = "lion"
+    # Default optimizer is Muon hybrid (Muon for 2D matrix weights,
+    # AdamW for embeddings/norms/scalars/router/loop_embeddings). The
+    # 1200-step ablation (A/B/C to completion; D stopped at step 600)
+    # showed Muon+aux delivers a
+    # ~4-nat task-loss improvement over Lion+aux at step 1200 (cell C
+    # task ~3.4 vs cell A task ~7.4) AND keeps the learned pre-bias
+    # routed-expert population balanced (prebias emin > 0.10 vs cell A's
+    # late-warmup collapse to emin < 0.01). Lion is still available
+    # via optimizer_name="lion" for comparison runs. AdamW is the
+    # fallback when optimizer_name is anything else.
+    optimizer_name: str = "muon"
+    # Muon LR (used only when optimizer_name == "muon"). The Newton-Schulz
+    # update is normalised, so Muon's effective step size is much smaller
+    # per parameter than Lion/AdamW. The 1200-step Cell C run held
+    # task-loss steady at lr=0.02 through 23 % of warmup with no fatal
+    # divergence. If a full Phase 1 (10k steps, peak at step 3000)
+    # destabilises, drop to 0.015 first — that's the next thing to
+    # try before deeper changes. AdamW (the other half of the hybrid)
+    # keeps using peak_lr / min_lr.
+    muon_lr: float = 0.02
+    muon_min_lr: float = 2e-3
 
     # Weights & Biases
     wandb_log: bool = True
     wandb_project: str = "nano-osrt"
-    wandb_run_name: str = "osrt-pretrain"
+    # Suffix the optimizer in the W&B name so dashboard runs from
+    # different optimizer configs don't visually pile up on top of the
+    # historical Lion runs. Override per-run if you want a custom label.
+    wandb_run_name: str = "osrt-pretrain-muon"
     wandb_run_id: str = ""
 
     # --- Success criteria for Phase 1 (Foundation) ---
@@ -48,6 +152,12 @@ class PretrainConfig:
     min_raw_max_prob: float = 0.30             # well above uniform 1/8 = 0.125
     min_top_margin: float = 0.10               # clear gap between rank 0 and 1
     min_marginal_entropy: float = 1.80         # balanced across experts
+    # The four checks above use clean deployed routing (router + balance bias).
+    # These guardrails make sure the learned pre-bias router is not secretly
+    # collapsed while the non-gradient bias controller hides it.
+    min_prebias_marginal_entropy: float = 1.55
+    min_prebias_expert_fraction: float = 0.01
+    max_bias_saturation_fraction: float = 0.85
 
     # --- Router exploration ---
     # Sanity runs showed experts can die during the first 20 optimizer steps:

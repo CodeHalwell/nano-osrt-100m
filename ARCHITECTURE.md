@@ -153,8 +153,9 @@ This gives each expert a different feature subspace to start from. Gradients pus
 
 ### Phase 1 — Foundation (10k steps, seq_len 2048, B=8, accum=8)
 - FineWeb-Edu (60%) + CodeParrot (40%)
-- peak_lr 6e-4, cosine
-- Lion optimiser (w/d 0.3)
+- peak_lr 6e-4 (AdamW side), 0.02 (Muon side), both cosine
+- **Muon hybrid optimiser** (Muon for 2D matrix weights, AdamW for
+  embeddings/norms/router/scalars). w/d 0.3 on Muon-managed weights.
 - ckpt every 1000 steps
 - **Success criteria** (v4 would have failed all four by step 5k):
   - `moe/clean_per_token_entropy` drops below 1.5 from initial ~2.08 (ln 8) — router
@@ -181,6 +182,43 @@ This gives each expert a different feature subspace to start from. Gradients pus
 - Phase 3: ~8h H100 = ~$32
 - **Total pretrain: ~$140** (realistic for a clean run)
 - Add SFT + GRPO: ~$40
+
+---
+
+## Optimizer × routing ablation (settled)
+
+A 2×2 ablation at 1200 Foundation-matched steps drove the v5 production
+defaults. Run it again with `modal run app.py --stage ablate`.
+
+| Cell | Optimizer | Aux  | Final task | clean emin | bal  | Verdict                                 |
+|------|-----------|-----:|-----------:|-----------:|-----:|-----------------------------------------|
+| A    | Lion      | 0.10 |       ~7.4 |     ~0.002 | ~1.2 | Baseline; partial late-warmup collapse  |
+| B    | Lion      | 0.0  |       ~7.6 |      0.000 | ~3.9 | Bias-only collapses by step 500         |
+| C    | Muon      | 0.10 |   **3.43** |  **0.105** | 1.02 | **Production recipe**                   |
+| D    | Muon      | 0.0  |    ~4.7    |     ~0.001 | ~2.3 | Same loss as C, B-style collapsed router |
+
+Three load-bearing conclusions:
+
+1. **Muon is a ~4-nat task-loss win** at this scale, regardless of
+   routing scheme. Cells C and D both crossed `task < 5.0` by step
+   450, while A and B were still around 7.2 there. The Newton-Schulz
+   orthogonalisation of the momentum update equalises step sizes
+   across singular directions, which is exactly what helps cold MoE
+   experts get useful gradient instead of being shrunk into oblivion
+   by Adam-style per-coordinate variance scaling.
+2. **Gradient aux loss is necessary for router health**, regardless
+   of optimiser. The bias controller alone collapses the raw router
+   under both Lion and Muon. The DeepSeek-V3 "auxiliary-loss-free"
+   claim is reportedly stable at 671B but does not hold at 363M on
+   this curriculum.
+3. **C is the production recipe.** Best loss, best balance, best emin,
+   best margin. D buys C's loss while letting the raw router degenerate
+   to 2-3 active experts — fine at Phase 1 difficulty, but Phase 2/3
+   will need the unused expert capacity that D throws away.
+
+The earlier v4 plan called for Lion (`w/d 0.3`); v5 keeps Lion as a
+fallback (`optimizer_name="lion"` in `train_config.PretrainConfig`) for
+A/B comparison runs, but the Muon hybrid is the default.
 
 ---
 

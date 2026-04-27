@@ -348,6 +348,176 @@ def sweep():
 
 
 # =============================================================================
+# OPTIMIZER × ROUTING ABLATION (cells A/B/C/D, 1200 steps each)
+# =============================================================================
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=21600,  # 6h for 4 sequential 1200-step runs (~80-90 min total + headroom)
+)
+def ablate():
+    """Optimizer × routing ablation, 1200 Foundation-matched steps per cell.
+
+    Reads each cell against:
+      - the four-metric clean health gate (Phase 1 success criteria)
+      - the three new prebias guards (router not collapsed under bias)
+
+    Cells:
+      | Cell | Optimizer   | Aux  | Routing      | Purpose              |
+      |------|-------------|-----:|--------------|----------------------|
+      | A    | Lion        | 0.10 | aux + bias   | old optimizer base   |
+      | B    | Lion        | 0.0  | bias only    | aux-loss isolation   |
+      | C    | Muon hybrid | 0.10 | aux + bias   | production default   |
+      | D    | Muon hybrid | 0.0  | bias only    | aux-free failure     |
+
+    Reading guide:
+      - If A passes the clean gate but B fails marginal_entropy below 1.5 →
+        the bias controller alone can't hold balance at this scale; keep aux.
+      - If A and C both pass but C reaches lower task loss at step 1200 →
+        Muon is paying off on the matrix updates; keep it for full pretrain.
+      - If any cell trips a prebias guard (clean passes, raw collapses) →
+        the bias controller is hiding raw-router collapse and the cell is
+        misleading; do NOT promote that recipe to a full run.
+
+    Each cell runs 1200 steps with Foundation-matched warmup (3000) so the
+    first ~1000 steps are LR-warmup territory — exactly when v4 saw expert
+    death. The 5k clean health gate is disabled because 1200 steps isn't
+    enough to calibrate it.
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_training
+    from nano_osrt.train_config import PretrainConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    model_config_kwargs = dict(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    cells = [
+        {
+            "name": "A",
+            "label": "lion+aux (baseline)",
+            "wandb_name": "osrt-ablate-A-lion-aux",
+            "ckpt_dir": "/vol/checkpoints/v5-ablate-A",
+            "optimizer_name": "lion",
+            "aux_coeff": 0.10,
+        },
+        {
+            "name": "B",
+            "label": "lion+bias-only",
+            "wandb_name": "osrt-ablate-B-lion-biasonly",
+            "ckpt_dir": "/vol/checkpoints/v5-ablate-B",
+            "optimizer_name": "lion",
+            "aux_coeff": 0.0,
+        },
+        {
+            "name": "C",
+            "label": "muon+aux",
+            "wandb_name": "osrt-ablate-C-muon-aux",
+            "ckpt_dir": "/vol/checkpoints/v5-ablate-C",
+            "optimizer_name": "muon",
+            "aux_coeff": 0.10,
+        },
+        {
+            "name": "D",
+            "label": "muon+bias-only",
+            "wandb_name": "osrt-ablate-D-muon-biasonly",
+            "ckpt_dir": "/vol/checkpoints/v5-ablate-D",
+            "optimizer_name": "muon",
+            "aux_coeff": 0.0,
+        },
+    ]
+
+    for cell in cells:
+        # Skip cells that already produced a final checkpoint. Lets us
+        # crash-recover the ablation without paying for cells that
+        # already finished — important because cell A is ~$1 of compute.
+        final_ckpt = f"{cell['ckpt_dir']}/osrt_v5_final.pt"
+        if os.path.exists(final_ckpt):
+            print("=" * 60)
+            print(
+                f"ABLATE CELL {cell['name']}: SKIP — final checkpoint "
+                f"already exists at {final_ckpt}"
+            )
+            print("=" * 60)
+            print(f"\n>>> Cell {cell['name']} ({cell['label']}) skipped.\n")
+            continue
+
+        print("=" * 60)
+        print(
+            f"ABLATE CELL {cell['name']}: {cell['label']} "
+            f"(optimizer={cell['optimizer_name']}, aux={cell['aux_coeff']})"
+        )
+        print("=" * 60)
+
+        # Each cell carries the new architectural defaults from today's
+        # session: Z-loss on, seq-balance off, QK-Norm always-on,
+        # softplus moe_gate, bias controller on. Only optimizer + aux
+        # coefficient vary across cells.
+        model_config = NanoOSRTConfig(
+            router_aux_loss_coeff=cell["aux_coeff"],
+            router_balance_bias_enabled=True,
+            **model_config_kwargs,
+        )
+
+        class AblateConfig(PretrainConfig):
+            # 1200 Foundation-matched steps — long enough to see expert
+            # death during LR warmup but short enough that 4 cells fit
+            # in one Modal run.
+            total_steps = 1200
+            warmup_steps = 3000
+            log_interval = 50
+            # Eval skipped — pays a 10-15 min FineWeb skip for telemetry
+            # we already get from the four-metric health gate at every step.
+            eval_interval = 10_000_000
+            ckpt_interval = 600
+            # Match the production Gumbel schedule so noise survives peak LR.
+            router_gumbel_tau_init = 0.5
+            router_gumbel_tau_final = 0.0
+            router_gumbel_anneal_steps = 4000
+            # 5k gate is calibrated for the full Foundation phase — at 1200
+            # steps it would always trip, so disable it. Read the clean gate
+            # plus the three prebias guards manually from W&B instead.
+            early_stop_check_step = 10_000_000
+
+        cfg = AblateConfig()
+        cfg.optimizer_name = cell["optimizer_name"]
+        cfg.wandb_run_name = cell["wandb_name"]
+
+        os.makedirs(cell["ckpt_dir"], exist_ok=True)
+        run_training(
+            model_config, cfg, vol, tokenizer_path,
+            ckpt_dir=cell["ckpt_dir"],
+        )
+        print(f"\n>>> Cell {cell['name']} ({cell['label']}) complete.\n")
+
+
+# =============================================================================
 # SFT
 # =============================================================================
 
@@ -432,7 +602,7 @@ def grpo():
     from nano_osrt.hra import get_param_groups, inject_hra
     from nano_osrt.model import NanoOSRTForCausalLM
     from nano_osrt.rewards import compute_group_advantages, compute_reward
-    from nano_osrt.train import apply_router_balance_updates
+    from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
     from nano_osrt.train_config import GRPOConfig
 
     device = torch.device("cuda")
@@ -473,13 +643,10 @@ def grpo():
     print(f"Loading SFT weights from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
-    if unexpected:
-        print(f"  UNEXPECTED keys ({len(unexpected)}): sample {unexpected[:3]}")
-    if not missing and not unexpected:
-        print("  Clean load: all keys matched.")
+    load_model_state_or_raise(
+        model, state_dict, context=f"GRPO SFT load from {ckpt_path}",
+    )
+    print("  Clean load: all keys matched.")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
@@ -499,6 +666,17 @@ def grpo():
     # eager-mode forward per decode step (shape changes each step
     # would trigger recompilation anyway).
     inner_for_gen = model._orig_mod if hasattr(model, "_orig_mod") else model
+    # Hold the policy in eval mode for the entire GRPO step so that the
+    # rollout (generate) and the log-prob recompute (model(...)) see the
+    # same routing distribution. With train(True) the MoE layer enforces
+    # capacity drops (model.py:394-398), so dropped (token, expert) pairs
+    # collapse to "shared expert + residual" only — different logits than
+    # the no-drop rollout. That makes the assumed importance ratio ≈ 1
+    # invalid and biases the policy gradient. The bias controller's
+    # accumulators are gated on self.training so they simply don't update
+    # during GRPO; the controller is already learned in pretrain.
+    inner_for_gen.train(False)
+    ref_model.train(False)
 
     # W&B
     use_wandb = cfg.wandb_log and wandb is not None
@@ -562,7 +740,11 @@ def grpo():
             best_grpo_ckpt, map_location=device, weights_only=True,
         )
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-        inner.load_state_dict(grpo_ckpt["model_state_dict"], strict=False)
+        load_model_state_or_raise(
+            inner,
+            grpo_ckpt["model_state_dict"],
+            context=f"GRPO resume from {best_grpo_ckpt}",
+        )
         try:
             optimizer.load_state_dict(grpo_ckpt["optimizer_state_dict"])
         except Exception as e:
@@ -628,7 +810,6 @@ def grpo():
             # built into NanoOSRTForCausalLM.generate(), decoding all
             # group_size samples in parallel at O(1) attention cost
             # per step.
-            inner_for_gen.train(False)
             prompt_batch = prompt_tensor.expand(
                 cfg.group_size, -1,
             ).contiguous()
@@ -655,7 +836,6 @@ def grpo():
                     completions.append(row[: prompt_len + first_eos + 1])
                 else:
                     completions.append(row)
-            inner_for_gen.train(True)
 
             # Score — IMPORTANT: skip_special_tokens=False so native tags
             # like <|think|>, <|answer|> survive decoding for the reward
@@ -814,6 +994,7 @@ def main(stage: str = "pretrain"):
 
     --stage sanity     200-step smoke test (config A)
     --stage sweep      Gumbel schedule sweep (configs B, C, D)
+    --stage ablate     Optimizer × routing ablation (cells A/B/C/D, 1200 steps each)
     --stage pretrain   Full pre-training with progressive seq_len curriculum
     --stage sft        Balanced SFT on the final pretrained checkpoint
     --stage grpo       GRPO RL on the SFT checkpoint (verifiable math rewards)
@@ -822,6 +1003,8 @@ def main(stage: str = "pretrain"):
         sanity.remote()
     elif stage == "sweep":
         sweep.remote()
+    elif stage == "ablate":
+        ablate.remote()
     elif stage == "pretrain":
         pretrain.remote()
     elif stage == "sft":
@@ -831,5 +1014,5 @@ def main(stage: str = "pretrain"):
     else:
         print(
             f"Unknown stage: {stage}. "
-            f"Use sanity, sweep, pretrain, sft, or grpo"
+            f"Use sanity, sweep, ablate, pretrain, sft, or grpo"
         )
