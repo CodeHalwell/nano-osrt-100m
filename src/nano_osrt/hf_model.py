@@ -262,12 +262,22 @@ class NanoOSRTForCausalLM(nn.Module):
 
             # Repetition penalty: reduce logits for tokens already generated
             if repetition_penalty != 1.0:
-                for token_id in set(generated[0].tolist()):
-                    if token_id < next_logits.shape[-1]:
-                        if next_logits[0, token_id] > 0:
-                            next_logits[0, token_id] /= repetition_penalty
-                        else:
-                            next_logits[0, token_id] *= repetition_penalty
+                V = next_logits.shape[-1]
+                valid_generated = generated.masked_fill(generated >= V, 0)
+
+                penalty_mask = torch.zeros_like(next_logits, dtype=torch.bool)
+                penalty_mask.scatter_(1, valid_generated, True)
+                penalty_mask[:, 0] = (generated == 0).any(dim=1)
+
+                next_logits = torch.where(
+                    penalty_mask & (next_logits > 0),
+                    next_logits / repetition_penalty,
+                    torch.where(
+                        penalty_mask,
+                        next_logits * repetition_penalty,
+                        next_logits
+                    )
+                )
 
             if temperature > 0:
                 next_logits = next_logits / temperature
@@ -292,7 +302,7 @@ class NanoOSRTForCausalLM(nn.Module):
 
             generated = torch.cat([generated, next_token], dim=1)
 
-            if next_token.item() == eos_token_id:
+            if (next_token == eos_token_id).all():
                 break
 
         return generated
