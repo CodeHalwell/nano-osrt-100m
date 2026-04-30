@@ -41,12 +41,29 @@ uv sync                          # installs pinned deps from uv.lock
 
 ### 3. Set secrets
 
-In the Studio's "Secrets" tab (or just export in shell):
+Three ways, pick one:
 
+**A. `.env` file in the repo root** (auto-loaded by `train_main.py`):
 ```bash
-export WANDB_API_KEY=...   # from https://wandb.ai/authorize
-export HF_TOKEN=...        # if your HF datasets need auth (FineWeb-Edu doesn't)
+cat > .env <<'EOF'
+WANDB_API_KEY=...   # from https://wandb.ai/authorize
+HF_TOKEN=...        # lifts HF rate limits; required for gated datasets
+EOF
 ```
+Variable names matter — use `WANDB_API_KEY` exactly (wandb's library
+reads that specific name). `.env` is gitignored.
+
+**B. Shell exports** (per-session):
+```bash
+export WANDB_API_KEY=...
+export HF_TOKEN=...
+```
+
+**C. Lightning Studio Secrets manager** (survives Studio restarts):
+- Studio → Settings → Secrets → add `WANDB_API_KEY` and `HF_TOKEN`
+- Lightning auto-exposes them as env vars in every shell.
+
+A is most convenient for one-off runs; C is best for repeat use.
 
 ### 4. Sync the tokenizer + checkpoint
 

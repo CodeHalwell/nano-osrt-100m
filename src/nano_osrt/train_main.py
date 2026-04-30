@@ -35,6 +35,17 @@ from nano_osrt.config import NanoOSRTConfig
 from nano_osrt.train import run_training
 from nano_osrt.train_config import PretrainConfig
 
+# Load .env from cwd if present so users can drop WANDB_API_KEY +
+# HF_TOKEN into a local .env file instead of exporting in shell. Made
+# optional — if python-dotenv isn't installed, fall through silently
+# and let users use plain `export` or platform secrets managers.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 
 class _LocalVol:
     """Volume stub that satisfies `run_training`'s `vol.commit()` calls
