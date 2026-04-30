@@ -110,7 +110,11 @@ class PretrainConfig:
     log_interval: int = 50
     eval_interval: int = 1_000
     eval_steps: int = 20           # number of batches per eval
-    ckpt_interval: int = 1_000
+    # Frequent ckpts protect against budget-driven Modal kills: with a
+    # capped credit pool, the function dies hard (no clean shutdown,
+    # no rescue ckpt) when the wallet hits zero. 500-step intervals
+    # bound progress loss to ~30 min on H100 at this throughput.
+    ckpt_interval: int = 500
     # Default optimizer is Muon hybrid (Muon for 2D matrix weights,
     # AdamW for embeddings/norms/scalars/router/loop_embeddings). The
     # 1200-step ablation (A/B/C to completion; D stopped at step 600)
