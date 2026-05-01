@@ -262,12 +262,19 @@ class NanoOSRTForCausalLM(nn.Module):
 
             # Repetition penalty: reduce logits for tokens already generated
             if repetition_penalty != 1.0:
-                for token_id in set(generated[0].tolist()):
-                    if token_id < next_logits.shape[-1]:
-                        if next_logits[0, token_id] > 0:
-                            next_logits[0, token_id] /= repetition_penalty
-                        else:
-                            next_logits[0, token_id] *= repetition_penalty
+                # Vectorized batch-aware repetition penalty
+                # O(1) PyTorch operations instead of O(seq_len) Python loop
+                # Also works for batch_size > 1
+                for b in range(generated.shape[0]):
+                    unique_tokens = generated[b].unique()
+                    valid_tokens = unique_tokens[unique_tokens < next_logits.shape[-1]]
+                    if valid_tokens.numel() > 0:
+                        logits_to_penalize = next_logits[b, valid_tokens]
+                        next_logits[b, valid_tokens] = torch.where(
+                            logits_to_penalize > 0,
+                            logits_to_penalize / repetition_penalty,
+                            logits_to_penalize * repetition_penalty
+                        )
 
             if temperature > 0:
                 next_logits = next_logits / temperature
