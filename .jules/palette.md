@@ -1,0 +1,3 @@
+## 2024-05-05 - Enhance Gradio Inputs with Autofocus and Tooltips
+**Learning:** Adding `autofocus=True` to the primary input component (like `gr.Textbox`) significantly improves keyboard accessibility and user flow by eliminating an unnecessary click. Additionally, using the `info` parameter on complex input components (like `gr.Slider` for generation parameters) serves as built-in, accessible tooltips that guide users without cluttering the UI with separate text blocks.
+**Action:** When designing or refactoring Gradio interfaces, always consider which element should have `autofocus` on load, and use `info` for any setting that requires technical explanation to help users understand what the controls do.
