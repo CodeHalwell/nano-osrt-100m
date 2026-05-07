@@ -202,8 +202,16 @@ class PretrainConfig:
             "start": 9_500,
             "end": 250_000,
             "seq_len": 4096,
-            "batch_size": 4,
-            "grad_accum_steps": 16,
+            # Bumped from batch_size=4, grad_accum_steps=16 once the
+            # grad-checkpointing threshold was raised (see train.py
+            # commit 57513a9). At seq_len 4096 with no checkpointing,
+            # H100 80GB has plenty of room — 49 GB used at batch 4.
+            # Batch 8 keeps the same effective batch (8*8=64 sequences)
+            # with half the accumulation overhead. If a future GPU is
+            # tighter on VRAM, drop batch_size back to 4 with
+            # grad_accum_steps=16.
+            "batch_size": 8,
+            "grad_accum_steps": 8,
             "datasets": [
                 {
                     "name": "fineweb-edu",
