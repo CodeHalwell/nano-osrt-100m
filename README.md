@@ -49,3 +49,54 @@ modal run --detach app.py --stage grpo       # GRPO RL with verifiable math rewa
 ```bash
 uv run pytest tests/ -q
 ```
+
+## Roadmap
+
+The architectural decisions in v5 (Muon hybrid, MoE without dense FFN,
+bias-controller routing, Z-loss + QK-Norm + softplus moe_gate) are
+settled by the `--stage ablate` evidence. From here the plan is
+deliberately small — pretrain → SFT → optional inference work — and
+explicitly avoids chasing every new paper.
+
+1. **Finish pretraining.** Currently mid-Phase 2 (Knowledge,
+   seq_len 4096). Phase 3 (Instruction, seq_len 8192) afterwards.
+   Resume contract handles partial-budget runs across providers
+   (Modal, Lightning AI) — see `LIGHTNING.md`.
+2. **SFT** the pretrained checkpoint with HRA adapters
+   (`--stage sft`). The HRA path injects ~90M extra parameters of
+   capacity without retraining the base. Balanced math + code +
+   STEM + general mixture, native single-token tag chat format.
+3. **(Optional) GRPO** on the SFT checkpoint with verifiable math
+   rewards (`--stage grpo`). Single-GPU, group-normalised
+   advantages, Schulman's unbiased KL approximation.
+4. **(Optional) Multi-Token Prediction (MTP) head for speculative
+   decoding.** A small extra Transformer block on the LM head trained
+   to predict t+2/t+3 tokens. Doubles as a draft model at inference
+   time, giving 2-3× decode speedup on greedy / low-temperature
+   generation. Worth the complexity only if we're deploying inference
+   at scale; otherwise skip.
+
+### Explicitly NOT on the roadmap
+
+The DeepSeek V4 paper (Apr 2026) introduced compressed sparse
+attention (CSA / HCA), DSA top-k routing on compressed entries,
+inverse-RoPE for shared KV, and Birkhoff-polytope-constrained
+residual mixing. All of these solve "1M-token context is too
+expensive" or "very deep residual stacks are unstable" — they are
+real and clever, but our setup hits neither problem:
+
+- max_position_embeddings is 8192. We never operate at long context.
+  Implementing CSA/HCA would invalidate the pretrained checkpoint
+  for no measurable gain.
+- We don't share KV across heads or layers. Inverse RoPE is a
+  no-op for our Q/K/V-per-head MHA.
+- 18 effective layers (3 physical × 6 loops) with simple additive
+  residuals show no instability through 11k+ measured steps
+  (`bias_abs_max ≈ 0.25`, `clean_marg ≈ 2.07`, no loss spikes). Until
+  we observe instability, mHC residuals add Sinkhorn cost for no
+  benefit.
+
+The general principle: at 363M params on a single H100, the wins
+are in `tok/s` and `tokens/$` (gradient-checkpointing thresholds,
+batch sizing, Muon LR tuning) — not in copying frontier-scale
+architectural tricks that target problems we don't have.
