@@ -949,11 +949,19 @@ def run_training(
         router_gumbel_tau = get_router_gumbel_tau(step, train_cfg)
         set_router_gumbel_tau(model, router_gumbel_tau)
 
-        # Gradient checkpointing: on for long seq_len to save memory.
-        # v5 has no soft-dispatch so no need to enable for routing phase.
+        # Gradient checkpointing: on only for very long seq_len. The
+        # original threshold was 4096 (Phase 2's seq_len) but H100 80GB
+        # only fills ~14 GB at Phase 2 sizes (batch 4 × accum 16 ×
+        # seq 4096), so checkpointing was throwing away ~50% of
+        # throughput for memory headroom we don't need. Bumped to 8192
+        # so Phase 3 still gets the memory relief while Phase 2 runs at
+        # full speed. If activation memory ever crowds the H100 budget
+        # at seq_len 4096 (e.g. larger batch on H200 141GB), raise
+        # batch_size in train_config first; only revert this threshold
+        # if that doesn't fit either.
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
-        need_ckpt = current_seq_len >= 4096
+        need_ckpt = current_seq_len >= 8192
         if (hasattr(base, "gradient_checkpointing")
                 and base.gradient_checkpointing != need_ckpt):
             base.gradient_checkpointing = need_ckpt
