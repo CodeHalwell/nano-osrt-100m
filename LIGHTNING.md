@@ -1,29 +1,38 @@
 # Pretraining on Lightning AI
 
 This guide gets you from "blank Lightning Studio" to "pretrain resumed
-from the Modal step-3500 checkpoint" in under 15 minutes. The training
-code itself (`src/nano_osrt/train.py`) is platform-agnostic; this doc
-just walks the bootstrap.
+from the latest `osrt_v5_step_N.pt` checkpoint" in under 15 minutes.
+The training code itself (`src/nano_osrt/train.py`) is platform-
+agnostic; this doc just walks the bootstrap.
 
-## Why Lightning over Modal for this project
+## GPU pick
 
-For our workload (single GPU, 49 GB VRAM, no multi-node all-reduce):
+Lightning brokers compute across providers (Lightning Cloud, Nebius,
+GCP, AWS) and the per-credit price varies a lot. As of last check:
 
-| Platform  | GPU       | Hourly  | tok/s est. | tokens / credit |
-|-----------|-----------|---------|------------|-----------------|
-| Modal     | H100 SXM  | $3.95   | 40 k       | ~10 k           |
-| Lightning | H100 SXM  | ~$3.49  | 40 k       | ~11.5 k         |
-| Lightning | A100 80GB | ~$1.49  | ~25 k      | **~17 k**       |
+| Provider | GPU       | cr/hr  | tok/s est. | Notes                              |
+|----------|-----------|--------|------------|------------------------------------|
+| **Nebius** | **H100 80GB** | **3.01** | **~40 k**  | **Best value — pick this**           |
+| GCP      | H100 80GB | ~5.17  | ~40 k      | Interruptible, more expensive      |
+| AWS      | H100 80GB | ~1.99  | ~40 k      | Only sold in 8× packs (unusable)   |
+| Lightning | A100 40GB | ~1.49  | ~25 k      | **Will OOM** — workload needs 49 GB |
 
-A100 80GB on Lightning is the cheapest credit/token for this exact
-workload — Hopper's higher memory bandwidth doesn't help us at batch
-8×8×2048 because we're compute-bound, not memory-bound.
+**Pick H100 80GB on Nebius, on-demand, quantity 1.** The A100 40GB
+looks cheap but our workload uses ~49 GB VRAM (forward + Muon momentum
+buffers + AdamW moments) — it will OOM at the first batch. Don't be
+tempted by the price.
+
+For our workload (single GPU, 49 GB VRAM, no multi-node all-reduce),
+Hopper's higher memory bandwidth doesn't help — we're compute-bound at
+batch 8×8×2048, not memory-bound. Pick H100 over H200 unless H100 is
+unavailable in your region.
 
 ## Step-by-step
 
 ### 1. Spin up a Studio
 
-- New Studio → **A100 80GB** (or H100 if you want maximum throughput).
+- New Studio → **AI development** template (ships with PyTorch + CUDA).
+- Compute → **H100 80GB on Nebius**, quantity 1, on-demand.
 - Storage: default (Lightning Studios come with persistent disk).
 
 ### 2. Clone and install
@@ -67,28 +76,27 @@ A is most convenient for one-off runs; C is best for repeat use.
 
 ### 4. Sync the tokenizer + checkpoint
 
-The tokenizer (~3 MB, 3 files) and the latest checkpoint (~2.9 GB)
-both live on the Modal Volume. Two options:
-
-**Option A — Lightning Studio web upload (easiest for one-shot):**
-- Drop your local `./tokenizer/` and `./checkpoints/v5/osrt_v5_step_3500.pt`
-  into the Studio file browser. The 2.9 GB ckpt takes a few minutes
-  over a residential connection.
-
-**Option B — Modal CLI from inside the Studio:**
+The tokenizer (~3 MB, 3 files) and the latest checkpoint (~3 GB) both
+live on the Modal Volume `osrt-checkpoints`. Use the Modal CLI from
+inside the Studio — object-store to object-store at multi-Gbps,
+typically ~3 min for the ckpt vs ~30 min uploading from your laptop.
 
 ```bash
-pip install modal
-modal token set --token-id <id> --token-secret <secret>   # from modal.com/settings
+uv pip install modal       # already in pyproject deps but keep this for clarity
+modal token set --token-id <id> --token-secret <secret>   # from modal.com/settings/tokens
 
 mkdir -p tokenizer checkpoints/v5
-modal volume get osrt-v4-tokenizer / ./tokenizer/
-modal volume get osrt-checkpoints v5/osrt_v5_step_3500.pt ./checkpoints/v5/
+uv run modal volume get osrt-v4-tokenizer / ./tokenizer/
+
+# Find the latest checkpoint and pull it. Listing first lets you skip
+# stale step files if your last run produced several:
+uv run modal volume ls osrt-checkpoints v5/
+uv run modal volume get osrt-checkpoints v5/<latest-step-file>.pt ./checkpoints/v5/
 ```
 
-Option B is faster end-to-end (Modal volumes serve from object storage
-at multi-Gbps to the Studio) and avoids the round-trip through your
-laptop.
+The auto-resume logic in `train.py` picks the highest
+`osrt_v5_step_N.pt` in `--ckpt-dir`, so you only need the most recent
+file — older ones aren't required.
 
 ### 5. Verify the bootstrap
 
@@ -107,8 +115,9 @@ uv run python -m nano_osrt.train_main \
 ```
 
 The script auto-resumes from the highest `osrt_v5_step_N.pt` in
-`--ckpt-dir`, so the first thing you'll see in the log is
-`Found checkpoint at step 3500 ... Resumed at step 3501`.
+`--ckpt-dir`. The first non-W&B-noise log line will be
+`Found checkpoint at step <N> ... Resumed at step <N+1>` where `<N>`
+is whatever you synced down in step 4.
 
 To start fresh (e.g. on a sanity dir), point `--ckpt-dir` somewhere
 empty.
@@ -143,6 +152,29 @@ ckpt.
   GPU uptime; set a budget alert in the Studio settings if you want a
   hard stop.
 
+## Known issues + fixes (already in the codebase)
+
+These bit during real Lightning runs and are now patched. Calling them
+out so future readers don't re-debug:
+
+- **`PyGILState_Release` at the foundation→knowledge phase boundary
+  (step 9.5k–10k).** With `persistent_workers=True`,
+  `multiprocessing_context="spawn"`, and live HF streaming connections
+  (aiohttp/fsspec), the old `del current_loader` rebinding raced
+  worker teardown against new-worker spawn. Fix lives at
+  `train.py:907` — explicitly null `loader_iter` then `current_loader`
+  and `gc.collect()` before building the new loader. Same race in
+  `run_eval` is fixed at `train.py:255`.
+- **`torch.compile` + `gradient_checkpoint(context_fn=...)` raises
+  `NotImplementedError` from Dynamo's higher-order-op tracer.** Fixed
+  at `model.py::_checkpoint_block` by wrapping the call in
+  `@torch.compiler.disable` so just the checkpoint dispatch falls back
+  to eager. The block_fn itself is still compiled.
+- **Phase 1→2 transition recompiles the model** because seq_len jumps
+  from 2048 → 4096. Expect a ~2-3 min compile freeze around
+  step 9.5k. The first batch after compile takes longer than usual;
+  step throughput recovers within ~50 steps.
+
 ## When the run finishes
 
 Pull the final checkpoint back to your laptop:
@@ -152,4 +184,12 @@ Pull the final checkpoint back to your laptop:
 lightning download <studio-name> /teamspace/studios/this_studio/.../osrt_v5_final.pt ./checkpoints/v5/
 ```
 
-Or upload to HF Hub and `huggingface-cli download` from anywhere.
+Or — easier — push it back to the Modal volume from inside the Studio
+so all your checkpoints live in one place:
+
+```bash
+uv run modal volume put osrt-checkpoints \
+    ./checkpoints/v5/osrt_v5_final.pt v5/osrt_v5_final.pt
+```
+
+Then `modal volume get` from anywhere later.
