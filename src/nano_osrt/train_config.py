@@ -101,7 +101,17 @@ class PretrainConfig:
     # Training
     batch_size: int = 8
     grad_accum_steps: int = 8
-    total_steps: int = 300_000
+    # Realistic step horizon for the available compute budget. The
+    # original 300_000 was the "complete the full curriculum" target
+    # but that requires ~$1700+ on Modal H100. With the realistic
+    # multi-account budget (~$77 across 3 accounts) we're aiming for
+    # roughly Chinchilla-optimal on active params (~3.8B tokens =
+    # step ~21000 at Phase 2 sizes). 25_000 leaves headroom past that
+    # so the cosine taper hits ~12% of peak LR by step 21000 — proper
+    # cooked training rather than running at peak forever.
+    # Bumped from 300_000 mid-run to fix the cosine being effectively
+    # a constant LR at this horizon.
+    total_steps: int = 25_000
     warmup_steps: int = 3_000
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
