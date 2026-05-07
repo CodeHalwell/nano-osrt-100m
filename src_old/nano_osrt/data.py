@@ -291,10 +291,10 @@ def make_loader(
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
         multiprocessing_context="spawn",
     )

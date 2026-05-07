@@ -182,7 +182,7 @@ class PretrainConfig:
     phases: dict = {  # noqa: RUF012
         "foundation": {
             "start": 0,
-            "end": 9_500,
+            "end": 10_000,
             "seq_len": 2048,
             "grad_accum_steps": 8,
             "datasets": [
@@ -199,7 +199,7 @@ class PretrainConfig:
             ],
         },
         "knowledge": {
-            "start": 9_500,
+            "start": 10_000,
             "end": 250_000,
             "seq_len": 4096,
             "batch_size": 4,
@@ -234,28 +234,16 @@ class PretrainConfig:
                     "name": "smoltalk",
                     "hf_id": "HuggingFaceTB/smoltalk",
                     "hf_config": "all",
-                    "weight": 0.30,
+                    "weight": 0.50,
                 },
                 {
                     "name": "evol-instruct-code",
                     "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
-                    "weight": 0.20,
+                    "weight": 0.30,
                 },
                 {
                     "name": "openhermes",
                     "hf_id": "teknium/OpenHermes-2.5",
-                    "weight": 0.10,
-                },
-                {
-                    "name": "nemotron-post-training-math",
-                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-                    "split": "math",
-                    "weight": 0.20,
-                },
-                {
-                    "name": "nemotron-post-training-stem",
-                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-                    "split": "stem",
                     "weight": 0.20,
                 },
             ],

@@ -665,19 +665,6 @@ def _balance_accumulation(moe: MoELayer, enabled: bool):
         moe.balance_accum_enabled = previous
 
 
-@torch.compiler.disable
-def _checkpoint_block(block_fn, *args, context_fn):
-    # Dynamo's higher-order-op tracer raises NotImplementedError on
-    # checkpoint(..., context_fn=...). Wrapping the call in
-    # torch.compiler.disable forces an eager fallback for just the
-    # checkpoint dispatch; the block_fn itself is still compiled when the
-    # outer model is wrapped in torch.compile because the inner call
-    # re-enters the compiled graph.
-    return gradient_checkpoint(
-        block_fn, *args, use_reentrant=False, context_fn=context_fn,
-    )
-
-
 class RecursiveBlock(nn.Module):
     """Physical transformer block: attention + MoE (no dense FFN).
 
@@ -968,8 +955,9 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                             _balance_accumulation(_block.moe, False),
                         )
 
-                    x = _checkpoint_block(
+                    x = gradient_checkpoint(
                         _block_fn, x, adapter_a, adapter_b, cos, sin,
+                        use_reentrant=False,
                         context_fn=_context_fn,
                     )
                 else:

@@ -255,18 +255,7 @@ def run_eval(
             except StopIteration:
                 break
         _EVAL_BATCH_CACHE[cache_key] = cached
-        # Drop the iterator before the loader so worker processes are
-        # reaped cleanly. `del loader, data_iter` evaluates left-to-right
-        # and dropping `loader` first does nothing observable because
-        # `data_iter` still holds the loader (and therefore the spawn
-        # workers); the actual teardown only fires when `data_iter` is
-        # released, racing finalize and producing
-        # "Fatal Python error: PyGILState_Release" in one of the workers
-        # — a leak per eval call. Force order + GC so workers exit cleanly.
-        import gc
-        del data_iter
-        del loader
-        gc.collect()
+        del loader, data_iter
 
     total_loss = 0.0
     total_tokens = 0
@@ -907,24 +896,7 @@ def run_training(
             )
 
             if current_loader is not None:
-                # Tear down the previous phase's loader BEFORE building the
-                # new one. The iterator owns the loader, the loader owns
-                # the worker processes; if we just rebind both vars in
-                # sequence (assigning current_loader first, then
-                # loader_iter), the old workers only get reaped when
-                # loader_iter is overwritten — which happens *after* the
-                # new workers have already spawned, racing teardown
-                # against startup. With persistent_workers=True +
-                # multiprocessing_context="spawn" + live HF streaming
-                # connections (aiohttp/fsspec), that race manifested at
-                # the foundation→knowledge transition (step 10000) as
-                # "Fatal Python error: PyGILState_Release". Drop both
-                # refs and force a GC pass so old workers fully exit
-                # before any new ones come up.
-                import gc
-                loader_iter = None
-                current_loader = None
-                gc.collect()
+                del current_loader
             load_t = time.time()
             current_loader = make_loader(
                 phase_cfg["datasets"],
