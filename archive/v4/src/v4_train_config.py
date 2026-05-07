@@ -1,7 +1,7 @@
 """Training configurations for NanoOSRT v4.
 
 Progressive curriculum:
-  Phase 1 (Foundation):  seq_len 2048, TinyStories + CodeParrot
+  Phase 1 (Foundation):  seq_len 2048, FineWeb-Edu + CodeParrot
   Phase 2 (Knowledge):   seq_len 4096, FineWeb-Edu + CodeParrot + Wikipedia
   Phase 3 (Instruction): seq_len 8192, SmolTalk + Evol-Code + OpenHermes
 
@@ -26,7 +26,7 @@ class V4PretrainConfig:
     log_interval: int = 50
     eval_interval: int = 1_000
     eval_steps: int = 20  # number of batches per eval
-    ckpt_interval: int = 5_000
+    ckpt_interval: int = 1_000
     optimizer_name: str = "lion"
 
     # Weights & Biases
@@ -50,14 +50,14 @@ class V4PretrainConfig:
             "grad_accum_steps": 8,
             "datasets": [
                 {
-                    "name": "tinystories",
-                    "hf_id": "roneneldan/TinyStories",
-                    "weight": 0.5,
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 0.6,
                 },
                 {
                     "name": "codeparrot-clean",
                     "hf_id": "codeparrot/codeparrot-clean",
-                    "weight": 0.5,
+                    "weight": 0.4,
                 },
             ],
         },
@@ -133,7 +133,7 @@ class V4SFTConfig:
     log_interval: int = 25
     ckpt_interval: int = 500
     optimizer_name: str = "adamw"
-    seq_len: int = 8192
+    seq_len: int = 2048
 
     # HRA
     hra_enabled: bool = True
@@ -151,7 +151,7 @@ class V4SFTConfig:
     wandb_run_id: str = ""
 
     # Pretrained checkpoint
-    pretrained_checkpoint: str = "/vol/checkpoints/v4/osrt_v4_final.pt"
+    pretrained_checkpoint: str = "/vol/checkpoints/v4/osrt_v4_step_9000.pt"
 
     # Chat format (uses native single-token tags)
     # Format: <|user|>{prompt}<|assistant|><|think|>{reasoning}<|/think|><|answer|>{answer}<|/answer|><|end_of_text|>
@@ -303,3 +303,56 @@ class V4GRPOConfig:
     think_close: str = "<|/think|>"
     answer_open: str = "<|answer|>"
     answer_close: str = "<|/answer|>"
+
+
+class V4MoERecoverConfig:
+    """MoE recovery config — wake up the dead router.
+
+    Strategy:
+      1. Re-init all routed experts from shared expert + small noise
+      2. Freeze everything except router, routed experts, and gates
+      3. Remove importance loss (it enforces uniformity)
+      4. Loosen capacity cap so router preferences matter
+      5. Add diversity loss pushing experts to produce different outputs
+    """
+
+    # Training
+    batch_size: int = 8
+    grad_accum_steps: int = 8
+    total_steps: int = 2_000
+    warmup_steps: int = 100
+    peak_lr: float = 5e-5          # higher than SFT since only MoE bits train
+    min_lr: float = 5e-6
+    grad_clip: float = 1.0
+    log_interval: int = 25
+    ckpt_interval: int = 500
+    seq_len: int = 2048
+
+    # Routing overrides (applied to model_config at runtime)
+    capacity_factor: float = 2.5   # loosened from 1.25 — router actually drives routing
+    gumbel_tau: float = 0.3        # keep some noise so router can explore
+    diversity_coeff: float = 0.1   # push experts apart
+    reinit_noise_std: float = 0.01
+    reinit_seed: int = 1337
+
+    # Weights & Biases
+    wandb_log: bool = True
+    wandb_project: str = "nano-osrt-v4"
+    wandb_run_name: str = "osrt-v4-moe-recover"
+
+    # Checkpoint to start from (latest SFT checkpoint)
+    pretrained_checkpoint: str = "/vol/checkpoints/v4/osrt_v4_sft_step_3500.pt"
+
+    # Datasets (Foundation phase: FineWeb-Edu + CodeParrot)
+    datasets: list = [  # noqa: RUF012
+        {
+            "name": "fineweb-edu",
+            "hf_id": "HuggingFaceFW/fineweb-edu",
+            "weight": 0.6,
+        },
+        {
+            "name": "codeparrot-clean",
+            "hf_id": "codeparrot/codeparrot-clean",
+            "weight": 0.4,
+        },
+    ]

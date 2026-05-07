@@ -139,7 +139,20 @@ class RecursiveBlock(nn.Module):
     def forward(
         self, x: Tensor, adapter_a: Tensor, adapter_b: Tensor,
         adapter_scale: float, rope_cos: Tensor, rope_sin: Tensor,
-    ) -> Tensor:
+        past_kv: tuple[Tensor, Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        """Block forward with optional KV cache.
+
+        Args:
+            x: (B, S, D). During decode with cache, S=1 and x is the single
+                new token's hidden state.
+            rope_cos, rope_sin: pre-sliced for positions past_len..past_len+S-1.
+            past_kv: (k_past, v_past) each (B, H, past_len, head_dim), or None.
+            use_cache: if True, return (k_all, v_all) as present_kv.
+
+        Returns: (output, present_kv | None).
+        """
         B, S, D = x.shape
         x_mod = x + adapter_scale * (x @ adapter_a @ adapter_b)
 
@@ -155,12 +168,25 @@ class RecursiveBlock(nn.Module):
         k = _apply_rope(k, rope_cos, rope_sin)
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # Concatenate cached K, V (already RoPE-applied) with the new ones.
+        if past_kv is not None:
+            k_past, v_past = past_kv
+            k = torch.cat([k_past, k], dim=2)
+            v = torch.cat([v_past, v], dim=2)
+
+        present_kv = (k, v) if use_cache else None
+
+        # Causal only during prefill (q_len == k_len). During decode with
+        # cache (q_len=1, k_len>1), a single query attends to all past keys
+        # so no mask is needed.
+        is_causal = (q.shape[2] == k.shape[2])
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
         x = x_mod + self.out_proj(attn_out)
         x = x + self.ffn(self.norm_ffn(x))
-        return x
+        return x, present_kv
 
 
 # ── Main model ──────────────────────────────────────────────────────────
@@ -221,23 +247,72 @@ class NanoOSRTForCausalLM(nn.Module):
                 )
                 setattr(block.ffn, name, new_layer)
 
-    def forward(self, input_ids: Tensor, **kwargs) -> dict:
+    def forward(
+        self,
+        input_ids: Tensor,
+        past_key_values: list[tuple[Tensor, Tensor] | None] | None = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> dict:
+        """Forward with optional KV cache.
+
+        Args:
+            input_ids: (B, S). During decode, S=1 (just the new token).
+            past_key_values: list of (k, v) tuples, one per effective layer
+                (num_blocks * recursive_loops = 12). Each tensor is
+                (B, H, past_len, head_dim). None entries allowed for any
+                layer not yet cached.
+            use_cache: if True, return present_key_values in the output.
+        """
         x = self.embedding(input_ids)
         S = input_ids.shape[1]
-        cos = self.rope_cos[:, :S, :, :]
-        sin = self.rope_sin[:, :S, :, :]
+        expected_layers = self.config.num_blocks * self.config.recursive_loops
+
+        # Derive past_len from the first non-None cache entry (or 0 if none).
+        past_len = 0
+        if past_key_values is not None:
+            if len(past_key_values) != expected_layers:
+                raise ValueError(
+                    f"past_key_values must have {expected_layers} entries, "
+                    f"got {len(past_key_values)}",
+                )
+            for layer_past in past_key_values:
+                if layer_past is not None:
+                    past_len = layer_past[0].shape[2]
+                    break
+
+        # Slice RoPE for positions past_len..past_len+S-1.
+        cos = self.rope_cos[:, past_len:past_len + S, :, :]
+        sin = self.rope_sin[:, past_len:past_len + S, :, :]
+
+        presents: list[tuple[Tensor, Tensor] | None] | None = (
+            [] if use_cache else None
+        )
 
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
-                x = block(x, self.adapters_a[idx], self.adapters_b[idx],
-                          self.adapter_scale, cos, sin)
+                layer_past = (
+                    past_key_values[idx] if past_key_values is not None else None
+                )
+                x, present_kv = block(
+                    x,
+                    self.adapters_a[idx],
+                    self.adapters_b[idx],
+                    self.adapter_scale,
+                    cos,
+                    sin,
+                    past_kv=layer_past,
+                    use_cache=use_cache,
+                )
+                if presents is not None:
+                    presents.append(present_kv)
             if loop < self.config.recursive_loops - 1:
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
         logits = F.linear(x, self.embedding.weight)
-        return {"logits": logits}
+        return {"logits": logits, "past_key_values": presents}
 
     @torch.no_grad()
     def generate(
@@ -251,14 +326,57 @@ class NanoOSRTForCausalLM(nn.Module):
         repetition_penalty: float = 1.2,
         **kwargs,
     ) -> Tensor:
-        """Generate tokens autoregressively with top-p sampling and repetition penalty."""
+        """Generate tokens autoregressively with KV cache, top-p sampling, and repetition penalty.
+
+        Uses a per-effective-layer KV cache so each new token only requires
+        one forward pass over a single new position (not the full context).
+        Changes O(N) context cost per step to O(1) + cache concat — roughly
+        10-30x faster for long generations on this architecture.
+        """
         generated = input_ids.clone()
 
-        for _ in range(max_new_tokens):
-            # Truncate to max seq_len
-            context = generated[:, -self.config.seq_len:]
-            out = self.forward(context)
-            next_logits = out["logits"][:, -1, :self.config.real_vocab_size].float()
+        # Prefill: one full forward over the input prompt, producing the
+        # initial KV cache and logits for the last prompt token.
+        context = generated[:, -self.config.seq_len:]
+        out = self.forward(context, use_cache=True)
+        past_key_values = out["past_key_values"]
+        next_logits = out["logits"][:, -1, :self.config.real_vocab_size].float()
+
+        for step_idx in range(max_new_tokens):
+            if step_idx > 0:
+                # Decode step: pass only the most recent token along with
+                # the cache. Truncate cache + new token to seq_len if it
+                # would exceed RoPE buffer.
+                new_tok = generated[:, -1:]
+                past_len = (
+                    past_key_values[0][0].shape[2]
+                    if past_key_values and past_key_values[0] is not None
+                    else 0
+                )
+                if past_len + new_tok.shape[1] > self.config.seq_len:
+                    # Cache exceeded: left-truncate each layer's cache so
+                    # the oldest positions fall off. Typical ~512-token
+                    # generations never hit this since seq_len=4096.
+                    trim = past_len + new_tok.shape[1] - self.config.seq_len
+                    trimmed: list[tuple[Tensor, Tensor] | None] = []
+                    for kv in past_key_values:
+                        if kv is None:
+                            trimmed.append(None)
+                        else:
+                            k_tr, v_tr = kv
+                            trimmed.append(
+                                (k_tr[:, :, trim:, :], v_tr[:, :, trim:, :])
+                            )
+                    past_key_values = trimmed
+                out = self.forward(
+                    new_tok,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = out["past_key_values"]
+                next_logits = (
+                    out["logits"][:, -1, :self.config.real_vocab_size].float()
+                )
 
             # Repetition penalty: reduce logits for tokens already generated
             if repetition_penalty != 1.0:

@@ -1,35 +1,66 @@
-"""Streaming SFT data pipeline with loss masking for chain-of-thought training."""
+"""SFT data pipeline for NanoOSRT with native token tags.
+
+Chat format:
+    <|user|>{prompt}<|assistant|><|think|>{reasoning}<|/think|><|answer|>{answer}<|/answer|><|end_of_text|>
+
+Loss masking:
+    - Everything from <|user|> to <|assistant|> (inclusive): IGNORE_INDEX
+    - <|think|> through <|/answer|>: trained on (real labels)
+
+All structural tags are single tokens in the v4 tokenizer.
+"""
 
 import random
 
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
-IGNORE_INDEX = -100  # PyTorch cross_entropy ignores this label
+IGNORE_INDEX = -100
 
 
-def format_gsm8k(example: dict, think_open: str, think_close: str) -> tuple[str, str]:
-    """Format a GSM8K example into user/assistant with CoT."""
+# ── Format functions ────────────────────────────────────────────────────
+# Each returns (question, reasoning, answer) triple.
+# The SFTStream handles wrapping with tags.
+
+
+def format_gsm8k(example: dict) -> tuple[str, str, str]:
+    """GSM8K: question + step-by-step reasoning + final numeric answer."""
     question = example["question"]
     answer_raw = example["answer"]
 
     if "####" in answer_raw:
         reasoning, final = answer_raw.rsplit("####", 1)
-        reasoning = reasoning.strip()
-        final = final.strip()
-        assistant = f"{think_open}{reasoning}{think_close}\n{final}"
+        return question, reasoning.strip(), final.strip()
+    return question, answer_raw, answer_raw
+
+
+def format_numina_math(example: dict) -> tuple[str, str, str]:
+    """NuminaMath-CoT: problem + solution with reasoning."""
+    import re
+    question = example.get("problem", "")
+    solution = example.get("solution", "")
+
+    if not question or not solution:
+        return "", "", ""
+
+    lines = solution.strip().split("\n")
+    if len(lines) > 1:
+        reasoning = "\n".join(lines[:-1]).strip()
+        final = lines[-1].strip()
+        match = re.search(r"\\boxed\{(.+?)\}", final)
+        if match:
+            final = match.group(1)
     else:
-        assistant = f"{think_open}{answer_raw}{think_close}\n{answer_raw}"
+        reasoning = solution.strip()
+        final = solution.strip()
 
-    return question, assistant
+    return question, reasoning, final
 
 
-def format_orca_math(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an Orca-Math example into user/assistant with CoT."""
+def format_orca_math(example: dict) -> tuple[str, str, str]:
+    """Orca-Math: question + worked solution."""
     question = example["question"]
     answer = example["answer"]
 
@@ -41,80 +72,17 @@ def format_orca_math(
         reasoning = answer.strip()
         final = answer.strip()
 
-    assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    return question, assistant
+    return question, reasoning, final
 
 
-def format_numina_math(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format a NuminaMath-CoT example into user/assistant with CoT.
-
-    NuminaMath-CoT has 'problem' and 'solution' columns.
-    """
-    question = example.get("problem", "")
-    solution = example.get("solution", "")
-
-    if not question or not solution:
-        return "", ""
-
-    # Split solution into reasoning and final answer
-    lines = solution.strip().split("\n")
-    if len(lines) > 1:
-        reasoning = "\n".join(lines[:-1]).strip()
-        final = lines[-1].strip()
-        # Clean up common patterns like "The answer is ..."
-        if final.startswith("\\boxed"):
-            # Extract from \boxed{...}
-            import re
-            match = re.search(r"\\boxed\{(.+?)\}", final)
-            if match:
-                final = match.group(1)
-    else:
-        reasoning = solution.strip()
-        final = solution.strip()
-
-    assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    return question, assistant
-
-
-def format_ifeval(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an ifeval-like-data example into user/assistant with CoT.
-
-    Has 'prompt' and 'response' columns. The key value is teaching
-    the model to follow precise constraints in the prompt.
-    """
-    question = example.get("prompt", "")
-    response = example.get("response", "")
-
-    if not question or not response:
-        return "", ""
-
-    # Wrap response in thinking format
-    paragraphs = response.strip().split("\n\n")
-    if len(paragraphs) > 1:
-        reasoning = "\n\n".join(paragraphs[:-1]).strip()
-        final = paragraphs[-1].strip()
-        assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    else:
-        assistant = f"{think_open}Let me follow the instructions carefully.{think_close}\n{response}"
-
-    return question, assistant
-
-
-def format_math_instruct(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format a TIGER-Lab/MathInstruct example into user/assistant with CoT."""
+def format_math_instruct(example: dict) -> tuple[str, str, str]:
+    """MathInstruct: instruction + output."""
     question = example.get("instruction", "")
     output = example.get("output", "")
 
     if not question or not output:
-        return "", ""
+        return "", "", ""
 
-    # Split reasoning from final answer
     lines = output.strip().split("\n")
     if len(lines) > 1:
         reasoning = "\n".join(lines[:-1]).strip()
@@ -123,67 +91,87 @@ def format_math_instruct(
         reasoning = output.strip()
         final = output.strip()
 
-    assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    return question, assistant
+    return question, reasoning, final
 
 
-def format_longform(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format a LongForm example into user/assistant with CoT.
+def format_evol_code(example: dict) -> tuple[str, str, str]:
+    """Evol-Instruct-Code: instruction + code output."""
+    question = example.get("instruction", "")
+    output = example.get("output", "")
 
-    LongForm has 'input' and 'output' columns with long-form responses.
-    We wrap the output as thinking with the final paragraph as the answer.
-    """
-    question = example["input"]
-    output = example["output"]
+    if not question or not output:
+        return "", "", ""
+
+    parts = output.split("```")
+    if len(parts) >= 3:
+        # Leave empty when no natural prose precedes the code block —
+        # fabricating "Let me write the code for this." trained v4 to
+        # emit CoT filler on trivial prompts. Empty think is fine: the
+        # model learns "no reasoning needed" for this example class.
+        reasoning = parts[0].strip()
+        code = "```" + "```".join(parts[1:])
+        return question, reasoning, code
 
     paragraphs = output.strip().split("\n\n")
     if len(paragraphs) > 1:
-        reasoning = "\n\n".join(paragraphs[:-1]).strip()
-        final = paragraphs[-1].strip()
-    else:
-        reasoning = output.strip()
-        final = output.strip()
+        return question, paragraphs[0].strip(), "\n\n".join(paragraphs[1:]).strip()
 
-    assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    return question, assistant
+    return question, "", output
 
 
-def format_alpaca(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an Alpaca example. Wraps the output with brief thinking."""
+def format_alpaca_code(example: dict) -> tuple[str, str, str]:
+    """Alpaca-style code: instruction + optional input + output."""
+    instruction = example.get("instruction", "")
+    inp = example.get("input", "")
+    output = example.get("output", "")
+
+    if not instruction or not output:
+        return "", "", ""
+
+    question = f"{instruction}\n{inp}".strip() if inp else instruction
+
+    parts = output.split("```")
+    if len(parts) >= 3:
+        reasoning = parts[0].strip()
+        code = "```" + "```".join(parts[1:])
+        return question, reasoning, code
+
+    lines = output.strip().split("\n")
+    code_indicators = ("def ", "class ", "import ", "from ", "#", "if __name__")
+    if lines and any(lines[0].strip().startswith(ind) for ind in code_indicators):
+        return question, "", output
+
+    if len(lines) > 3:
+        return question, lines[0].strip(), "\n".join(lines[1:]).strip()
+
+    return question, "", output
+
+
+def format_alpaca(example: dict) -> tuple[str, str, str]:
+    """Alpaca: instruction + optional input + output."""
     instruction = example["instruction"]
     inp = example.get("input", "")
     output = example["output"]
 
     question = f"{instruction}\n{inp}".strip() if inp else instruction
 
-    # For short outputs, thinking is the planning step
     sentences = output.strip().split(". ")
     if len(sentences) > 2:
         reasoning = ". ".join(sentences[:-1]).strip() + "."
         final = sentences[-1].strip()
         if not final.endswith("."):
             final += "."
-        assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    else:
-        # Short answer — still wrap in think to maintain format consistency
-        assistant = f"{think_open}Let me work through this.{think_close}\n{output}"
+        return question, reasoning, final
 
-    return question, assistant
+    return question, "", output
 
 
-def format_openhermes(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an OpenHermes example from conversations list."""
+def format_openhermes(example: dict) -> tuple[str, str, str]:
+    """OpenHermes: conversations list."""
     conversations = example.get("conversations", [])
     if len(conversations) < 2:
-        return "", ""
+        return "", "", ""
 
-    # Find first human/gpt pair
     question = ""
     answer = ""
     for msg in conversations:
@@ -195,205 +183,113 @@ def format_openhermes(
             answer = value
 
     if not question or not answer:
-        return "", ""
+        return "", "", ""
 
     paragraphs = answer.strip().split("\n\n")
     if len(paragraphs) > 1:
         reasoning = "\n\n".join(paragraphs[:-1]).strip()
         final = paragraphs[-1].strip()
-        assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    else:
-        sentences = answer.strip().split(". ")
-        if len(sentences) > 2:
-            reasoning = ". ".join(sentences[:-1]).strip() + "."
-            final = sentences[-1].strip()
-            assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-        else:
-            assistant = f"{think_open}Let me think about this.{think_close}\n{answer}"
+        return question, reasoning, final
 
-    return question, assistant
+    return question, "", answer
 
 
-def format_slimorca(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format a SlimOrca example from conversations list."""
-    conversations = example.get("conversations", [])
-    if len(conversations) < 2:
-        return "", ""
+def format_ifeval(example: dict) -> tuple[str, str, str]:
+    """IFEval-like: prompt + response with constraints."""
+    question = example.get("prompt", "")
+    response = example.get("response", "")
 
-    # SlimOrca uses system/human/gpt roles
-    question = ""
-    answer = ""
-    system = ""
-    for msg in conversations:
-        role = msg.get("from", "")
-        value = msg.get("value", "")
-        if role == "system":
-            system = value
-        elif role == "human" and not question:
-            question = f"{system}\n{value}".strip() if system else value
-        elif role == "gpt" and question and not answer:
-            answer = value
+    if not question or not response:
+        return "", "", ""
 
-    if not question or not answer:
-        return "", ""
-
-    paragraphs = answer.strip().split("\n\n")
+    paragraphs = response.strip().split("\n\n")
     if len(paragraphs) > 1:
         reasoning = "\n\n".join(paragraphs[:-1]).strip()
         final = paragraphs[-1].strip()
-        assistant = f"{think_open}{reasoning}{think_close}\n{final}"
-    else:
-        assistant = f"{think_open}Let me think step by step.{think_close}\n{answer}"
+        return question, reasoning, final
 
-    return question, assistant
+    return question, "", response
 
 
-def format_evol_code(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an Evol-Instruct-Code example.
+def format_longform(example: dict) -> tuple[str, str, str]:
+    """LongForm: input + long output."""
+    question = example["input"]
+    output = example["output"]
 
-    Has 'instruction' and 'output' columns. The output typically contains
-    code with explanation — we split into reasoning (approach) and code.
-    """
-    question = example.get("instruction", "")
-    output = example.get("output", "")
+    paragraphs = output.strip().split("\n\n")
+    if len(paragraphs) > 1:
+        reasoning = "\n\n".join(paragraphs[:-1]).strip()
+        final = paragraphs[-1].strip()
+        return question, reasoning, final
 
-    if not question or not output:
-        return "", ""
-
-    # Look for code blocks to separate reasoning from code
-    parts = output.split("```")
-    if len(parts) >= 3:
-        # Has code block: before is reasoning, code block is answer
-        reasoning = parts[0].strip()
-        code_and_rest = "```" + "```".join(parts[1:])
-        if reasoning:
-            assistant = f"{think_open}{reasoning}{think_close}\n{code_and_rest}"
-        else:
-            assistant = f"{think_open}Let me write the code for this.{think_close}\n{code_and_rest}"
-    else:
-        # No code block — treat first paragraph as reasoning
-        paragraphs = output.strip().split("\n\n")
-        if len(paragraphs) > 1:
-            reasoning = paragraphs[0].strip()
-            code = "\n\n".join(paragraphs[1:]).strip()
-            assistant = f"{think_open}{reasoning}{think_close}\n{code}"
-        else:
-            assistant = f"{think_open}Let me solve this step by step.{think_close}\n{output}"
-
-    return question, assistant
-
-
-def format_alpaca_code(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
-    """Format an Alpaca-style code instruction example.
-
-    Has 'instruction', optional 'input', and 'output' columns.
-    """
-    instruction = example.get("instruction", "")
-    inp = example.get("input", "")
-    output = example.get("output", "")
-
-    if not instruction or not output:
-        return "", ""
-
-    question = f"{instruction}\n{inp}".strip() if inp else instruction
-
-    # Look for code blocks
-    parts = output.split("```")
-    if len(parts) >= 3:
-        reasoning = parts[0].strip()
-        code_and_rest = "```" + "```".join(parts[1:])
-        if reasoning:
-            assistant = f"{think_open}{reasoning}{think_close}\n{code_and_rest}"
-        else:
-            assistant = f"{think_open}I'll write the code to solve this.{think_close}\n{code_and_rest}"
-    else:
-        # Many code outputs don't use ``` blocks — check for common code patterns
-        lines = output.strip().split("\n")
-        # If output looks like code (starts with def, class, import, #, etc.)
-        code_indicators = ("def ", "class ", "import ", "from ", "#", "if __name__")
-        if any(lines[0].strip().startswith(ind) for ind in code_indicators):
-            assistant = f"{think_open}Let me write the solution.{think_close}\n{output}"
-        elif len(lines) > 3:
-            # First line as reasoning, rest as code
-            reasoning = lines[0].strip()
-            code = "\n".join(lines[1:]).strip()
-            assistant = f"{think_open}{reasoning}{think_close}\n{code}"
-        else:
-            assistant = f"{think_open}Here's my approach.{think_close}\n{output}"
-
-    return question, assistant
+    return question, output.strip(), output.strip()
 
 
 FORMAT_FN = {
     "gsm8k": format_gsm8k,
-    "orca_math": format_orca_math,
     "numina_math": format_numina_math,
+    "orca_math": format_orca_math,
     "math_instruct": format_math_instruct,
-    "longform": format_longform,
-    "alpaca": format_alpaca,
-    "openhermes": format_openhermes,
-    "slimorca": format_slimorca,
-    "ifeval": format_ifeval,
     "evol_code": format_evol_code,
     "alpaca_code": format_alpaca_code,
+    "alpaca": format_alpaca,
+    "openhermes": format_openhermes,
+    "ifeval": format_ifeval,
+    "longform": format_longform,
 }
 
 
+# ── SFT Stream ──────────────────────────────────────────────────────────
+
+
 class SFTStream(IterableDataset):
-    """Streaming SFT dataset with loss masking.
+    """Streaming SFT dataset with native token tags and loss masking.
 
-    Formats each example as::
+    Formats each example as:
+        <|user|>{question}<|assistant|><|think|>{reasoning}<|/think|><|answer|>{answer}<|/answer|><|end_of_text|>
 
-        user: {prompt}
-        assistant: <think>{reasoning}</think>
-        {answer}<|endoftext|>
-
-    Yields ``(input_ids, labels)`` where ``labels[i] = IGNORE_INDEX``
-    for all positions corresponding to user prompt tokens.
+    Loss masking:
+        - <|user|> through <|assistant|> (inclusive): IGNORE_INDEX
+        - Everything after <|assistant|>: real labels (think + answer)
     """
 
     def __init__(
         self,
         dataset_configs: list[dict],
         seq_len: int,
-        tok_name: str,
+        tokenizer: PreTrainedTokenizerFast,
         seed: int,
-        think_open: str = "<think>",
-        think_close: str = "</think>",
-        user_prefix: str = "user: ",
-        assistant_prefix: str = "assistant: ",
+        user_tag: str = "<|user|>",
+        assistant_tag: str = "<|assistant|>",
+        think_open: str = "<|think|>",
+        think_close: str = "<|/think|>",
+        answer_open: str = "<|answer|>",
+        answer_close: str = "<|/answer|>",
     ) -> None:
         self.dataset_configs = dataset_configs
         self.seq_len = seq_len
-        self.tok_name = tok_name
+        self.tok = tokenizer
         self.seed = seed
+        self.user_tag = user_tag
+        self.assistant_tag = assistant_tag
         self.think_open = think_open
         self.think_close = think_close
-        self.user_prefix = user_prefix
-        self.assistant_prefix = assistant_prefix
+        self.answer_open = answer_open
+        self.answer_close = answer_close
 
     def __iter__(self):  # noqa: ANN204
         from datasets import load_dataset
-
-        tok = AutoTokenizer.from_pretrained(self.tok_name)
-        tok.pad_token = tok.eos_token
 
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed if worker_info is None else self.seed + worker_info.id
         rng = random.Random(seed)
 
-        # Load all datasets as streaming iterators
+        # Load all dataset streams
         streams = []
         weights = []
         for ds_cfg in self.dataset_configs:
             print(f"[SFTWorker] Connecting to {ds_cfg['hf_id']}...")
-            load_kwargs = {"split": ds_cfg["split"], "streaming": True}
+            load_kwargs = {"split": ds_cfg.get("split", "train"), "streaming": True}
             if ds_cfg.get("hf_config"):
                 load_kwargs["name"] = ds_cfg["hf_config"]
             ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
@@ -406,86 +302,144 @@ class SFTStream(IterableDataset):
         weights = [w / total_w for w in weights]
         format_fns = [FORMAT_FN[cfg["format"]] for cfg in self.dataset_configs]
 
+        # Token-weighted sampling (same debt-based scheme as pretrain
+        # data.py). SFT response lengths vary by 5-10x across datasets
+        # — NuminaMath-CoT rationales are long, Alpaca answers are
+        # short — so pure example-weighted sampling silently drifts
+        # the trained-token mix away from the configured weights.
+        # Counts only response tokens (prompt is IGNORE_INDEX-masked
+        # and contributes zero loss signal), so this balances what the
+        # model actually trains on.
+        tokens_seen: list[int] = [0] * len(streams)
+
+        def _pick_stream() -> int:
+            total = sum(tokens_seen)
+            if total == 0:
+                return rng.choices(range(len(streams)), weights=weights, k=1)[0]
+            deficits = [
+                weights[i] - tokens_seen[i] / total
+                for i in range(len(streams))
+            ]
+            max_def = max(deficits)
+            candidates = [
+                i for i, d in enumerate(deficits) if d >= max_def - 1e-6
+            ]
+            return rng.choice(candidates)
+
+        # Packing buffer: accumulate multiple examples per sequence
+        pack_ids: list[int] = []
+        pack_labels: list[int] = []
+
         while True:
-            idx = rng.choices(range(len(streams)), weights=weights, k=1)[0]
+            idx = _pick_stream()
 
             try:
                 example = next(streams[idx])
             except StopIteration:
                 ds_cfg = self.dataset_configs[idx]
-                reload_kwargs = {"split": ds_cfg["split"], "streaming": True}
+                load_kwargs = {"split": ds_cfg.get("split", "train"), "streaming": True}
                 if ds_cfg.get("hf_config"):
-                    reload_kwargs["name"] = ds_cfg["hf_config"]
-                ds = load_dataset(ds_cfg["hf_id"], **reload_kwargs)
-                ds = ds.shuffle(
-                    buffer_size=2_000, seed=seed + rng.randint(0, 10000)
-                )
+                    load_kwargs["name"] = ds_cfg["hf_config"]
+                ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
+                ds = ds.shuffle(buffer_size=2_000, seed=seed + rng.randint(0, 10000))
                 streams[idx] = iter(ds)
-                example = next(streams[idx])
+                try:
+                    example = next(streams[idx])
+                except StopIteration:
+                    continue
 
             try:
-                question, assistant_text = format_fns[idx](
-                    example, self.think_open, self.think_close
-                )
+                question, reasoning, answer = format_fns[idx](example)
             except (KeyError, TypeError):
                 continue
 
-            if not question or not assistant_text:
+            if not question or not answer:
                 continue
 
-            user_part = f"{self.user_prefix}{question}\n{self.assistant_prefix}"
-            full_text = f"{user_part}{assistant_text}{tok.eos_token}"
-
-            user_tokens = tok.encode(user_part, add_special_tokens=False)
-            full_tokens = tok.encode(full_text, add_special_tokens=False)
-
-            if len(full_tokens) > self.seq_len + 1:
-                full_tokens = full_tokens[: self.seq_len + 1]
-
-            if len(full_tokens) < 10:
-                continue
-
-            input_ids = full_tokens[:-1]
-            labels = full_tokens[1:]
-
-            # Mask user prompt positions
-            mask_len = len(user_tokens) - 1
-            for i in range(min(mask_len, len(labels))):
-                labels[i] = IGNORE_INDEX
-
-            # Pad to seq_len
-            pad_len = self.seq_len - len(input_ids)
-            if pad_len > 0:
-                input_ids = input_ids + [tok.eos_token_id] * pad_len
-                labels = labels + [IGNORE_INDEX] * pad_len
-
-            yield (
-                torch.tensor(input_ids, dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long),
+            # Build token sequence with native tags
+            # Prompt (masked): <|user|>{question}<|assistant|>
+            # Response (trained):
+            #   <|think|>{reasoning}<|/think|>
+            #   <|answer|>{answer}<|/answer|><|end_of_text|>
+            prompt_text = f"{self.user_tag}{question}{self.assistant_tag}"
+            response_text = (
+                f"{self.think_open}{reasoning}{self.think_close}"
+                f"{self.answer_open}{answer}{self.answer_close}"
+                f"{self.tok.eos_token}"
             )
+
+            prompt_ids = self.tok.encode(prompt_text, add_special_tokens=False)
+            response_ids = self.tok.encode(response_text, add_special_tokens=False)
+
+            ex_ids = prompt_ids + response_ids
+            ex_labels = [IGNORE_INDEX] * len(prompt_ids) + response_ids
+
+            # Skip examples longer than seq_len or with no room for response
+            if len(ex_ids) > self.seq_len or len(prompt_ids) >= len(ex_ids) - 5:
+                continue
+
+            # If this example won't fit, flush the buffer first
+            if pack_ids and len(pack_ids) + len(ex_ids) > self.seq_len:
+                pad_len = self.seq_len - len(pack_ids)
+                yield (
+                    torch.tensor(
+                        pack_ids + [self.tok.pad_token_id] * pad_len,
+                        dtype=torch.long,
+                    ),
+                    torch.tensor(
+                        pack_labels + [IGNORE_INDEX] * pad_len,
+                        dtype=torch.long,
+                    ),
+                )
+                pack_ids = []
+                pack_labels = []
+
+            # Append example to buffer and record its trained-token
+            # contribution for the debt-based sampler.
+            pack_ids.extend(ex_ids)
+            pack_labels.extend(ex_labels)
+            tokens_seen[idx] += len(response_ids)
 
 
 def make_sft_loader(
     dataset_configs: list[dict],
     seq_len: int,
-    tokenizer_name: str,
+    tokenizer: PreTrainedTokenizerFast,
     batch_size: int,
-    seed: int = 42,
-    think_open: str = "<think>",
-    think_close: str = "</think>",
-    user_prefix: str = "user: ",
-    assistant_prefix: str = "assistant: ",
+    seed: int,
+    user_tag: str = "<|user|>",
+    assistant_tag: str = "<|assistant|>",
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
 ) -> DataLoader[tuple[Tensor, Tensor]]:
-    """Build a streaming DataLoader for SFT training."""
+    """Build a streaming DataLoader for SFT.
+
+    Args:
+        dataset_configs: List of dataset config dicts.
+        seq_len: Sequence length.
+        tokenizer: The v4 tokenizer.
+        batch_size: Micro-batch size.
+        seed: Random seed.
+        user_tag: User turn tag.
+        assistant_tag: Assistant turn tag.
+        think_open: Think open tag.
+        think_close: Think close tag.
+        answer_open: Answer open tag.
+        answer_close: Answer close tag.
+
+    Returns:
+        DataLoader yielding (input_ids, labels) batches.
+    """
     ds = SFTStream(
-        dataset_configs=dataset_configs,
-        seq_len=seq_len,
-        tok_name=tokenizer_name,
-        seed=seed,
+        dataset_configs, seq_len, tokenizer, seed,
+        user_tag=user_tag,
+        assistant_tag=assistant_tag,
         think_open=think_open,
         think_close=think_close,
-        user_prefix=user_prefix,
-        assistant_prefix=assistant_prefix,
+        answer_open=answer_open,
+        answer_close=answer_close,
     )
     return DataLoader(
         ds,

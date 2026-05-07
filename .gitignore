@@ -53,6 +53,14 @@ wandb/
 data/*.bin
 data/*.npy
 
+# Tokenizer artefact — synced from Modal volume osrt-v4-tokenizer or
+# rebuilt via scripts/train_tokenizer.py. Not source.
+tokenizer/
+
+# Local pre-change backups (e.g. src_old/) shouldn't be committed.
+# git history is the right backup mechanism.
+src_old/
+
 # Checkpoints (ignore model weight files, not directory placeholders)
 checkpoints/*.pt
 checkpoints/*.pth

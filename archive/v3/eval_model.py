@@ -27,8 +27,28 @@ from src.nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
 class NanoOSRTHarnessModel(LM):
     """Wrapper for lm-evaluation-harness."""
 
-    def __init__(self, model_path: str = "./nano-osrt-model", device: str = "auto", batch_size: int = 1, **kwargs):
+    def __init__(
+        self,
+        model_path: str = "./nano-osrt-model",
+        device: str = "auto",
+        batch_size: int = 1,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
+        **kwargs,
+    ):
         super().__init__()
+
+        # Generation params. v3's original eval silently defaulted to
+        # repetition_penalty=1.2 from hf_model.py's generate signature, which
+        # hurt IFEval format-following (model couldn't repeat bullet markers
+        # or required keywords). Defaults here are now IFEval-safe: greedy +
+        # no repetition penalty. Override via CLI for sampling benchmarks.
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -51,6 +71,10 @@ class NanoOSRTHarnessModel(LM):
 
         total = sum(p.numel() for p in self.model.parameters())
         print(f"Parameters: {total:,}")
+        print(
+            f"Gen params: temperature={temperature}, top_p={top_p}, "
+            f"top_k={top_k}, repetition_penalty={repetition_penalty}"
+        )
 
     @property
     def eot_token_id(self):
@@ -89,7 +113,10 @@ class NanoOSRTHarnessModel(LM):
             return self.model.generate(
                 context.to(self._device),
                 max_new_tokens=max_new,
-                temperature=0.0,  # greedy for eval
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                repetition_penalty=self.repetition_penalty,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
@@ -98,7 +125,14 @@ class NanoOSRTHarnessModel(LM):
         for context, continuation in [req.args for req in requests]:
             ctx_ids = self.tok_encode(context)
             cont_ids = self.tok_encode(continuation)
-            full_ids = torch.tensor([ctx_ids + cont_ids], dtype=torch.long)
+            # Build full_ids directly on the compute device so shift_labels
+            # stays on-device for the gather() below. Without this, MPS
+            # raises "Placeholder storage has not been allocated on MPS
+            # device!" because logits are on MPS but shift_labels would be
+            # on CPU.
+            full_ids = torch.tensor(
+                [ctx_ids + cont_ids], dtype=torch.long, device=self._device,
+            )
 
             # Truncate to max_length
             if full_ids.shape[1] > self.max_length:
@@ -125,7 +159,9 @@ class NanoOSRTHarnessModel(LM):
         results = []
         for (string,) in [req.args for req in requests]:
             ids = self.tok_encode(string)
-            full_ids = torch.tensor([ids], dtype=torch.long)
+            full_ids = torch.tensor(
+                [ids], dtype=torch.long, device=self._device,
+            )
 
             if full_ids.shape[1] > self.max_length:
                 full_ids = full_ids[:, -self.max_length:]
@@ -157,7 +193,10 @@ class NanoOSRTHarnessModel(LM):
             output = self.model.generate(
                 ctx_tensor.to(self._device),
                 max_new_tokens=max_gen,
-                temperature=0.0,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                repetition_penalty=self.repetition_penalty,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
@@ -181,6 +220,13 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output", type=str, default="./eval_results")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of examples (for quick testing)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling threshold (1.0 = disabled)")
+    parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling (0 = disabled)")
+    parser.add_argument(
+        "--repetition-penalty", type=float, default=1.0,
+        help="Repetition penalty (1.0 = disabled; v3's original eval used 1.2 by accident)",
+    )
     args = parser.parse_args()
 
     task_list = [t.strip() for t in args.tasks.split(",")]
@@ -189,6 +235,10 @@ def main():
         model_path=args.model,
         device=args.device,
         batch_size=args.batch_size,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
     )
 
     print(f"\nRunning benchmarks: {task_list}")
