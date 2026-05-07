@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+lib/
+lib64/
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# uv
+.uv/
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+htmlcov/
+
+# Deep learning / model artefacts
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Data (ignore binary token files, not directory placeholders)
+data/*.bin
+data/*.npy
+
+# Tokenizer artefact — synced from Modal volume osrt-v4-tokenizer or
+# rebuilt via scripts/train_tokenizer.py. Not source.
+tokenizer/
+
+# Checkpoints (ignore model weight files, not directory placeholders)
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+checkpoints/*.safetensors
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local workspace/tooling metadata
+.claude/
+.junie/
+.lightning_studio/
+.venv.lightninglink
+
+# Local recovery backup from corrupted git metadata
+.git_corrupt_backup_*/
+
+# Logs and crash dumps
+*.log
+core.*
+
+nano-osrt-model/
+checkpoints/
