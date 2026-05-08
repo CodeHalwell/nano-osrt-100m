@@ -562,6 +562,51 @@ def sft():
     run_sft(model_config, sft_cfg, vol, tok)
 
 
+# =============================================================================
+# SFT-LONG (long-context follow-up SFT, seq_len 4096, Nemotron-heavy mix)
+# =============================================================================
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_long():
+    """Long-context SFT (seq_len 4096) resuming from osrt_v5_sft_final.pt.
+
+    Configures a 1000-step run on a Nvidia-Nemotron-heavy data mix
+    (math + stem + code + tool_calling = 75% Nemotron, 25% diversity)
+    with HRA already loaded from the base SFT pass. Cooler LR
+    (5e-6 peak) since we're fine-tuning a fine-tune.
+    """
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.sft_train import run_sft
+    from nano_osrt.train_config import SFTLongConfig
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    sft_long_cfg = SFTLongConfig()
+    run_sft(model_config, sft_long_cfg, vol, tok)
+
 
 # =============================================================================
 # GRPO (REINFORCEMENT LEARNING)
@@ -997,6 +1042,7 @@ def main(stage: str = "pretrain"):
     --stage ablate     Optimizer × routing ablation (cells A/B/C/D, 1200 steps each)
     --stage pretrain   Full pre-training with progressive seq_len curriculum
     --stage sft        Balanced SFT on the final pretrained checkpoint
+    --stage sft_long   Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage grpo       GRPO RL on the SFT checkpoint (verifiable math rewards)
     """
     if stage == "sanity":
@@ -1009,10 +1055,12 @@ def main(stage: str = "pretrain"):
         pretrain.remote()
     elif stage == "sft":
         sft.remote()
+    elif stage == "sft_long":
+        sft_long.remote()
     elif stage == "grpo":
         grpo.remote()
     else:
         print(
             f"Unknown stage: {stage}. "
-            f"Use sanity, sweep, ablate, pretrain, sft, or grpo"
+            f"Use sanity, sweep, ablate, pretrain, sft, sft_long, or grpo"
         )

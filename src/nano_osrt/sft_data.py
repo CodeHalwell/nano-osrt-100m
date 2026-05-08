@@ -226,6 +226,119 @@ def format_longform(example: dict) -> tuple[str, str, str]:
     return question, output.strip(), output.strip()
 
 
+def format_nemotron(example: dict) -> tuple[str, str, str]:
+    """Nemotron-Post-Training-Dataset-v1 (math, stem, code splits).
+
+    Schema fields used:
+      - messages: list of {role, content, tool_calls} — we take the
+        first user message as `question` and the first assistant
+        message as `answer`.
+      - reasoning: top-level string field with the chain-of-thought.
+        Maps directly to our `<|think|>{reasoning}<|/think|>` block —
+        cleaner than the heuristic split-on-paragraph approach used by
+        the other format functions.
+
+    For tool_calling examples (where the assistant message has a
+    tool_calls field), use `format_nemotron_tool_calling` instead.
+    """
+    msgs = example.get("messages", [])
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        return "", "", ""
+
+    question = ""
+    answer = ""
+    for m in msgs:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "user" and not question:
+            question = content
+        elif role == "assistant" and question and not answer:
+            answer = content
+            break
+
+    if not question or not answer:
+        return "", "", ""
+
+    reasoning = (example.get("reasoning") or "").strip()
+    return question, reasoning, answer
+
+
+def format_nemotron_tool_calling(example: dict) -> tuple[str, str, str]:
+    """Nemotron tool_calling split.
+
+    Uses Hermes-style plain-text <tool_call>...</tool_call> tags inside
+    the answer block to encode tool invocations. Avoids tokenizer
+    surgery (no new special tokens) — the model just learns to emit a
+    recognisable substring pattern that downstream serving code parses
+    with a regex.
+
+    Schema:
+      - messages[i].tool_calls is a list of
+        {id, type, function: {name, arguments}}
+      - When tool_calls is non-empty, the assistant turn is "I'm going
+        to call these tools" rather than a final answer.
+      - The answer block here is the tool-call invocation only;
+        post-tool-result continuation is a separate (multi-turn) example
+        we don't try to capture in single-turn SFT.
+    """
+    import json
+
+    msgs = example.get("messages", [])
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        return "", "", ""
+
+    question = ""
+    assistant_content = ""
+    tool_calls: list[dict] = []
+    for m in msgs:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "user" and not question:
+            question = content
+        elif role == "assistant" and question and not assistant_content and not tool_calls:
+            assistant_content = content
+            tcs = m.get("tool_calls") or []
+            if isinstance(tcs, list):
+                tool_calls = tcs
+            break
+
+    if not question:
+        return "", "", ""
+    if not assistant_content and not tool_calls:
+        return "", "", ""
+
+    # Build the answer body. Plain-text <tool_call> tags carry the
+    # function name + arguments in JSON form. If the assistant also
+    # produced text alongside the tool calls, include both.
+    parts: list[str] = []
+    if assistant_content:
+        parts.append(assistant_content)
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        args_raw = fn.get("arguments")
+        # `arguments` is sometimes already a JSON string, sometimes a
+        # dict — normalise to a string we can drop into the tag body.
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except (json.JSONDecodeError, TypeError):
+                args = {"_raw": args_raw}
+        else:
+            args = args_raw or {}
+        if not name:
+            continue
+        payload = json.dumps({"name": name, "arguments": args})
+        parts.append(f"<tool_call>{payload}</tool_call>")
+    answer = "\n".join(parts).strip()
+
+    if not answer:
+        return "", "", ""
+
+    reasoning = (example.get("reasoning") or "").strip()
+    return question, reasoning, answer
+
+
 FORMAT_FN = {
     "gsm8k": format_gsm8k,
     "numina_math": format_numina_math,
@@ -237,6 +350,8 @@ FORMAT_FN = {
     "openhermes": format_openhermes,
     "ifeval": format_ifeval,
     "longform": format_longform,
+    "nemotron": format_nemotron,
+    "nemotron_tool_calling": format_nemotron_tool_calling,
 }
 
 

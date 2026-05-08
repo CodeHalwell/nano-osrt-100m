@@ -418,6 +418,107 @@ class SFTConfig:
     ]
 
 
+class SFTLongConfig(SFTConfig):
+    """Long-context SFT — resumes from the seq-2048 SFT checkpoint and
+    fine-tunes at seq_len 4096 with a Nemotron-heavy data mix.
+
+    Why: NuminaMath CoT and longform responses cluster in the
+    1500-3000 token range and got truncated under the seq 2048 base
+    SFT. This phase teaches the model to maintain quality over longer
+    completions. Includes Nvidia Nemotron splits (math, stem, code,
+    tool_calling) which the base SFT didn't see — Nemotron has
+    explicit `reasoning` field that maps directly to our
+    `<|think|>{}<|/think|>` block.
+
+    HRA contract:
+      - `hra_before_load=True` because the saved SFT ckpt already has
+        HRA params in its state_dict; injecting HRA structure first
+        lets the load place them correctly.
+      - `hra_enabled=True` (inherited) — keeps the existing rank-256
+        adapters trained in the base SFT.
+
+    LR contract:
+      - Lower peak (5e-6 vs base SFT's 1.5e-5) because we're
+        fine-tuning a fine-tune. Aggressive LR risks washing out the
+        base SFT learning.
+      - Cosine over total_steps=1000 cools to min_lr by the end.
+    """
+
+    total_steps: int = 1_000
+    warmup_steps: int = 50
+    seq_len: int = 4096
+    batch_size: int = 4               # halved from 8 to fit longer ctx
+    grad_accum_steps: int = 16        # doubled to keep effective batch 64
+    peak_lr: float = 5e-6
+    min_lr: float = 5e-7
+    log_interval: int = 25
+    ckpt_interval: int = 250
+
+    # Resume from the base SFT checkpoint with HRA already applied.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_final.pt"
+    hra_before_load: bool = True
+    stage_prefix: str = "sft_long"
+
+    wandb_run_name: str = "osrt-sft-long"
+
+    # Nvidia Nemotron-heavy mix (60%) plus 40% diversity from existing
+    # SFT data to prevent over-fitting to one teacher's style.
+    datasets: list = [  # noqa: RUF012
+        # Nvidia Nemotron Post-Training (60% total)
+        {
+            "name": "nemotron-math",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "math",
+            "weight": 0.30,
+            "format": "nemotron",
+        },
+        {
+            "name": "nemotron-stem",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "stem",
+            "weight": 0.20,
+            "format": "nemotron",
+        },
+        {
+            "name": "nemotron-code",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "code",
+            "weight": 0.15,
+            "format": "nemotron",
+        },
+        {
+            "name": "nemotron-tool-calling",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "tool_calling",
+            "weight": 0.10,
+            "format": "nemotron_tool_calling",
+        },
+        # Diversity (25%) — long-form reasoning + code from non-Nvidia
+        # sources to keep the teacher distribution mixed.
+        {
+            "name": "numina-math-cot",
+            "hf_id": "AI-MO/NuminaMath-CoT",
+            "split": "train",
+            "weight": 0.10,
+            "format": "numina_math",
+        },
+        {
+            "name": "evol-instruct-code",
+            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
+            "split": "train",
+            "weight": 0.10,
+            "format": "evol_code",
+        },
+        {
+            "name": "longform",
+            "hf_id": "akoksal/LongForm",
+            "split": "train",
+            "weight": 0.05,
+            "format": "longform",
+        },
+    ]
+
+
 class GRPOConfig:
     """GRPO config for v5 — verifiable math rewards on top of SFT."""
 
