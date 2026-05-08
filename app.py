@@ -55,7 +55,13 @@ image = (
         # after .add_local_dir; folding it in here keeps the build chain
         # linear (env → apt → pip → add_local) so any function can
         # evaluate without an image rebuild.
-        "lm-eval",
+        #
+        # [ifeval] extras: pulls in langdetect + immutabledict + nltk
+        # which IFEval's instruction graders rely on. Without these,
+        # `lm_eval.simple_evaluate(tasks=["ifeval", ...])` fails at
+        # task-config load time with "ModuleNotFoundError: No module
+        # named 'langdetect'" before the model even runs.
+        "lm-eval[ifeval]",
     )
     .add_local_dir("src/nano_osrt", remote_path="/root/nano_osrt")
     .add_local_dir("scripts", remote_path="/root/scripts")
