@@ -584,20 +584,28 @@ def make_sft_loader(
         answer_open=answer_open,
         answer_close=answer_close,
     )
-    # Multi-worker streaming with persistent workers + prefetch.
-    # SFT has no phase boundaries (unlike pretrain's seq_len curriculum),
-    # so the PyGILState_Release crash that forced num_workers=0 during
-    # pretrain phase transitions does not apply here. Each worker keeps
-    # its own HF stream, tokenizer, and packing buffer alive across
-    # batches; prefetch_factor=4 means up to 16 batches sit ready for
-    # the GPU at any time, which absorbs HF Hub latency blips that
-    # would otherwise stall the training loop.
+    # Single-threaded loader. We tried num_workers=4 + persistent_workers
+    # + prefetch_factor=4 for SFT-ultralong launch on 2026-05-08 — workers
+    # silently deadlocked at the very first __iter__() call, never even
+    # printing the "[SFTWorker] Connecting to..." line. 38 min of
+    # GPU-idle wait before manual kill, ~$2.50 of budget burned.
+    #
+    # Failure surface: 4 workers × 7 HF dataset streams × spawn-context
+    # re-import = 28 simultaneous load_dataset() calls during worker
+    # bootstrap. TOKENIZERS_PARALLELISM=false (set in the Modal image)
+    # prevents the tokenizers-rs mutex deadlock, but the HF datasets
+    # streaming auth + first-shard fetch per worker has its own race
+    # surface that we have not isolated. Until that's diagnosed,
+    # num_workers=0 is the only known-safe configuration.
+    #
+    # Throughput cost: ~30-40 % vs the prefetched setup. SFT-long ran
+    # successfully at num_workers=0 (20-23 sec/step on the fast
+    # windows), so this is not a regression — it is the previous
+    # working configuration.
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=4,
-        persistent_workers=True,
-        prefetch_factor=4,
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
     )
