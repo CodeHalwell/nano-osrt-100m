@@ -320,8 +320,13 @@ class SFTConfig:
     wandb_run_name: str = "osrt-sft"
     wandb_run_id: str = ""
 
-    # Pretrained checkpoint
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_final.pt"
+    # Pretrained checkpoint. Points to the explicit step file rather
+    # than `osrt_v5_final.pt` because pretraining was stopped early at
+    # step 17000 once the eval-loss curve flatlined (eval 3.48 / ppl
+    # 32.4 — Chinchilla-knee on 192M active params). Path is set
+    # explicitly so SFT loads the actual snapshot, not a stale
+    # filename convention.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_step_17000.pt"
 
     # Chat format (native single-token tags)
     user_tag: str = "<|user|>"
