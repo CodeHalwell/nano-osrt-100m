@@ -498,45 +498,33 @@ class MoELayer(nn.Module):
         # Dispatch: for each expert, gather every token that picked it at
         # ANY top-k rank, apply capacity, run expert, scatter-add into output
         # with the renormalised gate weights.
-        #
-        # Bucket-sort (token, rank) slots by chosen expert in one pass so the
-        # per-expert loop becomes a slice instead of a fresh `nonzero` per
-        # expert. `nonzero` is data-dependent and forces a GPU→CPU sync each
-        # call; with E experts × 18 effective layers that adds up. One
-        # `argsort` + `bincount` plus a single `.tolist()` collapses E syncs
-        # into one. Within-bucket order is randomised in training so the
-        # capacity truncation drops a uniform random subset (matching the
-        # previous `randperm`-then-truncate behaviour) rather than the tail.
         moe_out = torch.zeros_like(x_flat)
         total_dropped = 0
-        K = self.top_k
-        flat_slots = top_idx.reshape(-1)  # (N*K,) — expert chosen per slot
-        counts = torch.bincount(flat_slots, minlength=self.num_routed)
 
-        if self.training:
-            shuffle = torch.randperm(N * K, device=top_idx.device)
-            bucket_order = torch.argsort(flat_slots[shuffle], stable=True)
-            sorted_slot_idx = shuffle[bucket_order]
-        else:
-            # Eval: capacity is unbounded so within-bucket order is irrelevant.
-            sorted_slot_idx = torch.argsort(flat_slots, stable=True)
-
-        counts_list = counts.tolist()  # one sync, E ints
-        start = 0
         for ei, expert in enumerate(self.experts):
-            count = counts_list[ei]
-            end = start + count
-            if count == 0:
-                start = end
+            # Where (token_idx, rank) pairs where this expert is chosen
+            is_chosen = (top_idx == ei)  # (N, K), bool
+            token_indices, rank_indices = is_chosen.nonzero(as_tuple=True)  # both (T,)
+
+            if token_indices.numel() == 0:
                 continue
 
-            slot_indices = sorted_slot_idx[start:end]
-            if self.training and count > capacity:
-                total_dropped += count - capacity
-                slot_indices = slot_indices[:capacity]
-
-            token_indices = torch.div(slot_indices, K, rounding_mode="floor")
-            rank_indices = slot_indices % K
+            # Apply capacity limit. `nonzero()` returns indices in
+            # token-major order, so a naive `[:capacity]` always drops
+            # the tail of the sequence and keeps prefix positions —
+            # under expert collapse or long-context bursts this trains
+            # the model to ignore late positions. Shuffle the (token,
+            # rank) pairs before truncating so every position has equal
+            # survival probability when an expert overflows. In eval
+            # mode capacity == N*K so this branch never triggers.
+            if token_indices.numel() > capacity:
+                total_dropped += (token_indices.numel() - capacity)
+                perm = torch.randperm(
+                    token_indices.numel(), device=token_indices.device,
+                )
+                keep = perm[:capacity]
+                token_indices = token_indices[keep]
+                rank_indices = rank_indices[keep]
 
             # Run expert on selected tokens (one forward per expert per batch)
             expert_input = x_flat[token_indices]  # (T, D)
@@ -549,8 +537,6 @@ class MoELayer(nn.Module):
             # Scatter-add: a token may contribute from multiple experts
             # (different ranks), so use index_add, not direct assignment.
             moe_out.index_add_(0, token_indices, expert_output * gates)
-
-            start = end
 
         moe_out = moe_out.view(B, S, D)
 
