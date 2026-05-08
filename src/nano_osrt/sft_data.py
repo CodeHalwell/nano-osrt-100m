@@ -11,6 +11,7 @@ All structural tags are single tokens in the v4 tokenizer.
 """
 
 import random
+import time
 
 import torch
 from torch import Tensor
@@ -284,16 +285,47 @@ class SFTStream(IterableDataset):
         seed = self.seed if worker_info is None else self.seed + worker_info.id
         rng = random.Random(seed)
 
+        # Mirror of data.py::_open_stream — bounded-retry stream open
+        # used both for initial connect and mid-run reconnect. Without
+        # this, a transient HF Hub error during stream setup
+        # ("Cannot send a request, as the client has been closed")
+        # kills the whole SFT run. Same exact failure that hit pretrain
+        # before we patched data.py; sft_data.py needed the same fix.
+        def _open_stream(stream_idx: int, seed_offset: int = 0):
+            ds_cfg = self.dataset_configs[stream_idx]
+            load_kwargs = {
+                "split": ds_cfg.get("split", "train"),
+                "streaming": True,
+            }
+            if ds_cfg.get("hf_config"):
+                load_kwargs["name"] = ds_cfg["hf_config"]
+            last_exc = None
+            for attempt in range(1, 6):
+                try:
+                    ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
+                    return ds.shuffle(
+                        buffer_size=2_000, seed=seed + seed_offset,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    print(
+                        f"[SFTWorker] {ds_cfg['hf_id']} setup attempt "
+                        f"{attempt}/5 failed: {type(exc).__name__}: "
+                        f"{str(exc)[:120]} — retrying...",
+                        flush=True,
+                    )
+                    time.sleep(2 * attempt)
+            raise RuntimeError(
+                f"Failed to open SFT stream for {ds_cfg['hf_id']} after "
+                f"5 attempts: {last_exc}",
+            )
+
         # Load all dataset streams
         streams = []
         weights = []
-        for ds_cfg in self.dataset_configs:
+        for stream_idx, ds_cfg in enumerate(self.dataset_configs):
             print(f"[SFTWorker] Connecting to {ds_cfg['hf_id']}...")
-            load_kwargs = {"split": ds_cfg.get("split", "train"), "streaming": True}
-            if ds_cfg.get("hf_config"):
-                load_kwargs["name"] = ds_cfg["hf_config"]
-            ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
-            ds = ds.shuffle(buffer_size=2_000, seed=seed)
+            ds = _open_stream(stream_idx)
             streams.append(iter(ds))
             weights.append(ds_cfg["weight"])
             print(f"[SFTWorker] Stream ready for {ds_cfg['hf_id']}")
@@ -336,12 +368,8 @@ class SFTStream(IterableDataset):
             try:
                 example = next(streams[idx])
             except StopIteration:
-                ds_cfg = self.dataset_configs[idx]
-                load_kwargs = {"split": ds_cfg.get("split", "train"), "streaming": True}
-                if ds_cfg.get("hf_config"):
-                    load_kwargs["name"] = ds_cfg["hf_config"]
-                ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
-                ds = ds.shuffle(buffer_size=2_000, seed=seed + rng.randint(0, 10000))
+                # Mid-run reconnect uses the same retry-aware open path.
+                ds = _open_stream(idx, seed_offset=rng.randint(1, 10000))
                 streams[idx] = iter(ds)
                 try:
                     example = next(streams[idx])
