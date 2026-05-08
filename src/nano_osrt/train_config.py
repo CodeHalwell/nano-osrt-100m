@@ -519,6 +519,55 @@ class SFTLongConfig(SFTConfig):
     ]
 
 
+class SFTUltraLongConfig(SFTLongConfig):
+    """Ultra-long-context SFT — resumes from the seq-4096 SFT-long
+    checkpoint and pushes to seq_len 8192.
+
+    Why: NuminaMath multi-page derivations and multi-file code
+    generations exceed the 4096 context window. Pushing to 8192
+    teaches the model to maintain coherence across genuinely long
+    completions before GRPO (which runs at seq_len 8192).
+
+    Compute cost: attention is O(N²) so seq 8192 vs 4096 is 4× the
+    attention compute per token. With 4× more tokens per microbatch
+    too (4096 → 8192 plus same effective batch shape), this is the
+    most expensive SFT phase — kept short (500 steps) to fit budget.
+
+    HRA contract:
+      - hra_before_load=True (inherited) — sft_long_final.pt has HRA
+        params already.
+      - Same HRA rank 256 — keeps continuity with the previous SFT
+        passes' learned adaptations.
+
+    LR contract:
+      - Even cooler peak (3e-6) — third successive fine-tune, the
+        adapters are well-formed and need light polish, not heavy
+        re-shaping.
+    """
+
+    total_steps: int = 500
+    warmup_steps: int = 25
+    seq_len: int = 8192
+    # Halve batch_size again, double grad_accum_steps to keep effective
+    # batch at 64 sequences per gradient step. Memory budget at 80 GB
+    # H100: ~50-60 GB for activations at seq 8192 + batch 2 (estimated;
+    # if it OOMs, drop batch to 1 and accum to 64).
+    batch_size: int = 2
+    grad_accum_steps: int = 32
+    peak_lr: float = 3e-6
+    min_lr: float = 3e-7
+    log_interval: int = 10
+    ckpt_interval: int = 100
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_long_final.pt"
+    stage_prefix: str = "sft_ultralong"
+    wandb_run_name: str = "osrt-sft-ultralong"
+
+    # Same Nemotron-heavy + diversity mix as SFTLongConfig (inherited
+    # from `datasets`). The mix doesn't change between SFT-long and
+    # SFT-ultralong — only the context window does.
+
+
 class GRPOConfig:
     """GRPO config for v5 — verifiable math rewards on top of SFT."""
 

@@ -609,6 +609,51 @@ def sft_long():
 
 
 # =============================================================================
+# SFT-ULTRALONG (seq_len 8192, resumes from sft_long_final.pt)
+# =============================================================================
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_ultralong():
+    """Ultra-long-context SFT (seq_len 8192) resuming from sft_long_final.pt.
+
+    500 steps at the same Nemotron-heavy mix, batch 2 × accum 32 to
+    keep effective batch at 64 sequences within H100 80GB at seq 8192.
+    Cooler LR (3e-6 peak) for the third successive fine-tune.
+    """
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.sft_train import run_sft
+    from nano_osrt.train_config import SFTUltraLongConfig
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    sft_ultralong_cfg = SFTUltraLongConfig()
+    run_sft(model_config, sft_ultralong_cfg, vol, tok)
+
+
+# =============================================================================
 # GRPO (REINFORCEMENT LEARNING)
 # =============================================================================
 
@@ -1041,9 +1086,10 @@ def main(stage: str = "pretrain"):
     --stage sweep      Gumbel schedule sweep (configs B, C, D)
     --stage ablate     Optimizer × routing ablation (cells A/B/C/D, 1200 steps each)
     --stage pretrain   Full pre-training with progressive seq_len curriculum
-    --stage sft        Balanced SFT on the final pretrained checkpoint
-    --stage sft_long   Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
-    --stage grpo       GRPO RL on the SFT checkpoint (verifiable math rewards)
+    --stage sft            Balanced SFT on the final pretrained checkpoint
+    --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
+    --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
+    --stage grpo           GRPO RL on the SFT checkpoint (verifiable math rewards)
     """
     if stage == "sanity":
         sanity.remote()
@@ -1057,10 +1103,13 @@ def main(stage: str = "pretrain"):
         sft.remote()
     elif stage == "sft_long":
         sft_long.remote()
+    elif stage == "sft_ultralong":
+        sft_ultralong.remote()
     elif stage == "grpo":
         grpo.remote()
     else:
         print(
             f"Unknown stage: {stage}. "
-            f"Use sanity, sweep, ablate, pretrain, sft, sft_long, or grpo"
+            f"Use sanity, sweep, ablate, pretrain, sft, sft_long, "
+            f"sft_ultralong, or grpo"
         )
