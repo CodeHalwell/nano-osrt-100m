@@ -572,7 +572,12 @@ class SFTUltraLongConfig(SFTLongConfig):
     log_interval: int = 10
     ckpt_interval: int = 50
 
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_long_final.pt"
+    # Points at the explicit step file rather than osrt_v5_sft_long_final.pt
+    # because SFT-long was stopped early at step 500 (budget-driven cut to
+    # preserve compute for SFT-ultralong + GRPO; final loss 1.32 vs the
+    # ~1.10 a full 1000-step run would have hit). The step-500 ckpt has the
+    # same HRA contract as the final would have — no functional difference.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_long_step_500.pt"
     stage_prefix: str = "sft_ultralong"
     wandb_run_name: str = "osrt-sft-ultralong"
 
