@@ -654,6 +654,147 @@ def sft_ultralong():
 
 
 # =============================================================================
+# EVALUATE (lm-eval-harness pass: gsm8k + IFEval + MMLU-stem)
+# =============================================================================
+
+
+@app.function(
+    gpu="H100",
+    image=image.pip_install("lm-eval"),  # ensure lm-eval is in container
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=14400,  # 4h: comfortable headroom for full lm-eval suite
+)
+def evaluate(
+    ckpt_name: str = "osrt_v5_sft_ultralong_final.pt",
+    tag: str = "pre-grpo",
+    tasks: str = "gsm8k,ifeval,mmlu_stem",
+    limit: int | None = None,
+):
+    """Run lm-evaluation-harness on the latest SFT/GRPO checkpoint.
+
+    Runs gsm8k + IFEval + MMLU-stem by default. Results are written to
+    `/vol/checkpoints/v5/eval_<tag>.json` so pre-GRPO and post-GRPO
+    runs can be diffed straightforwardly.
+
+    Args:
+        ckpt_name: filename under /vol/checkpoints/v5/. Default points
+            at the SFT-ultralong final ckpt; pass
+            "osrt_v5_grpo_final.pt" (or step-named variants) for the
+            post-GRPO eval.
+        tag: short label embedded in the output filename and W&B run.
+            Use "pre-grpo" / "post-grpo" / "post-iter-grpo" for the
+            comparison sequence.
+        tasks: comma-separated lm-eval task names. Defaults match the
+            three benchmarks we care about; override for ad-hoc runs.
+        limit: cap problems per task for quick smoke tests. None =
+            full benchmark. 50 is a reasonable smoke value.
+
+    Cost: ~$5 for the default three-task pass on H100 (gsm8k 1319
+    problems × 256 generated tokens dominates).
+    """
+    import json
+    import os
+
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
+
+    from lm_eval import simple_evaluate
+
+    from nano_osrt.lm_eval_wrapper import NanoOSRTLMEval
+
+    ckpt_path = f"/vol/checkpoints/v5/{ckpt_name}"
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}. Available files: "
+            f"{sorted(os.listdir('/vol/checkpoints/v5'))[:10]}",
+        )
+
+    print("=" * 60)
+    print(f"NanoOSRT — lm-eval-harness ({tag})")
+    print("=" * 60)
+    print(f"Checkpoint     : {ckpt_path}")
+    print(f"Tasks          : {tasks}")
+    print(f"Per-task limit : {limit or 'full'}")
+    print()
+
+    wrapper = NanoOSRTLMEval(
+        ckpt_path=ckpt_path,
+        tokenizer_path="/vol/tokenizer",
+        hra_enabled=True,
+        hra_rank=256,
+        batch_size=8,
+        device="cuda",
+    )
+
+    task_list = [t.strip() for t in tasks.split(",") if t.strip()]
+
+    if wandb is not None:
+        wandb.init(
+            project="nano-osrt",
+            name=f"osrt-eval-{tag}",
+            config={
+                "stage": "evaluate",
+                "ckpt_name": ckpt_name,
+                "tasks": task_list,
+                "limit": limit,
+            },
+        )
+
+    print(f"Running lm-eval on {task_list}...", flush=True)
+    results = simple_evaluate(
+        model=wrapper,
+        tasks=task_list,
+        limit=limit,
+        log_samples=False,  # don't dump every prompt+response — JSON gets huge
+    )
+
+    # Strip the bulky "samples" + "model_dump" entries before saving;
+    # we want the headline numbers, not the raw transcripts.
+    summary = {
+        "tag": tag,
+        "ckpt_name": ckpt_name,
+        "tasks": task_list,
+        "limit": limit,
+        "results": results.get("results", {}),
+        "configs": {k: v.get("task", k) for k, v in results.get("configs", {}).items()},
+    }
+
+    out_path = f"/vol/checkpoints/v5/eval_{tag}.json"
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"\nResults written to {out_path}", flush=True)
+
+    # Print headline numbers for stdout/Modal log readability.
+    print("\n=== Headline metrics ===")
+    for task_name, task_results in summary["results"].items():
+        print(f"\n[{task_name}]")
+        for metric, value in task_results.items():
+            if isinstance(value, (int, float)):
+                print(f"  {metric}: {value:.4f}")
+            else:
+                print(f"  {metric}: {value}")
+
+    if wandb is not None:
+        # Log flat metrics so they're queryable + plottable across runs.
+        for task_name, task_results in summary["results"].items():
+            for metric, value in task_results.items():
+                if isinstance(value, (int, float)):
+                    wandb.log({f"eval/{task_name}/{metric}": value})
+        wandb.finish()
+
+    vol.commit()
+
+
+# =============================================================================
 # GRPO (REINFORCEMENT LEARNING)
 # =============================================================================
 
@@ -1089,6 +1230,11 @@ def main(stage: str = "pretrain"):
     --stage sft            Balanced SFT on the final pretrained checkpoint
     --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
+    --stage evaluate       lm-eval-harness pass (gsm8k + IFEval + MMLU-stem). Args:
+                             --ckpt-name <filename in /vol/checkpoints/v5/>
+                             --tag <pre-grpo|post-grpo|...>
+                             --tasks <comma-separated, default gsm8k,ifeval,mmlu_stem>
+                             --limit <int or None for full benchmark>
     --stage grpo           GRPO RL on the SFT checkpoint (verifiable math rewards)
     """
     if stage == "sanity":
@@ -1105,11 +1251,13 @@ def main(stage: str = "pretrain"):
         sft_long.remote()
     elif stage == "sft_ultralong":
         sft_ultralong.remote()
+    elif stage == "evaluate":
+        evaluate.remote()
     elif stage == "grpo":
         grpo.remote()
     else:
         print(
             f"Unknown stage: {stage}. "
             f"Use sanity, sweep, ablate, pretrain, sft, sft_long, "
-            f"sft_ultralong, or grpo"
+            f"sft_ultralong, evaluate, or grpo"
         )
