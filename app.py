@@ -54,6 +54,23 @@ vol = modal.Volume.from_name("osrt-checkpoints", create_if_missing=True)
 tokenizer_vol = modal.Volume.from_name(
     "osrt-v4-tokenizer", create_if_missing=True,
 )
+# Persistent HF datasets cache. First run downloads dataset shards from
+# the Hub into this volume; subsequent runs read from local volume
+# storage, which removes Hub round-trips and the latency variance that
+# caused 20→75 sec/step swings during SFT-long. Streaming mode bypasses
+# the dataset cache for the iterable itself, but it still uses this
+# directory for split metadata, dataset_info.json, and any non-streamed
+# auxiliary downloads — small but noticeable wins.
+hf_cache_vol = modal.Volume.from_name(
+    "osrt-hf-cache", create_if_missing=True,
+)
+
+# Image variant for data-heavy stages (SFT / eval / GRPO) that mount
+# the HF cache volume. Sets HF_DATASETS_CACHE so the datasets library
+# auto-discovers the cache without any code change. The base `image`
+# is unchanged so pretrain (which doesn't mount this volume) is
+# unaffected.
+data_image = image.env({"HF_DATASETS_CACHE": "/vol/hf_cache"})
 
 
 # =============================================================================
@@ -524,10 +541,11 @@ def ablate():
 
 @app.function(
     gpu="H100",
-    image=image,
+    image=data_image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -569,10 +587,11 @@ def sft():
 
 @app.function(
     gpu="H100",
-    image=image,
+    image=data_image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -615,10 +634,11 @@ def sft_long():
 
 @app.function(
     gpu="H100",
-    image=image,
+    image=data_image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -660,10 +680,11 @@ def sft_ultralong():
 
 @app.function(
     gpu="H100",
-    image=image.pip_install("lm-eval"),  # ensure lm-eval is in container
+    image=data_image.pip_install("lm-eval"),  # ensure lm-eval is in container
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -801,10 +822,11 @@ def evaluate(
 
 @app.function(
     gpu="H100",
-    image=image,
+    image=data_image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),

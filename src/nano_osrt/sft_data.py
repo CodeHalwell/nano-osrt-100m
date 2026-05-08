@@ -584,10 +584,20 @@ def make_sft_loader(
         answer_open=answer_open,
         answer_close=answer_close,
     )
+    # Multi-worker streaming with persistent workers + prefetch.
+    # SFT has no phase boundaries (unlike pretrain's seq_len curriculum),
+    # so the PyGILState_Release crash that forced num_workers=0 during
+    # pretrain phase transitions does not apply here. Each worker keeps
+    # its own HF stream, tokenizer, and packing buffer alive across
+    # batches; prefetch_factor=4 means up to 16 batches sit ready for
+    # the GPU at any time, which absorbs HF Hub latency blips that
+    # would otherwise stall the training loop.
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
+        prefetch_factor=4,
         pin_memory=True,
         drop_last=True,
     )
