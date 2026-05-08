@@ -455,7 +455,12 @@ class SFTLongConfig(SFTConfig):
     ckpt_interval: int = 250
 
     # Resume from the base SFT checkpoint with HRA already applied.
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_final.pt"
+    # Points at the explicit step file rather than osrt_v5_sft_final.pt
+    # because base SFT was stopped early at step 2500 (Option B budget
+    # plan — eval loss already at 1.02 train, no point in chasing the
+    # remaining 2500 steps with diminishing returns and a loss curve
+    # that's already in the "starting to memorise" zone).
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_step_2500.pt"
     hra_before_load: bool = True
     stage_prefix: str = "sft_long"
 
