@@ -76,6 +76,16 @@ class NanoOSRTLMEval(LM):
         but the guard stays for portability.
     """
 
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are a careful, accurate assistant. For every question:\n"
+        "1. Reason step by step inside <|think|>...<|/think|>.\n"
+        "2. Put your final answer inside <|answer|>...<|/answer|>.\n"
+        "For math problems, the answer block must contain only the final "
+        "numerical value. For instruction-following tasks, obey every "
+        "constraint exactly. For multiple-choice, the answer block contains "
+        "just the letter of the correct option."
+    )
+
     def __init__(
         self,
         ckpt_path: str,
@@ -85,11 +95,55 @@ class NanoOSRTLMEval(LM):
         batch_size: int = 8,
         max_length: int = 8192,
         device: str = "cuda",
+        chat_format: bool = True,
+        system_prompt: str | None = None,
+        default_temperature: float = 0.2,
+        max_temperature: float = 0.5,
     ) -> None:
+        """
+        Eval-time prompt + sampling controls
+        ────────────────────────────────────
+        chat_format: when True, every lm-eval `context` is wrapped in the
+            model's trained chat schema:
+              <|system|>{system_prompt}<|user|>{context}<|assistant|>
+            The model was SFT'd to emit <|think|>...<|/think|><|answer|>
+            ...<|/answer|> after <|assistant|>, so this puts the model in
+            the distribution it was trained on. Continuations (for
+            loglikelihood) and generations (for generate_until) live
+            after the <|assistant|> tag, exactly as during SFT.
+
+            System prompts were NOT seen during SFT — including one is
+            mildly out-of-distribution. Default prompt is short and
+            restates the format the model already produces, minimising
+            risk while giving the model a priming nudge for accuracy.
+            Set system_prompt="" (empty string) to skip the system block.
+
+        default_temperature: applied when the benchmark task does not
+            pass a temperature in gen_kwargs. 0.2 (vs the standard
+            greedy 0.0) introduces tiny stochasticity — enough to
+            unstick degenerate ties, not enough to materially change
+            answers on math/instruction benchmarks. Keeps eval close to
+            deterministic ("closer to 0 than 1" — see review note in
+            commit message).
+
+        max_temperature: hard cap on whatever the benchmark passes.
+            Some tasks default to 0.7 or 1.0 in their configuration,
+            which is wrong for our use case (we want repeatable
+            benchmark numbers, not creative samples). Cap at 0.5 so a
+            passed-in 1.0 still produces a near-deterministic eval.
+        """
         super().__init__()
         self._device = torch.device(device)
         self._batch_size = batch_size
         self._max_length = max_length
+        self._chat_format = chat_format
+        self._system_prompt = (
+            system_prompt
+            if system_prompt is not None
+            else self.DEFAULT_SYSTEM_PROMPT
+        )
+        self._default_temperature = float(default_temperature)
+        self._max_temperature = float(max_temperature)
 
         # Imports here to avoid loading torch dependencies at module
         # import time when this file might be parsed but not used.
@@ -181,6 +235,30 @@ class NanoOSRTLMEval(LM):
             tokens = [tokens]
         return self._tok.decode(tokens, skip_special_tokens=False)
 
+    # ── Chat-format helper ─────────────────────────────────────────
+
+    def _wrap_context(self, context: str) -> str:
+        """Wrap raw lm-eval context in the SFT-trained chat schema.
+
+        Schema (matches sft_data.py SFTStream output):
+            <|system|>{system_prompt}<|user|>{context}<|assistant|>
+
+        The model expects to start emitting at <|assistant|>; downstream
+        token sequences (continuations for loglikelihood, generated
+        text for generate_until) land in the position the model was
+        trained to produce <|think|>...<|/think|><|answer|>...<|/answer|>.
+
+        When chat_format=False, returns context unchanged — useful for
+        debugging or for benchmarks that already supply chat-formatted
+        prompts.
+        """
+        if not self._chat_format:
+            return context
+        prefix = ""
+        if self._system_prompt:
+            prefix = f"<|system|>{self._system_prompt}"
+        return f"{prefix}<|user|>{context}<|assistant|>"
+
     # ── loglikelihood (multiple-choice scoring) ────────────────────
 
     @torch.no_grad()
@@ -209,7 +287,12 @@ class NanoOSRTLMEval(LM):
         items = []
         for orig_idx, req in enumerate(requests):
             context, continuation = req.args
-            ctx_ids = self.tok_encode(context)
+            # Wrap context in the SFT chat schema so the model is in
+            # the distribution it was trained on. The continuation is
+            # NOT wrapped — it lives in the position where the model
+            # learned to emit <|think|>... output, so direct comparison
+            # of the raw answer letter / numeric token works.
+            ctx_ids = self.tok_encode(self._wrap_context(context))
             cont_ids = self.tok_encode(continuation)
             # Truncate from the left if context+continuation exceeds
             # max_length. We keep the continuation intact and lop off
@@ -300,22 +383,36 @@ class NanoOSRTLMEval(LM):
         .generate, then post-process to truncate at the first stop
         string encountered.
 
-        Sampling is deterministic by default (temperature=0). Override
-        per-request via `gen_kwargs["temperature"]` and
-        `gen_kwargs["top_p"]` if a benchmark configures otherwise.
+        Sampling is near-deterministic by default (default_temperature
+        0.2). Per-request gen_kwargs["temperature"] is honoured but
+        clamped to max_temperature (0.5) so a benchmark misconfigured
+        with do_sample=True + temperature=1.0 still produces
+        reproducible eval numbers rather than creative variations.
         """
         results: list[str] = []
         for req in requests:
             context, gen_kwargs = req.args
-            until = gen_kwargs.get("until") or []
+            until = list(gen_kwargs.get("until") or [])
             if isinstance(until, str):
                 until = [until]
+            # Always stop at the model's trained end-of-answer tag —
+            # the answer block is the target output for every benchmark
+            # we run, and continuing past it just generates noise that
+            # might confuse the task's answer extractor.
+            if self._chat_format and "<|/answer|>" not in until:
+                until.append("<|/answer|>")
             max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
-            temperature = float(gen_kwargs.get("temperature", 0.0))
+            requested_temp = float(
+                gen_kwargs.get("temperature", self._default_temperature),
+            )
+            temperature = min(requested_temp, self._max_temperature)
             top_p = float(gen_kwargs.get("top_p", 1.0))
             top_k = int(gen_kwargs.get("top_k", 0))
 
-            ctx_ids = self.tok_encode(context)
+            # Wrap with SFT chat schema. The generation will start
+            # immediately after <|assistant|>, exactly where the model
+            # learned to emit <|think|>...<|/think|><|answer|>... .
+            ctx_ids = self.tok_encode(self._wrap_context(context))
             # Leave room for max_new tokens within the model's
             # max_position_embeddings. Drop oldest context if needed.
             keep = self._max_length - max_new
