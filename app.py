@@ -35,6 +35,13 @@ image = (
         # failure mode: sanity run stuck at "Fetching first batch..."
         # for 45 min with no output until manually stopped.
         "TOKENIZERS_PARALLELISM": "false",
+        # Persistent HF datasets cache. Volume mounted by SFT/eval/GRPO
+        # functions; pretrain doesn't mount it, but HF datasets handles
+        # a non-existent path gracefully under streaming=True (the
+        # iterable doesn't touch the cache; only metadata downloads do,
+        # and those mkdir the path on demand within the container's
+        # writable layer if no volume is mounted there).
+        "HF_DATASETS_CACHE": "/vol/hf_cache",
     })
     .pip_install(
         "torch==2.10.0+cu128",
@@ -43,6 +50,12 @@ image = (
     .pip_install(
         "transformers", "datasets", "lion-pytorch", "triton", "wandb",
         "tokenizers", "sentencepiece", "safetensors",
+        # lm-eval baked into the base image so the `evaluate` function
+        # doesn't need a derived image. Modal disallows .pip_install
+        # after .add_local_dir; folding it in here keeps the build chain
+        # linear (env → apt → pip → add_local) so any function can
+        # evaluate without an image rebuild.
+        "lm-eval",
     )
     .add_local_dir("src/nano_osrt", remote_path="/root/nano_osrt")
     .add_local_dir("scripts", remote_path="/root/scripts")
@@ -61,16 +74,14 @@ tokenizer_vol = modal.Volume.from_name(
 # the dataset cache for the iterable itself, but it still uses this
 # directory for split metadata, dataset_info.json, and any non-streamed
 # auxiliary downloads — small but noticeable wins.
+#
+# HF_DATASETS_CACHE=/vol/hf_cache is set in the base image's env block
+# (above) so the datasets library auto-discovers it. SFT/eval/GRPO
+# functions mount this volume; pretrain skips the mount and HF falls
+# back gracefully under streaming=True.
 hf_cache_vol = modal.Volume.from_name(
     "osrt-hf-cache", create_if_missing=True,
 )
-
-# Image variant for data-heavy stages (SFT / eval / GRPO) that mount
-# the HF cache volume. Sets HF_DATASETS_CACHE so the datasets library
-# auto-discovers the cache without any code change. The base `image`
-# is unchanged so pretrain (which doesn't mount this volume) is
-# unaffected.
-data_image = image.env({"HF_DATASETS_CACHE": "/vol/hf_cache"})
 
 
 # =============================================================================
@@ -541,7 +552,7 @@ def ablate():
 
 @app.function(
     gpu="H100",
-    image=data_image,
+    image=image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
@@ -587,7 +598,7 @@ def sft():
 
 @app.function(
     gpu="H100",
-    image=data_image,
+    image=image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
@@ -634,7 +645,7 @@ def sft_long():
 
 @app.function(
     gpu="H100",
-    image=data_image,
+    image=image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
@@ -680,7 +691,7 @@ def sft_ultralong():
 
 @app.function(
     gpu="H100",
-    image=data_image.pip_install("lm-eval"),  # ensure lm-eval is in container
+    image=image,  # lm-eval is in the base image's pip_install
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
@@ -822,7 +833,7 @@ def evaluate(
 
 @app.function(
     gpu="H100",
-    image=data_image,
+    image=image,
     volumes={
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
