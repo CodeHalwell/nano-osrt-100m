@@ -1,0 +1,3 @@
+## 2026-05-08 - Gradio Parameter Tooltips & Focus
+**Learning:** Adding `info` parameters to `gr.Slider` components greatly improves usability by providing inline tooltips without cluttering the UI, while `autofocus=True` on the primary `gr.Textbox` reduces interaction friction immediately upon page load. Both are native Gradio parameters making them easy, zero-dependency UX wins.
+**Action:** Always look for opportunities to document technical parameters inline using `info` and use `autofocus=True` for the primary chat/message input element in Gradio apps.
