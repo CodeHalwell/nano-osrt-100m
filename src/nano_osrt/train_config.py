@@ -536,7 +536,11 @@ class SFTUltraLongConfig(SFTLongConfig):
     Compute cost: attention is O(N²) so seq 8192 vs 4096 is 4× the
     attention compute per token. With 4× more tokens per microbatch
     too (4096 → 8192 plus same effective batch shape), this is the
-    most expensive SFT phase — kept short (500 steps) to fit budget.
+    most expensive SFT phase — kept short (200 steps) to fit budget.
+    Trimmed from the original 500 once it became clear that SFT-long
+    delivers most of the long-context adaptation; ultralong is a
+    polish pass to anchor seq 8192 behaviour before GRPO, not a
+    full curriculum stage.
 
     HRA contract:
       - hra_before_load=True (inherited) — sft_long_final.pt has HRA
@@ -548,10 +552,14 @@ class SFTUltraLongConfig(SFTLongConfig):
       - Even cooler peak (3e-6) — third successive fine-tune, the
         adapters are well-formed and need light polish, not heavy
         re-shaping.
+      - Cosine over total_steps=200; warmup scaled down to 10 steps
+        (5 % of total) to match the shorter horizon. Without this the
+        old 25-step warmup would consume 12.5 % of the run before any
+        cosine taper — too much.
     """
 
-    total_steps: int = 500
-    warmup_steps: int = 25
+    total_steps: int = 200
+    warmup_steps: int = 10
     seq_len: int = 8192
     # Halve batch_size again, double grad_accum_steps to keep effective
     # batch at 64 sequences per gradient step. Memory budget at 80 GB
@@ -562,7 +570,7 @@ class SFTUltraLongConfig(SFTLongConfig):
     peak_lr: float = 3e-6
     min_lr: float = 3e-7
     log_interval: int = 10
-    ckpt_interval: int = 100
+    ckpt_interval: int = 50
 
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_long_final.pt"
     stage_prefix: str = "sft_ultralong"
