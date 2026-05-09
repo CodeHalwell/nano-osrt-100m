@@ -299,24 +299,34 @@ class NanoOSRTLMEval(LM):
         return f"{prefix}<|user|>{context}<|assistant|>"
 
     def _extract_answer(self, text: str) -> str:
-        """Strip <|think|>...<|/think|> and return only <|answer|>...
-        <|/answer|> contents.
+        """Strip <|think|>...<|/think|> and return the <|answer|>...
+        <|/answer|> contents formatted for lm-eval's filter chain.
 
-        lm-eval's gsm8k extractor looks for "#### X", "\\boxed{X}", or
-        "the answer is X" in the generation. Our model emits answers as
-        "<|think|>...<|/think|><|answer|>X<|/answer|>" — none of the
-        standard patterns match. Pulling the answer block out and
-        returning just its contents lets the standard extractor work
-        (it will find the bare number "X" via its last-number fallback).
+        Lm-eval's gsm8k task uses a two-stage filter:
+          - strict-match:    "#### (\\-?[0-9\\.\\,]+)"
+          - flexible-extract: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+        Smoke-L5 (commit f931406) confirmed bare extracted answers
+        like "9" come back as "[invalid]" from BOTH filters — the
+        strict pattern requires a literal "#### " prefix and the
+        flexible pattern needs surrounding context that a single
+        digit doesn't supply.
+
+        Fix: emit "{answer}\n#### {answer}". Two payoffs:
+          1. strict-match finds "#### 9" → valid extraction.
+          2. flexible-extract finds "9" at end of string.
+        The duplication is harmless on tasks that don't filter
+        (loglikelihood) and only mildly extra-text-y on IFEval
+        (where graders test the response content, not its
+        position-of-number formatting).
 
         Behaviour:
-          - If <|answer|>...<|/answer|> found: return the contents
-            (with surrounding whitespace stripped).
-          - If only <|answer|> found (no close tag): return everything
-            after <|answer|>, stripped.
-          - If no <|answer|> tag at all: return the input unchanged.
-            This preserves output for the (likely buggy) case where the
-            model fails to emit the answer block within max_gen_toks.
+          - If <|answer|>...<|/answer|> found: extract contents,
+            strip, and emit dual format.
+          - If only <|answer|> found (no close tag): everything
+            after <|answer|>, stripped, dual-formatted.
+          - If no <|answer|> tag at all: return input unchanged
+            (preserves the model's full output for the failure
+            case where it never emits the answer block).
 
         Always called when extract_answer_block=True.
         """
@@ -331,7 +341,10 @@ class NanoOSRTLMEval(LM):
         close_idx = rest.find(close_tag)
         if close_idx != -1:
             rest = rest[:close_idx]
-        return rest.strip()
+        ans = rest.strip()
+        if not ans:
+            return text
+        return f"{ans}\n#### {ans}"
 
     # ── loglikelihood (multiple-choice scoring) ────────────────────
 
