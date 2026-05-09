@@ -712,7 +712,18 @@ def sft_ultralong():
 def evaluate(
     ckpt_name: str = "osrt_v5_sft_ultralong_final.pt",
     tag: str = "pre-grpo",
-    tasks: str = "gsm8k,ifeval,mmlu_stem",
+    tasks: str = (
+        # Original three: math reasoning + instruction following + STEM knowledge
+        "gsm8k,ifeval,mmlu_stem,"
+        # Small-model commonsense suite — gives a clean GPT-2-class
+        # comparison anchor. GPT-2 medium (355M) reference numbers:
+        #   hellaswag 33%, arc_easy 49%, arc_challenge 22%,
+        #   piqa 63%, winogrande 52%.
+        # All five are pure loglikelihood scoring (no generation),
+        # so total added cost is ~$3-4 on top of the generate-heavy
+        # gsm8k + ifeval. Adds ~30 min to the full pass.
+        "hellaswag,arc_easy,arc_challenge,piqa,winogrande"
+    ),
     limit: int | None = None,
 ):
     """Run lm-evaluation-harness on the latest SFT/GRPO checkpoint.
@@ -1272,7 +1283,9 @@ def main(stage: str = "pretrain"):
     --stage evaluate       lm-eval-harness pass (gsm8k + IFEval + MMLU-stem). Args:
                              --ckpt-name <filename in /vol/checkpoints/v5/>
                              --tag <pre-grpo|post-grpo|...>
-                             --tasks <comma-separated, default gsm8k,ifeval,mmlu_stem>
+                             --tasks <comma-separated; default 8-task suite:
+                                gsm8k, ifeval, mmlu_stem, hellaswag,
+                                arc_easy, arc_challenge, piqa, winogrande>
                              --limit <int or None for full benchmark>
     --stage grpo           GRPO RL on the SFT checkpoint (verifiable math rewards)
     """
