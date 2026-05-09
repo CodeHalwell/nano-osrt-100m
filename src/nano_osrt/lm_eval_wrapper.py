@@ -76,15 +76,29 @@ class NanoOSRTLMEval(LM):
         but the guard stays for portability.
     """
 
-    DEFAULT_SYSTEM_PROMPT = (
-        "You are a careful, accurate assistant. For every question:\n"
-        "1. Reason step by step inside <|think|>...<|/think|>.\n"
-        "2. Put your final answer inside <|answer|>...<|/answer|>.\n"
-        "For math problems, the answer block must contain only the final "
-        "numerical value. For instruction-following tasks, obey every "
-        "constraint exactly. For multiple-choice, the answer block contains "
-        "just the letter of the correct option."
-    )
+    # Empty by default. Earlier versions populated this with a guidance
+    # block referencing <|think|>...<|/think|><|answer|>...<|/answer|>
+    # by name. That backfired badly:
+    #
+    #   1. Tokenisation embedded the literal special tokens (IDs 7-10)
+    #      into the prompt context.
+    #   2. repetition_penalty=1.2 then suppressed those exact tokens
+    #      during generation.
+    #   3. The model wanted to emit <|think|> after <|assistant|> (as
+    #      trained) but its score was divided by 1.2, so it fell back
+    #      to literal "<" + "think" + ">" text tokens.
+    #   4. Output devolved into hallucinated tool-call narrative
+    #      ("looking at the tools provided...") that bled in from
+    #      Nemotron tool_calling examples.
+    #
+    # Empty system prompt restores the in-distribution wrap
+    # "<|user|>{ctx}<|assistant|>" — exactly what SFT trained on.
+    # The model was never SFT'd with system prompts at all; including
+    # one is OOD even when it doesn't break the special tokens.
+    #
+    # If a future SFT pass introduces system prompts, repopulate this
+    # with natural-language guidance (no literal <|think|> markers).
+    DEFAULT_SYSTEM_PROMPT = ""
 
     def __init__(
         self,
