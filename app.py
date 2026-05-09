@@ -798,16 +798,26 @@ def evaluate(
             },
         )
 
-    print(f"Running lm-eval on {task_list}...", flush=True)
+    # Sample logging is gated on the smoke run — when limit is set
+    # (i.e. iterating on the wrapper), we want every prompt+response
+    # in the JSON to debug. Full eval (limit=None) skips it because
+    # the transcript dump bloats the JSON ~100×.
+    log_samples = limit is not None
+    print(
+        f"Running lm-eval on {task_list}... "
+        f"(limit={limit}, log_samples={log_samples})",
+        flush=True,
+    )
     results = simple_evaluate(
         model=wrapper,
         tasks=task_list,
         limit=limit,
-        log_samples=False,  # don't dump every prompt+response — JSON gets huge
+        log_samples=log_samples,
     )
 
-    # Strip the bulky "samples" + "model_dump" entries before saving;
-    # we want the headline numbers, not the raw transcripts.
+    # Strip the bulky "model_dump" entry. Keep "samples" iff log_samples
+    # was on (smoke runs) so we can read what the model actually emitted
+    # — the whole point of running smokes.
     summary = {
         "tag": tag,
         "ckpt_name": ckpt_name,
@@ -816,6 +826,14 @@ def evaluate(
         "results": results.get("results", {}),
         "configs": {k: v.get("task", k) for k, v in results.get("configs", {}).items()},
     }
+    if log_samples and "samples" in results:
+        # Cap to first 5 per task to keep JSON readable even at limit=50.
+        # Five samples per task is enough to see if formatting / extraction
+        # is working without burying us in transcripts.
+        capped_samples = {}
+        for task_name, sample_list in results["samples"].items():
+            capped_samples[task_name] = sample_list[:5]
+        summary["samples"] = capped_samples
 
     out_path = f"/vol/checkpoints/v5/eval_{tag}.json"
     with open(out_path, "w") as f:
