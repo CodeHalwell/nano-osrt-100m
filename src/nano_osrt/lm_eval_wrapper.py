@@ -95,48 +95,67 @@ class NanoOSRTLMEval(LM):
         batch_size: int = 8,
         max_length: int = 8192,
         device: str = "cuda",
-        chat_format: bool = True,
+        chat_format_generate: bool = True,
+        chat_format_loglikelihood: bool = False,
         system_prompt: str | None = None,
-        default_temperature: float = 0.2,
-        max_temperature: float = 0.5,
+        default_temperature: float = 0.7,
+        max_temperature: float = 1.0,
+        default_top_p: float = 0.9,
+        default_top_k: int = 50,
+        default_repetition_penalty: float = 1.2,
+        extract_answer_block: bool = True,
     ) -> None:
         """
         Eval-time prompt + sampling controls
         ────────────────────────────────────
-        chat_format: when True, every lm-eval `context` is wrapped in the
-            model's trained chat schema:
+        chat_format_generate (default True): wraps generate_until contexts
+            in the model's trained chat schema:
               <|system|>{system_prompt}<|user|>{context}<|assistant|>
             The model was SFT'd to emit <|think|>...<|/think|><|answer|>
-            ...<|/answer|> after <|assistant|>, so this puts the model in
-            the distribution it was trained on. Continuations (for
-            loglikelihood) and generations (for generate_until) live
-            after the <|assistant|> tag, exactly as during SFT.
+            ...<|/answer|> after <|assistant|>. Helpful for gsm8k / IFEval
+            / open-ended generation.
 
-            System prompts were NOT seen during SFT — including one is
-            mildly out-of-distribution. Default prompt is short and
-            restates the format the model already produces, minimising
-            risk while giving the model a priming nudge for accuracy.
-            Set system_prompt="" (empty string) to skip the system block.
+        chat_format_loglikelihood (default False): wraps loglikelihood
+            contexts the same way. Disabled by default because empirical
+            smoke runs showed it breaks MMLU scoring — the model is asked
+            to score " A"/" B"/" C"/" D" continuations after <|assistant|>
+            where it expects <|think|>, producing essentially-random
+            (~25 %) results. Raw context for loglikelihood lets the
+            model's pretrained next-token distribution rank multiple-choice
+            options in the expected way.
 
-        default_temperature: applied when the benchmark task does not
-            pass a temperature in gen_kwargs. 0.2 (vs the standard
-            greedy 0.0) introduces tiny stochasticity — enough to
-            unstick degenerate ties, not enough to materially change
-            answers on math/instruction benchmarks. Keeps eval close to
-            deterministic ("closer to 0 than 1" — see review note in
-            commit message).
+        Sampling defaults are tuned for an undertrained 363M MoE that
+        collapses into repetition loops at low temperature. Local probes
+        (probe3.py) showed:
+          - temp 0.2  → degenerate loops ("17*23 = 17*(2*23) = 17*(2*23)..."
+                        for 30+ iterations, never closes <|/think|>)
+          - temp 0.7  + repetition_penalty 1.0 → enters bizarre nested
+                        states (<|/think|><|answer|><think>...)
+          - temp 0.7, top_p 0.9, top_k 50, rep_penalty 1.2 → coherent
+                        attempts that close all three tags in <300 tokens
+                        with structurally-correct (if mathematically wrong)
+                        reasoning.
+        Future better-trained checkpoints should drop temperature and
+        repetition_penalty back toward 0.2 / 1.0 as they stop repeating.
 
-        max_temperature: hard cap on whatever the benchmark passes.
-            Some tasks default to 0.7 or 1.0 in their configuration,
-            which is wrong for our use case (we want repeatable
-            benchmark numbers, not creative samples). Cap at 0.5 so a
-            passed-in 1.0 still produces a near-deterministic eval.
+        max_temperature caps benchmark-passed temperatures at 1.0 to
+        avoid pure-noise sampling.
+
+        extract_answer_block (default True): post-processes generations
+            to return only the contents of the first <|answer|>...
+            <|/answer|> block. Without this, lm-eval's gsm8k extractor
+            sees "<|think|>... long reasoning ... <|/think|><|answer|>42"
+            and fails to find the numeric answer because its regex
+            patterns target "#### 42", "\\boxed{42}", or "the answer is 42"
+            — none of which are present. Returning just "42" lets the
+            standard extractor work.
         """
         super().__init__()
         self._device = torch.device(device)
         self._batch_size = batch_size
         self._max_length = max_length
-        self._chat_format = chat_format
+        self._chat_format_generate = chat_format_generate
+        self._chat_format_loglikelihood = chat_format_loglikelihood
         self._system_prompt = (
             system_prompt
             if system_prompt is not None
@@ -144,6 +163,10 @@ class NanoOSRTLMEval(LM):
         )
         self._default_temperature = float(default_temperature)
         self._max_temperature = float(max_temperature)
+        self._default_top_p = float(default_top_p)
+        self._default_top_k = int(default_top_k)
+        self._default_repetition_penalty = float(default_repetition_penalty)
+        self._extract_answer_block = extract_answer_block
 
         # Imports here to avoid loading torch dependencies at module
         # import time when this file might be parsed but not used.
@@ -237,27 +260,64 @@ class NanoOSRTLMEval(LM):
 
     # ── Chat-format helper ─────────────────────────────────────────
 
-    def _wrap_context(self, context: str) -> str:
+    def _wrap_context(self, context: str, *, for_generate: bool) -> str:
         """Wrap raw lm-eval context in the SFT-trained chat schema.
 
         Schema (matches sft_data.py SFTStream output):
             <|system|>{system_prompt}<|user|>{context}<|assistant|>
 
-        The model expects to start emitting at <|assistant|>; downstream
-        token sequences (continuations for loglikelihood, generated
-        text for generate_until) land in the position the model was
-        trained to produce <|think|>...<|/think|><|answer|>...<|/answer|>.
-
-        When chat_format=False, returns context unchanged — useful for
-        debugging or for benchmarks that already supply chat-formatted
-        prompts.
+        Two independent gates:
+          - generate_until paths use chat_format_generate (default True
+            — gsm8k / IFEval need it to put the model in distribution)
+          - loglikelihood paths use chat_format_loglikelihood (default
+            False — MMLU scoring is broken by chat wrap, see __init__
+            docstring)
         """
-        if not self._chat_format:
+        gate = (
+            self._chat_format_generate if for_generate
+            else self._chat_format_loglikelihood
+        )
+        if not gate:
             return context
         prefix = ""
         if self._system_prompt:
             prefix = f"<|system|>{self._system_prompt}"
         return f"{prefix}<|user|>{context}<|assistant|>"
+
+    def _extract_answer(self, text: str) -> str:
+        """Strip <|think|>...<|/think|> and return only <|answer|>...
+        <|/answer|> contents.
+
+        lm-eval's gsm8k extractor looks for "#### X", "\\boxed{X}", or
+        "the answer is X" in the generation. Our model emits answers as
+        "<|think|>...<|/think|><|answer|>X<|/answer|>" — none of the
+        standard patterns match. Pulling the answer block out and
+        returning just its contents lets the standard extractor work
+        (it will find the bare number "X" via its last-number fallback).
+
+        Behaviour:
+          - If <|answer|>...<|/answer|> found: return the contents
+            (with surrounding whitespace stripped).
+          - If only <|answer|> found (no close tag): return everything
+            after <|answer|>, stripped.
+          - If no <|answer|> tag at all: return the input unchanged.
+            This preserves output for the (likely buggy) case where the
+            model fails to emit the answer block within max_gen_toks.
+
+        Always called when extract_answer_block=True.
+        """
+        if not self._extract_answer_block:
+            return text
+        open_tag = "<|answer|>"
+        close_tag = "<|/answer|>"
+        open_idx = text.find(open_tag)
+        if open_idx == -1:
+            return text
+        rest = text[open_idx + len(open_tag) :]
+        close_idx = rest.find(close_tag)
+        if close_idx != -1:
+            rest = rest[:close_idx]
+        return rest.strip()
 
     # ── loglikelihood (multiple-choice scoring) ────────────────────
 
@@ -287,12 +347,14 @@ class NanoOSRTLMEval(LM):
         items = []
         for orig_idx, req in enumerate(requests):
             context, continuation = req.args
-            # Wrap context in the SFT chat schema so the model is in
-            # the distribution it was trained on. The continuation is
-            # NOT wrapped — it lives in the position where the model
-            # learned to emit <|think|>... output, so direct comparison
-            # of the raw answer letter / numeric token works.
-            ctx_ids = self.tok_encode(self._wrap_context(context))
+            # Loglikelihood by default does NOT wrap (smoke run showed
+            # chat-wrap drops MMLU scoring to ~22 % — below random — by
+            # asking the model to score " A"/" B"/" C"/" D" continuations
+            # after <|assistant|> where it expects <|think|>). Toggle via
+            # chat_format_loglikelihood if testing.
+            ctx_ids = self.tok_encode(
+                self._wrap_context(context, for_generate=False),
+            )
             cont_ids = self.tok_encode(continuation)
             # Truncate from the left if context+continuation exceeds
             # max_length. We keep the continuation intact and lop off
@@ -383,11 +445,10 @@ class NanoOSRTLMEval(LM):
         .generate, then post-process to truncate at the first stop
         string encountered.
 
-        Sampling is near-deterministic by default (default_temperature
-        0.2). Per-request gen_kwargs["temperature"] is honoured but
-        clamped to max_temperature (0.5) so a benchmark misconfigured
-        with do_sample=True + temperature=1.0 still produces
-        reproducible eval numbers rather than creative variations.
+        Sampling defaults are tuned for the undertrained 363M MoE
+        (see __init__ docstring): temp 0.7, top_p 0.9, top_k 50,
+        repetition_penalty 1.2. Per-request gen_kwargs override these
+        but temperature is hard-capped at max_temperature (1.0).
         """
         results: list[str] = []
         for req in requests:
@@ -397,22 +458,29 @@ class NanoOSRTLMEval(LM):
                 until = [until]
             # Always stop at the model's trained end-of-answer tag —
             # the answer block is the target output for every benchmark
-            # we run, and continuing past it just generates noise that
-            # might confuse the task's answer extractor.
-            if self._chat_format and "<|/answer|>" not in until:
+            # we run, and continuing past it just generates noise.
+            if self._chat_format_generate and "<|/answer|>" not in until:
                 until.append("<|/answer|>")
             max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
             requested_temp = float(
                 gen_kwargs.get("temperature", self._default_temperature),
             )
             temperature = min(requested_temp, self._max_temperature)
-            top_p = float(gen_kwargs.get("top_p", 1.0))
-            top_k = int(gen_kwargs.get("top_k", 0))
+            top_p = float(gen_kwargs.get("top_p", self._default_top_p))
+            top_k = int(gen_kwargs.get("top_k", self._default_top_k))
+            repetition_penalty = float(
+                gen_kwargs.get(
+                    "repetition_penalty",
+                    self._default_repetition_penalty,
+                ),
+            )
 
             # Wrap with SFT chat schema. The generation will start
             # immediately after <|assistant|>, exactly where the model
             # learned to emit <|think|>...<|/think|><|answer|>... .
-            ctx_ids = self.tok_encode(self._wrap_context(context))
+            ctx_ids = self.tok_encode(
+                self._wrap_context(context, for_generate=True),
+            )
             # Leave room for max_new tokens within the model's
             # max_position_embeddings. Drop oldest context if needed.
             keep = self._max_length - max_new
@@ -429,13 +497,16 @@ class NanoOSRTLMEval(LM):
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                     eos_token_id=self.eot_token_id,
                 )
 
             gen_ids = out_ids[0, len(ctx_ids):].tolist()
             text = self.tok_decode(gen_ids)
 
-            # Truncate at first occurrence of any stop string.
+            # Truncate at first occurrence of any stop string. The
+            # <|/answer|> auto-stop above means we cut cleanly at the
+            # answer-block close in the common case.
             min_idx = math.inf
             for stop in until:
                 idx = text.find(stop)
@@ -443,5 +514,10 @@ class NanoOSRTLMEval(LM):
                     min_idx = idx
             if min_idx != math.inf:
                 text = text[: int(min_idx)]
+            # Strip the <|think|>...<|/think|> wrapper and return only
+            # the answer-block contents so lm-eval's gsm8k extractor
+            # (which looks for "#### X", "\\boxed{X}", or last number)
+            # can find our numeric answer without us reformatting it.
+            text = self._extract_answer(text)
             results.append(text)
         return results
