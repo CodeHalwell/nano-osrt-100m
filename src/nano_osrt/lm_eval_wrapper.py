@@ -76,29 +76,23 @@ class NanoOSRTLMEval(LM):
         but the guard stays for portability.
     """
 
-    # Empty by default. Earlier versions populated this with a guidance
-    # block referencing <|think|>...<|/think|><|answer|>...<|/answer|>
-    # by name. That backfired badly:
+    # Targeted at the only failure mode the model+wrapper combination
+    # has shown that's NOT pure math/IF capability: tool-call
+    # hallucination bleeding in from Nemotron-tool_calling SFT
+    # examples. Smoke L5b confirmed this is the dominant IFEval
+    # failure — 2 of 3 IFEval prompts derail into invented function
+    # names like "itinerary_for_a_play" or "get_full_salary_and_
+    # placeholder" instead of producing the requested response.
     #
-    #   1. Tokenisation embedded the literal special tokens (IDs 7-10)
-    #      into the prompt context.
-    #   2. repetition_penalty=1.2 then suppressed those exact tokens
-    #      during generation.
-    #   3. The model wanted to emit <|think|> after <|assistant|> (as
-    #      trained) but its score was divided by 1.2, so it fell back
-    #      to literal "<" + "think" + ">" text tokens.
-    #   4. Output devolved into hallucinated tool-call narrative
-    #      ("looking at the tools provided...") that bled in from
-    #      Nemotron tool_calling examples.
-    #
-    # Empty system prompt restores the in-distribution wrap
-    # "<|user|>{ctx}<|assistant|>" — exactly what SFT trained on.
-    # The model was never SFT'd with system prompts at all; including
-    # one is OOD even when it doesn't break the special tokens.
-    #
-    # If a future SFT pass introduces system prompts, repopulate this
-    # with natural-language guidance (no literal <|think|> markers).
-    DEFAULT_SYSTEM_PROMPT = ""
+    # CRITICAL: do NOT include literal <|think|>, <|answer|>, etc. in
+    # this prompt. An earlier version did, and the resulting tokens
+    # (IDs 7-10) in the prompt got suppressed by repetition_penalty
+    # during generation, breaking the trained think/answer structure
+    # entirely. Use only natural language references.
+    DEFAULT_SYSTEM_PROMPT = (
+        "Respond directly to the user with a complete answer. "
+        "Do not call any tools or external functions."
+    )
 
     def __init__(
         self,
@@ -344,7 +338,18 @@ class NanoOSRTLMEval(LM):
         ans = rest.strip()
         if not ans:
             return text
-        return f"{ans}\n#### {ans}"
+        # Only emit the "#### {ans}" duplicate when the answer looks
+        # like a number (gsm8k-style). Doing it for IFEval/longform
+        # responses doubles the response text — which would inflate
+        # word-count constraints, fool "include word X N times" checks,
+        # and generally break any IF grader that processes the literal
+        # output. The numeric check is permissive: matches "9", "9.0",
+        # "1,234", "-2.5", "$18", "18 dollars" with leading/trailing
+        # whitespace.
+        import re
+        if re.fullmatch(r"\$?-?[0-9][0-9.,]*\s*(?:dollars?|usd)?", ans, re.IGNORECASE):
+            return f"{ans}\n#### {ans}"
+        return ans
 
     # ── loglikelihood (multiple-choice scoring) ────────────────────
 
