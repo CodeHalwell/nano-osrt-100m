@@ -333,8 +333,19 @@ class PretrainExtendConfig(PretrainConfig):
     """
 
     # ── Schedule ─────────────────────────────────────────────────────
-    total_steps: int = 1_800
-    warmup_steps: int = 50          # 3 % of total — short re-warmup
+    # Extended from 1,800 → 2,800 mid-run (post-step 200) to use more
+    # of the $30 workspace budget on actual training (Liquid AI / Phi
+    # philosophy: small models benefit from heavy overtraining past
+    # Chinchilla-optimal). At our 8.4 sec/step throughput, 2,800
+    # steps fits ~$26 of compute, leaving ~$4 for a limit-100 eval
+    # pass to measure the lift. The cosine schedule recalibrates
+    # automatically — at step 200 with new total=2800, LR is at
+    # ~99.7 % of peak (vs ~99 % under the old total=1800), so the
+    # transition is a tiny upward LR bump (0.5 %), then cosine cools
+    # more gently over the longer horizon.
+    total_steps: int = 2_800
+    warmup_steps: int = 50          # 3 % of original — kept fixed (re-warmup
+                                    # already done in steps 0-50)
     peak_lr: float = 1.5e-5         # 2.5 % of original 6e-4
     min_lr: float = 1.5e-6          # cosine to 10 % of peak
     weight_decay: float = 0.1       # softer wd than pretrain (0.3)
@@ -342,7 +353,7 @@ class PretrainExtendConfig(PretrainConfig):
     log_interval: int = 25
     eval_interval: int = 250
     eval_steps: int = 20
-    ckpt_interval: int = 200        # ~9 ckpts over the 1,800-step run
+    ckpt_interval: int = 200        # ~14 ckpts over the 2,800-step run
 
     # Optimizer reuses the Muon hybrid from pretrain. The lower
     # peak_lr also propagates down to Muon via the same _peak_lr
