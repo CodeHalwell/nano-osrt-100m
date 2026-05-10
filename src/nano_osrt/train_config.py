@@ -417,30 +417,45 @@ class PretrainExtendConfig(PretrainConfig):
                 {
                     "name": "nemotron-cc-math",
                     "hf_id": "nvidia/Nemotron-CC-Math-v1",
-                    # 3+ subset (FineMath-classifier ≥3) is the larger
-                    # 133B-token variant. Use the default config to
-                    # pick up the standard split.
+                    # `4plus` subset (FineMath-classifier ≥4) is the
+                    # higher-quality 52B-token variant. Quality > quantity
+                    # for our 243M-token math budget. Available subsets
+                    # are: '3' (133B, broader), '4plus' (52B, higher
+                    # quality), '4plus_MIND' (most curated). REQUIRES
+                    # gated-access approval at
+                    # https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1
+                    "hf_config": "4plus",
                     "weight": 0.35,
                     "format": "nemotron_math",
                 },
-                # ── Scientific text (12 %)
+                # ── Math/scientific web text (12 %)
+                # OpenWebMath replaces the original RedPajama-arxiv plan
+                # because RedPajama-Data-1T uses a deprecated Python
+                # loader script that modern HF datasets no longer
+                # supports ("Dataset scripts are no longer supported").
+                # OpenWebMath is the well-known 14.7B-token math web
+                # corpus that Nemotron-CC-Math itself is positioned
+                # against — provides math/science diversity beyond
+                # Nemotron's curation pipeline.
                 {
-                    "name": "redpajama-arxiv",
-                    "hf_id": "togethercomputer/RedPajama-Data-1T",
-                    "hf_config": "arxiv",
+                    "name": "open-web-math",
+                    "hf_id": "open-web-math/open-web-math",
                     "weight": 0.12,
-                    "format": "arxiv",
+                    "format": "arxiv",  # same `text` field shape
                 },
-                # ── Better code (12 %) — replaces CodeParrot
+                # ── Code (12 %) — CodeParrot
+                # Originally planned bigcode/the-stack-smol but it is
+                # gated. CodeParrot-Clean is the same dataset already
+                # used in original pretrain so we know it streams
+                # reliably; the goal here is to maintain code
+                # capability under the new mix, not introduce a
+                # different code distribution.
                 {
-                    "name": "the-stack-smol",
-                    "hf_id": "bigcode/the-stack-smol",
-                    # Python subset — focused, well-documented; covers
-                    # most of what the model needs to see beyond the
-                    # CodeParrot exposure already baked in.
-                    "hf_config": "data/python",
+                    "name": "codeparrot-clean",
+                    "hf_id": "codeparrot/codeparrot-clean",
                     "weight": 0.12,
-                    "format": "stack_code",
+                    # Default extractor handles the `content` field
+                    # natively (see TokenStream._extract_text).
                 },
                 # ── General-capability maintenance (16 %)
                 {
