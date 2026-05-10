@@ -288,6 +288,196 @@ class PretrainConfig:
     # Any early stopping still leaves a usable model for SFT.
 
 
+class PretrainExtendConfig(PretrainConfig):
+    """Continued pre-training ("mid-training") on top of an SFT checkpoint.
+
+    Goal: fill the pretrain data-mix gaps identified after SFT —
+    specifically math (Nemotron-CC-Math), better code (The Stack v2),
+    and scientific text (RedPajama-arxiv). The original pretrain ran
+    on FineWeb-Edu + CodeParrot + Wikipedia only, with effectively no
+    math content; the result was a model that emits structurally
+    correct chat output but can't do double-digit multiplication.
+
+    Resume strategy
+    ───────────────
+    Loads from `osrt_v5_sft_ultralong_final.pt` rather than the pure
+    pretrain ckpt (osrt_v5_step_17000.pt). This keeps the SFT
+    investment intact so we don't have to redo SFT from scratch
+    afterward. The risks (chat-format erosion, HRA drift, full-token
+    loss vs prompt-masked) are mitigated by:
+
+      1. Conservative LR: peak 1.5e-5 (2.5 % of original 6e-4).
+      2. SFT-formatted rehearsal data (25 % of mix) — Nemotron rows
+         wrapped in <|user|>...<|assistant|><|think|>...<|/think|>
+         <|answer|>...<|/answer|> so the model keeps seeing chat
+         tags during ostensibly "raw" pretraining.
+      3. HRA frozen (`hra_frozen=True`) — the 86 M HRA delta layer
+         stays as the SFT-trained delta; only base weights absorb new
+         pretrain knowledge. Cleanly separates concerns and gives a
+         small ~5–8 % throughput win from skipping HRA backward pass.
+
+    Token budget
+    ────────────
+    $30 of H100 time (~7.6 hr) at Phase-2-ish throughput
+    (~15 sec/step at seq 4096) ≈ 1,800 steps × 270 k tok/step ≈
+    485 M new tokens. About 15 % of our prior 3.27 B pretrain budget,
+    concentrated in the underrepresented categories.
+
+    Lineage
+    ───────
+    Output checkpoint: osrt_v5_extend_step_N.pt and
+    osrt_v5_extend_final.pt (distinct prefix so resume scans don't
+    collide with base pretrain checkpoints). Subsequent SFT
+    "refresh" pass (200 steps, ~$4) loads from the extend-final to
+    re-anchor chat format if it has degraded.
+    """
+
+    # ── Schedule ─────────────────────────────────────────────────────
+    total_steps: int = 1_800
+    warmup_steps: int = 50          # 3 % of total — short re-warmup
+    peak_lr: float = 1.5e-5         # 2.5 % of original 6e-4
+    min_lr: float = 1.5e-6          # cosine to 10 % of peak
+    weight_decay: float = 0.1       # softer wd than pretrain (0.3)
+    grad_clip: float = 1.0
+    log_interval: int = 25
+    eval_interval: int = 250
+    eval_steps: int = 20
+    ckpt_interval: int = 200        # ~9 ckpts over the 1,800-step run
+
+    # Optimizer reuses the Muon hybrid from pretrain. The lower
+    # peak_lr also propagates down to Muon via the same _peak_lr
+    # tagging in train.py::_set_param_group_lrs. Override muon_lr
+    # explicitly so we don't reuse the pretrain-tuned 0.02 (which
+    # would shock SFT-flavored weights at this stage).
+    optimizer_name: str = "muon"
+    muon_lr: float = 5e-3           # 25 % of pretrain's 0.02
+    muon_min_lr: float = 5e-4
+
+    # ── Routing exploration ─────────────────────────────────────────
+    # Disable Gumbel exploration entirely. The router has been trained
+    # for 17k pretrain + 2.7k SFT steps and is well-formed; reintroducing
+    # noise would hurt rather than help.
+    router_gumbel_tau_init: float = 0.0
+    router_gumbel_tau_final: float = 0.0
+    router_gumbel_anneal_steps: int = 1   # avoid div-by-zero
+
+    # ── Early-stop gate ────────────────────────────────────────────
+    # Push past the budget so the gate never trips — the four-metric
+    # gate was tuned for cold-start pretraining where the router needs
+    # to specialise from scratch. At extend time the router is already
+    # healthy (clean_per_token_H ~1.40, assn ~2.07 in last SFT) and the
+    # gate's thresholds (designed for the "is this run salvageable?"
+    # question) don't apply.
+    early_stop_check_step: int = 9_999_999
+
+    # ── HRA ────────────────────────────────────────────────────────
+    # SFT-ultralong ckpt has HRA params (rank 256, +86.1M) in its
+    # state_dict — must inject before load. `hra_frozen=True` is a
+    # new flag (see train.py::run_pretrain_extend) that sets
+    # requires_grad=False on adapters_a/adapters_b after load so the
+    # frozen SFT-trained delta layer stays as-is while base absorbs
+    # new pretrain content.
+    hra_enabled: bool = True
+    hra_rank: int = 256
+    hra_scale: float = 1.0
+    hra_before_load: bool = True
+    hra_frozen: bool = True
+    pretrained_checkpoint: str = (
+        "/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt"
+    )
+
+    # Distinct ckpt prefix so this stage's checkpoints
+    # (osrt_v5_extend_step_N.pt) don't collide with base pretrain
+    # ckpts (osrt_v5_step_N.pt) under the resume scan.
+    stage_prefix: str = "extend"
+
+    # W&B labels
+    wandb_run_name: str = "osrt-pretrain-extend"
+    wandb_run_id: str = ""
+
+    # ── Data mix (single phase, seq 4096) ──────────────────────────
+    # Three new datasets + two existing for general-capability
+    # maintenance + two SFT-formatted rehearsal streams.
+    #
+    # Token-weighted sampling (debt-based, see TokenStream._pick_stream)
+    # produces actual token mixes matching these weights regardless of
+    # per-stream example length. Weights need not sum to exactly 1; the
+    # sampler normalises.
+    phases: dict = {  # noqa: RUF012
+        "extend": {
+            "start": 0,
+            "end": 1_800,
+            "seq_len": 4096,
+            # Phase 2 sizing — known to fit comfortably on H100 80GB
+            # at ~60 GB VRAM with the bump from 4×16 to 6×11.
+            "batch_size": 6,
+            "grad_accum_steps": 11,
+            "datasets": [
+                # ── Math (35 %) — biggest gap, biggest expected lift
+                {
+                    "name": "nemotron-cc-math",
+                    "hf_id": "nvidia/Nemotron-CC-Math-v1",
+                    # 3+ subset (FineMath-classifier ≥3) is the larger
+                    # 133B-token variant. Use the default config to
+                    # pick up the standard split.
+                    "weight": 0.35,
+                    "format": "nemotron_math",
+                },
+                # ── Scientific text (12 %)
+                {
+                    "name": "redpajama-arxiv",
+                    "hf_id": "togethercomputer/RedPajama-Data-1T",
+                    "hf_config": "arxiv",
+                    "weight": 0.12,
+                    "format": "arxiv",
+                },
+                # ── Better code (12 %) — replaces CodeParrot
+                {
+                    "name": "the-stack-smol",
+                    "hf_id": "bigcode/the-stack-smol",
+                    # Python subset — focused, well-documented; covers
+                    # most of what the model needs to see beyond the
+                    # CodeParrot exposure already baked in.
+                    "hf_config": "data/python",
+                    "weight": 0.12,
+                    "format": "stack_code",
+                },
+                # ── General-capability maintenance (16 %)
+                {
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 0.08,
+                },
+                {
+                    "name": "wikipedia",
+                    "hf_id": "wikimedia/wikipedia",
+                    "hf_config": "20231101.en",
+                    "weight": 0.08,
+                },
+                # ── SFT-formatted rehearsal (25 %) — anti-forgetting
+                # wraps Nemotron rows in <|user|>...<|/answer|> chat
+                # schema before tokenisation. Pretrain loss is full-
+                # token (no masking) so the model trains on every
+                # token in the formatted string including chat tags.
+                {
+                    "name": "nemotron-math-rehearsal",
+                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+                    "split": "math",
+                    "weight": 0.15,
+                    "format": "nemotron_sft",
+                },
+                {
+                    "name": "nemotron-stem-rehearsal",
+                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+                    "split": "stem",
+                    "weight": 0.10,
+                    "format": "nemotron_sft",
+                },
+            ],
+        },
+    }
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 

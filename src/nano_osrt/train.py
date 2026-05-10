@@ -1215,3 +1215,452 @@ def run_training(
         print(f"Final checkpoint: {final_path}", flush=True)
     if use_wandb:
         wandb.finish()
+
+
+# ============================================================================
+# CONTINUED PRE-TRAINING ("EXTEND" / MID-TRAINING)
+# ============================================================================
+
+
+def _freeze_hra_params(model: nn.Module) -> tuple[int, int]:
+    """Freeze every HRA adapter parameter on a (possibly compiled) model.
+
+    HRA wraps Linear layers with a parallel `adapter_a @ adapter_b`
+    pair (singular, see hra.py::HRALinear). State-dict names end in
+    ".adapter_a" / ".adapter_b" — e.g. "model.blocks.0.qkv.adapter_a".
+
+    CRITICAL: do NOT use substring `"adapter_a" in name` — that also
+    matches the recursive-architecture loop adapters at "model.adapters_a"
+    (plural, ModuleList from config.adapter_rank=16). Endswith with the
+    leading "." disambiguates: HRA uses `.adapter_a` singular, loop
+    adapters are `model.adapters_a.<i>` plural. A previous version of
+    this function used the substring check and only froze 884k params
+    (the loop adapters!), leaving the 86.1M HRA tensors fully trainable
+    despite "Frozen HRA" log messages — the bug was caught during
+    validation by counting trainable params before/after.
+
+    Setting requires_grad=False excludes them from both Muon and
+    AdamW optimizer groups (build_param_groups in muon.py and the
+    AdamW path in run_training both check requires_grad).
+
+    Returns (n_frozen_params, n_frozen_tensors) for logging.
+    """
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    n_params = 0
+    n_tensors = 0
+    for name, p in inner.named_parameters():
+        if name.endswith(".adapter_a") or name.endswith(".adapter_b"):
+            p.requires_grad = False
+            n_params += p.numel()
+            n_tensors += 1
+    return n_params, n_tensors
+
+
+def run_pretrain_extend(
+    model_config: NanoOSRTConfig,
+    extend_cfg,
+    vol,
+    tokenizer_name: str,
+    ckpt_dir: str = "/vol/checkpoints/v5",
+) -> None:
+    """Continued pre-training on top of an SFT checkpoint.
+
+    Differs from `run_training` in four bounded ways:
+      1. Initial weights come from `extend_cfg.pretrained_checkpoint`
+         (an SFT ckpt with HRA params), not from a glob-scan.
+      2. HRA structure is injected before load so SFT-trained HRA
+         tensors land in their slots correctly.
+      3. HRA params are frozen post-load if `hra_frozen=True` (the
+         default for this stage).
+      4. Checkpoints are written under `osrt_v5_{stage_prefix}_step_*.pt`
+         so they don't collide with base pretrain checkpoints under
+         the resume scanner.
+
+    Held-out validation pass is intentionally skipped for this stage —
+    the run is short (1,800 steps), training task_loss + MoE telemetry
+    give continuous monitoring, and the held-out cache builder eats
+    10-20 min of first-call time we don't want to burn here. If a
+    longer extend run is ever needed, lift the validation block from
+    run_training.
+    """
+    device = torch.device("cuda")
+
+    print("=" * 60)
+    print("NanoOSRT — Continued Pre-training (Extend / Mid-training)")
+    print("=" * 60)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # ── Build model ─────────────────────────────────────────────────
+    model = NanoOSRTForCausalLM(model_config).to(device=device)
+    base_params = sum(p.numel() for p in model.parameters())
+    print(f"Base parameters     : {base_params:>12,}")
+    print(f"Resume from         : {extend_cfg.pretrained_checkpoint}")
+    print(f"Stage prefix        : {extend_cfg.stage_prefix}")
+    print(f"Total steps         : {extend_cfg.total_steps}")
+    print(f"Peak LR             : {extend_cfg.peak_lr}")
+    print(f"HRA enabled         : {extend_cfg.hra_enabled}")
+    print(f"HRA frozen          : {getattr(extend_cfg, 'hra_frozen', False)}")
+    print()
+
+    # ── HRA injection (BEFORE state_dict load) ─────────────────────
+    if extend_cfg.hra_enabled:
+        from nano_osrt.hra import inject_hra
+        print(f"Injecting HRA before load (rank={extend_cfg.hra_rank})...")
+        inject_hra(
+            model,
+            rank=extend_cfg.hra_rank,
+            scale=getattr(extend_cfg, "hra_scale", 1.0),
+            freeze_pretrained=False,
+        )
+        with_hra_params = sum(p.numel() for p in model.parameters())
+        added = with_hra_params - base_params
+        print(f"  HRA injected: +{added:,} params ({added / 1e6:.1f}M)")
+
+    # ── Load SFT checkpoint ────────────────────────────────────────
+    ckpt_path = extend_cfg.pretrained_checkpoint
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"pretrain_extend refuses to start: pretrained checkpoint "
+            f"not found at {ckpt_path}. Run SFT first or correct the "
+            f"`pretrained_checkpoint` path in the extend config.",
+        )
+    print(f"Loading initial weights from {ckpt_path}...")
+    init_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    init_state = init_ckpt.get("model_state_dict", init_ckpt)
+    load_model_state_or_raise(
+        model,
+        init_state,
+        context=f"pretrain_extend initial load from {ckpt_path}",
+    )
+    print("  Clean load: all keys matched.")
+
+    # ── Freeze HRA after load ──────────────────────────────────────
+    if extend_cfg.hra_enabled and getattr(extend_cfg, "hra_frozen", False):
+        n_frozen_params, n_frozen_tensors = _freeze_hra_params(model)
+        trainable_after = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+        print(
+            f"Froze {n_frozen_tensors} HRA tensors "
+            f"({n_frozen_params:,} params, "
+            f"{n_frozen_params / 1e6:.1f}M). "
+            f"Trainable: {trainable_after:,} "
+            f"({trainable_after / 1e6:.1f}M)",
+        )
+
+    print("\nCompiling model with torch.compile...")
+    compile_start = time.time()
+    model = torch.compile(model)
+    print(f"Model compile done in {time.time() - compile_start:.1f}s")
+
+    # ── W&B ────────────────────────────────────────────────────────
+    use_wandb = extend_cfg.wandb_log and wandb is not None
+    if use_wandb:
+        wandb_kwargs = {
+            "project": extend_cfg.wandb_project,
+            "name": extend_cfg.wandb_run_name,
+            "config": {
+                "stage": "pretrain_extend",
+                "base_params": base_params,
+                "hra_enabled": extend_cfg.hra_enabled,
+                "hra_frozen": getattr(extend_cfg, "hra_frozen", False),
+                "pretrained_checkpoint": extend_cfg.pretrained_checkpoint,
+                "peak_lr": extend_cfg.peak_lr,
+                "min_lr": extend_cfg.min_lr,
+                "warmup_steps": extend_cfg.warmup_steps,
+                "total_steps": extend_cfg.total_steps,
+                "datasets": [
+                    d["name"]
+                    for d in extend_cfg.phases["extend"]["datasets"]
+                ],
+            },
+        }
+        if extend_cfg.wandb_run_id:
+            wandb_kwargs["id"] = extend_cfg.wandb_run_id
+            wandb_kwargs["resume"] = "allow"
+        wandb.init(**wandb_kwargs)
+        print("W&B logging enabled.")
+
+    # ── Optimizer ──────────────────────────────────────────────────
+    inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    if extend_cfg.optimizer_name.lower() == "muon":
+        from nano_osrt.muon import (
+            HybridMuonAdamW,
+            Muon,
+            build_param_groups,
+        )
+        muon_params, adamw_groups = build_param_groups(
+            inner_model.named_parameters(),
+            weight_decay=extend_cfg.weight_decay,
+        )
+        muon_lr = getattr(extend_cfg, "muon_lr", extend_cfg.peak_lr)
+        muon = Muon(
+            muon_params,
+            lr=muon_lr,
+            momentum=0.95,
+            nesterov=True,
+            weight_decay=extend_cfg.weight_decay,
+        )
+        adamw = torch.optim.AdamW(
+            adamw_groups,
+            lr=extend_cfg.peak_lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+        muon_min = getattr(extend_cfg, "muon_min_lr", muon_lr * 0.1)
+        for pg in muon.param_groups:
+            pg["_peak_lr"] = muon_lr
+            pg["_min_lr"] = muon_min
+        for pg in adamw.param_groups:
+            pg["_peak_lr"] = extend_cfg.peak_lr
+            pg["_min_lr"] = extend_cfg.min_lr
+        optimizer = HybridMuonAdamW(muon, adamw)
+        n_muon = len(muon_params)
+        n_adamw = sum(len(g["params"]) for g in adamw_groups)
+        print(
+            f"Muon+AdamW hybrid: {n_muon} matrix tensors → Muon "
+            f"(lr={muon_lr}), {n_adamw} other tensors → AdamW "
+            f"(lr={extend_cfg.peak_lr})",
+        )
+    else:
+        router_params = []
+        other_params = []
+        for name, param in inner_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "router" in name or "loop_embeddings" in name:
+                router_params.append(param)
+            else:
+                other_params.append(param)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": other_params, "weight_decay": extend_cfg.weight_decay},
+                {"params": router_params, "weight_decay": 0.0},
+            ],
+            lr=extend_cfg.peak_lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+        for pg in optimizer.param_groups:
+            pg["_peak_lr"] = extend_cfg.peak_lr
+            pg["_min_lr"] = extend_cfg.min_lr
+        print(f"AdamW (lr={extend_cfg.peak_lr}, wd={extend_cfg.weight_decay})")
+
+    # ── Resume from prior extend checkpoints ────────────────────────
+    prefix = extend_cfg.stage_prefix
+    os.makedirs(ckpt_dir, exist_ok=True)
+    best_step = -1
+    best_ckpt: str | None = None
+    for pattern in (
+        f"{ckpt_dir}/osrt_v5_{prefix}_step_*.pt",
+        f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_*.pt",
+    ):
+        for f in glob.glob(pattern):
+            try:
+                s = int(f.rsplit("_", 1)[1].split(".")[0])
+            except (ValueError, IndexError):
+                continue
+            if s > best_step or (s == best_step and "rescue" in f):
+                best_step = s
+                best_ckpt = f
+
+    start_step = 0
+    if best_step > 0 and best_ckpt is not None:
+        print(f"Found {prefix} checkpoint at step {best_step}: {best_ckpt}")
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
+        load_model_state_or_raise(
+            model,
+            ckpt["model_state_dict"],
+            context=f"{prefix} resume from {best_ckpt}",
+        )
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except (ValueError, RuntimeError) as e:
+            print(f"  Optimizer state mismatch, starting fresh: {e}")
+        start_step = ckpt["step"] + 1
+        print(f"Resumed at step {start_step}")
+
+    # ── Training loop (single phase, no curriculum, no held-out val) ──
+    start_time = time.time()
+    step = start_step
+    extend_phase = extend_cfg.phases["extend"]
+    seq_len = extend_phase["seq_len"]
+    batch_size = extend_phase["batch_size"]
+    grad_accum = extend_phase["grad_accum_steps"]
+
+    print(
+        f"\n>>> Extend phase | seq_len: {seq_len} | "
+        f"batch: {batch_size} | accum: {grad_accum} | "
+        f"effective batch: {batch_size * grad_accum}",
+    )
+    print(f"    Datasets: {[d['name'] for d in extend_phase['datasets']]}")
+
+    load_t = time.time()
+    loader = make_loader(
+        extend_phase["datasets"],
+        seq_len,
+        tokenizer_name,
+        batch_size,
+        step,
+    )
+    loader_iter = iter(loader)
+    print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
+
+    # Activation checkpointing only for very long seq.
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    base = inner.model if hasattr(inner, "model") else inner
+    need_ckpt = seq_len >= 8192
+    if (hasattr(base, "gradient_checkpointing")
+            and base.gradient_checkpointing != need_ckpt):
+        base.gradient_checkpointing = need_ckpt
+
+    # Gumbel buffer fill (no-op since extend_cfg sets tau init = 0).
+    set_router_gumbel_tau(model, extend_cfg.router_gumbel_tau_init)
+
+    while step < extend_cfg.total_steps:
+        lr = _set_param_group_lrs(optimizer, step, extend_cfg)
+        optimizer.zero_grad(set_to_none=True)
+
+        accum_task_loss = torch.tensor(0.0, device=device)
+        accum_balance_norm = torch.tensor(0.0, device=device)
+        moe_snapshots: list[dict[str, float]] = []
+
+        if step == start_step:
+            print("Fetching first batch...")
+            batch_t = time.time()
+
+        for micro in range(grad_accum):
+            try:
+                input_ids, labels = next(loader_iter)
+            except StopIteration:
+                # Loader exhausted — rebuild with a different seed.
+                import gc
+                loader_iter = None
+                del loader
+                gc.collect()
+                loader = make_loader(
+                    extend_phase["datasets"],
+                    seq_len,
+                    tokenizer_name,
+                    batch_size,
+                    step,
+                )
+                loader_iter = iter(loader)
+                input_ids, labels = next(loader_iter)
+
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            if step == start_step and micro == 0:
+                print(f"First batch fetched in {time.time() - batch_t:.1f}s")
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(input_ids, labels=labels)
+                loss = outputs.loss / grad_accum
+            loss.backward()
+
+            if inner.last_task_loss is not None:
+                accum_task_loss += (
+                    inner.last_task_loss.detach() / grad_accum
+                )
+            if inner.last_balance_loss_normalised is not None:
+                accum_balance_norm += (
+                    inner.last_balance_loss_normalised.detach() / grad_accum
+                )
+            micro_metrics, _ = _collect_moe_metrics(model)
+            moe_snapshots.append(micro_metrics)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), extend_cfg.grad_clip,
+        )
+        optimizer.step()
+        apply_router_balance_updates(model)
+
+        moe_metrics, moe_summary = _average_moe_snapshots(moe_snapshots)
+
+        # ── Logging ────────────────────────────────────────────────
+        should_log = (
+            step % extend_cfg.log_interval == 0
+            or step == 0
+            or (step < 100 and step % 10 == 0)
+        )
+        if should_log:
+            elapsed = time.time() - start_time
+            vram_gb = torch.cuda.max_memory_allocated() / 1e9
+            torch.cuda.reset_peak_memory_stats()
+            eff_batch = batch_size * grad_accum
+            steps_done = max(step - start_step, 1)
+            tok_per_sec = eff_batch * seq_len / max(
+                elapsed / steps_done, 1e-8,
+            )
+            print(
+                f"step {step:>5d}/{extend_cfg.total_steps} | "
+                f"task {accum_task_loss.item():.4f} | "
+                f"bal {accum_balance_norm.item():.4f} | "
+                f"lr {lr:.2e} | vram {vram_gb:.1f}GB | "
+                f"tok/s {tok_per_sec:,.0f}",
+                flush=True,
+            )
+            print(
+                f"           moe: pte={moe_summary['per_token_H']:.3f} "
+                f"assn={moe_summary['assign_H']:.3f} "
+                f"drop={moe_summary['drop_rate']:.4f} "
+                f"gate={moe_summary['moe_gate']:.3f}",
+                flush=True,
+            )
+            if use_wandb:
+                log_dict = {
+                    "extend/task_loss": accum_task_loss.item(),
+                    "extend/balance_loss_normalised": accum_balance_norm.item(),
+                    "extend/lr": lr,
+                    "extend/vram_gb": vram_gb,
+                    "extend/tok_per_sec": tok_per_sec,
+                }
+                log_dict.update(moe_metrics)
+                wandb.log(log_dict, step=step)
+        elif step < 100:
+            sys.stdout.write(".")
+            sys.stdout.flush()
+            if step % 25 == 24:
+                sys.stdout.write(f" [step {step}]\n")
+                sys.stdout.flush()
+
+        # ── Numbered checkpoints ───────────────────────────────────
+        if step > 0 and step % extend_cfg.ckpt_interval == 0:
+            path = f"{ckpt_dir}/osrt_v5_{prefix}_step_{step}.pt"
+            save_checkpoint(model, optimizer, step, path)
+            vol.commit()
+
+        # ── 23h Modal safety rescue ────────────────────────────────
+        if time.time() - start_time > 82_800:
+            rescue_path = (
+                f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
+            )
+            save_checkpoint(model, optimizer, step, rescue_path)
+            vol.commit()
+            print(
+                f"\n23h boundary reached at step {step}. "
+                f"Rescue checkpoint saved; exiting cleanly for resume.",
+                flush=True,
+            )
+            if use_wandb:
+                wandb.finish()
+            return
+
+        step += 1
+
+    # Final checkpoint
+    final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
+    save_checkpoint(model, optimizer, step, final_path)
+    vol.commit()
+    elapsed_total = time.time() - start_time
+    print(
+        f"\n{prefix} complete. {step:,} steps in "
+        f"{elapsed_total / 3600:.1f}h",
+        flush=True,
+    )
+    print(f"Final checkpoint: {final_path}", flush=True)
+    if use_wandb:
+        wandb.finish()

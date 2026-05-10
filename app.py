@@ -152,6 +152,86 @@ def pretrain():
 
 
 # =============================================================================
+# PRETRAIN_EXTEND (continued pretraining / "mid-training" on top of SFT ckpt)
+# =============================================================================
+#
+# Loads osrt_v5_sft_ultralong_final.pt, injects + freezes HRA, then runs
+# 1,800 steps of continued pretraining at seq 4096 with a math/science/
+# code-heavy mix plus 25 % SFT-formatted rehearsal data to combat
+# chat-format forgetting. Output: osrt_v5_extend_step_N.pt and
+# osrt_v5_extend_final.pt (distinct prefix so resume scans don't
+# collide with base pretrain ckpts). See PretrainExtendConfig +
+# train.py::run_pretrain_extend for the design rationale.
+#
+# Mounts the HF cache volume so the new datasets (Nemotron-CC-Math,
+# RedPajama-arxiv, the-stack-smol, plus the existing FineWeb-Edu and
+# Wikipedia) populate /vol/hf_cache on first run and reuse the cache
+# on subsequent runs.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def pretrain_extend():
+    """Continued pretraining on top of the SFT-ultralong checkpoint.
+
+    See train_config.py::PretrainExtendConfig for the full design
+    rationale (lineage decision, LR schedule, rehearsal mix, HRA
+    freeze). Single phase, seq 4096, ~1,800 steps, ~$30 of H100
+    time, ~485M new pretrain tokens concentrated in the
+    math/science/code categories the original pretrain missed.
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import PretrainExtendConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tokenizer_name = tokenizer_path
+
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    extend_cfg = PretrainExtendConfig()
+    print(
+        "pretrain_extend: 1,800 steps at seq 4096, peak LR 1.5e-5, "
+        "HRA frozen, 25 % SFT-formatted rehearsal mix.",
+    )
+    print(
+        f"Resume base: {extend_cfg.pretrained_checkpoint}",
+    )
+
+    run_pretrain_extend(model_config, extend_cfg, vol, tokenizer_name)
+
+
+# =============================================================================
 # SANITY (200-step smoke test)
 # =============================================================================
 
@@ -1295,6 +1375,9 @@ def main(stage: str = "pretrain"):
     --stage sweep      Gumbel schedule sweep (configs B, C, D)
     --stage ablate     Optimizer × routing ablation (cells A/B/C/D, 1200 steps each)
     --stage pretrain   Full pre-training with progressive seq_len curriculum
+    --stage pretrain_extend  Continued pretraining on top of SFT-ultralong ckpt
+                             (~1,800 steps, seq 4096, math/science/code mix +
+                              SFT-formatted rehearsal, HRA frozen)
     --stage sft            Balanced SFT on the final pretrained checkpoint
     --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
@@ -1315,6 +1398,8 @@ def main(stage: str = "pretrain"):
         ablate.remote()
     elif stage == "pretrain":
         pretrain.remote()
+    elif stage == "pretrain_extend":
+        pretrain_extend.remote()
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":
@@ -1328,6 +1413,6 @@ def main(stage: str = "pretrain"):
     else:
         print(
             f"Unknown stage: {stage}. "
-            f"Use sanity, sweep, ablate, pretrain, sft, sft_long, "
-            f"sft_ultralong, evaluate, or grpo"
+            f"Use sanity, sweep, ablate, pretrain, pretrain_extend, "
+            f"sft, sft_long, sft_ultralong, evaluate, or grpo"
         )

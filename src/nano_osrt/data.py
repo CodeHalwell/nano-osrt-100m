@@ -7,6 +7,10 @@ Handles:
 - Instruction format handling (messages column)
 - Resilient streaming: connection drops and corrupt shards are caught
   and retried instead of killing the training run.
+- Optional `format` key on a dataset config to force a custom text
+  extractor — used by the continued-pretraining ("extend") mix to
+  wrap Nemotron post-training rows in the SFT chat schema for
+  rehearsal-against-forgetting (see PretrainExtendConfig).
 """
 
 import random
@@ -16,6 +20,105 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
+
+
+# ── Custom text extractors for the extend-stage mix ─────────────────────
+# Used only when a dataset config sets `format=<key>`. Default
+# (no format key) falls through to TokenStream._extract_text which
+# handles plain text / code / chat-messages columns generically.
+#
+# Each extractor takes a raw HF row dict and returns a string of
+# already-formatted text ready for the tokenizer. The tokenizer's
+# special-token IDs end up baked in, which is the whole point for
+# the SFT-rehearsal extractors.
+
+
+def _format_nemotron_sft_text(example: dict) -> str:
+    """Wrap Nemotron-Post-Training rows in the SFT chat schema.
+
+    Used as a *rehearsal* signal during continued pretraining so the
+    model keeps seeing (and predicting) the chat tags it learned in
+    SFT — without that, ~1,800 steps of plain-text pretrain would
+    erode the structured think/answer behaviour. Pretrain's loss is
+    full-token (no masking), so the model is trained to predict every
+    token in the formatted string including the chat tags.
+
+    Mirrors `format_nemotron` in sft_data.py: pulls (question,
+    reasoning, answer) from messages + the dedicated `reasoning`
+    field, then wraps as
+        <|user|>{q}<|assistant|><|think|>{r}<|/think|><|answer|>{a}<|/answer|>
+    Returns "" on malformed rows so the stream loop skips them.
+    """
+    msgs = example.get("messages", [])
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        return ""
+    question = ""
+    answer = ""
+    for m in msgs:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "user" and not question:
+            question = content
+        elif role == "assistant" and question and not answer:
+            answer = content
+            break
+    if not question or not answer:
+        return ""
+    reasoning = (example.get("reasoning") or "").strip()
+    return (
+        f"<|user|>{question}<|assistant|>"
+        f"<|think|>{reasoning}<|/think|>"
+        f"<|answer|>{answer}<|/answer|>"
+    )
+
+
+def _format_stack_code(example: dict) -> str:
+    """The Stack v2 / the-stack-smol code rows.
+
+    Schema varies across The Stack subsets — try `content`, `text`,
+    and `code` in that order. Returns "" if none present so malformed
+    rows skip cleanly rather than killing the worker.
+    """
+    for key in ("content", "text", "code"):
+        val = example.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+def _format_arxiv(example: dict) -> str:
+    """RedPajama-arxiv rows.
+
+    RedPajama stores the full LaTeX paper body in `text`. Long but
+    well-formatted; the tokenizer handles LaTeX as a sequence of
+    short BPE pieces.
+    """
+    text = example.get("text", "")
+    if isinstance(text, str) and text.strip():
+        return text
+    return ""
+
+
+def _format_nemotron_math_pretrain(example: dict) -> str:
+    """Nemotron-CC-Math-v1 rows.
+
+    The math-pretraining variant ships with `text` containing the
+    math-rich web document, LaTeX equations preserved. Same shape as
+    arxiv rows but tagged separately so the data-mix logging can
+    distinguish them.
+    """
+    text = example.get("text", "")
+    if isinstance(text, str) and text.strip():
+        return text
+    return ""
+
+
+FORMAT_FN_PRETRAIN = {
+    "nemotron_sft": _format_nemotron_sft_text,
+    "stack_code": _format_stack_code,
+    "arxiv": _format_arxiv,
+    "nemotron_math": _format_nemotron_math_pretrain,
+}
 
 
 class TokenStream(IterableDataset):
@@ -182,8 +285,21 @@ class TokenStream(IterableDataset):
                     )
                     continue
 
-            # Extract text from example
-            text = self._extract_text(example, tok)
+            # Extract text from example. Per-stream `format` config
+            # (used by extend-stage rehearsal) overrides the generic
+            # _extract_text path so we can wrap Nemotron rows in the
+            # SFT chat schema and pull non-standard fields cleanly.
+            fmt = ds_cfg_i.get("format")
+            if fmt:
+                fn = FORMAT_FN_PRETRAIN.get(fmt)
+                if fn is None:
+                    raise ValueError(
+                        f"Unknown pretrain format key '{fmt}' on dataset "
+                        f"{ds_name}. Valid: {sorted(FORMAT_FN_PRETRAIN)}",
+                    )
+                text = fn(example)
+            else:
+                text = self._extract_text(example, tok)
             if not text or not text.strip():
                 continue
 
