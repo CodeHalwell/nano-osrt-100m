@@ -477,8 +477,12 @@ class SFTStream(IterableDataset):
         pack_ids: list[int] = []
         pack_labels: list[int] = []
 
+        max_retries = 5
+
         while True:
             idx = _pick_stream()
+            ds_cfg_i = self.dataset_configs[idx]
+            ds_name = ds_cfg_i.get("name", ds_cfg_i["hf_id"])
 
             try:
                 example = next(streams[idx])
@@ -489,6 +493,44 @@ class SFTStream(IterableDataset):
                 try:
                     example = next(streams[idx])
                 except StopIteration:
+                    continue
+            except Exception as exc:
+                # Mid-iteration failures: HF httpx "client has been
+                # closed", connection drops, corrupt parquet shards,
+                # rate-limit responses. Mirrors data.py::TokenStream's
+                # retry block (this file used to only catch
+                # StopIteration, which let the run die on the first
+                # transient HTTP error — caught during sft_refresh
+                # run 3 on codhe-hugging-mcp where the workspace
+                # top-up triggered an httpx client reset mid-run).
+                example = None
+                for attempt in range(1, max_retries + 1):
+                    print(
+                        f"[SFTWorker] {ds_name}: {type(exc).__name__}: "
+                        f"{str(exc)[:120]} — reconnecting "
+                        f"[{attempt}/{max_retries}]",
+                        flush=True,
+                    )
+                    time.sleep(2 * attempt)
+                    try:
+                        ds = _open_stream(
+                            idx, seed_offset=rng.randint(1, 100_000),
+                        )
+                        streams[idx] = iter(ds)
+                        example = next(streams[idx])
+                        print(
+                            f"[SFTWorker] {ds_name}: reconnected.",
+                            flush=True,
+                        )
+                        break
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                if example is None:
+                    print(
+                        f"[SFTWorker] {ds_name}: giving up after "
+                        f"{max_retries} retries, skipping example",
+                        flush=True,
+                    )
                     continue
 
             try:
