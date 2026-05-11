@@ -850,15 +850,25 @@ class SFTRefreshConfig(SFTConfig):
     preserved. Should restore extraction validity for eval.
     """
 
-    total_steps: int = 500
-    warmup_steps: int = 25
+    # Trimmed from 500 → 200 steps after first launch attempt
+    # (sft_refresh run 1) ran at 106 sec/step due to cold HF cache on
+    # 4 of 7 datasets (NuminaMath, Evol-Code, OpenHermes,
+    # IFEval-like all new on the codhe-hugging-mcp workspace).
+    # Single-threaded SFT loader + cold cache = GPU idle waiting on
+    # HF Hub fetches every step. Killed and re-scoped to use only
+    # already-cached Nemotron splits (math + stem + code, all warm
+    # from pretrain_extend's rehearsal mix). Format anchoring needs
+    # exposure, not deep content; 200 steps × ~6 sec/step ≈ 20 min ≈
+    # $1.30, well within remaining $2.70 budget.
+    total_steps: int = 200
+    warmup_steps: int = 10            # 5 % of new total
     seq_len: int = 2048
     batch_size: int = 8
     grad_accum_steps: int = 8
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
-    log_interval: int = 25
-    ckpt_interval: int = 100
+    log_interval: int = 10            # tighter logs for the short run
+    ckpt_interval: int = 50
 
     # HRA: keep trainable so adapters re-tune to the new base.
     hra_enabled: bool = True
@@ -873,33 +883,29 @@ class SFTRefreshConfig(SFTConfig):
     stage_prefix: str = "sft_refresh"
     wandb_run_name: str = "osrt-sft-refresh"
 
-    # Nemotron-heavy SFT mix WITHOUT tool_calling. The pretrain_extend
-    # eliminated tool-call hallucination; we deliberately omit
-    # nemotron-tool-calling here to preserve that win. NuminaMath +
-    # Evol-Code provide diversity beyond Nemotron's CoT style.
-    # All formats are already wired in sft_data.py::FORMAT_FN.
+    # Nemotron-only SFT mix — no NuminaMath / Evol-Code / OpenHermes /
+    # IFEval-like (cold cache caused 100+ sec/step on first attempt).
+    # These three Nemotron splits were heavily exercised during
+    # pretrain_extend (math + stem rehearsal at 25 %, plus the new
+    # nemotron-code split here is small enough to cache quickly).
+    # No tool_calling — that habit is gone after extend, keep it gone.
+    # Pure-Nemotron mix risks over-fit to one teacher's CoT style at
+    # 500+ steps but is fine for a 200-step format-anchor pass.
     datasets: list = [  # noqa: RUF012
-        # Math (40 %)
+        # Math (50 %) — primary signal
         {
             "name": "nemotron-math",
             "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
             "split": "math",
-            "weight": 0.30,
+            "weight": 0.50,
             "format": "nemotron",
         },
-        {
-            "name": "numina-math-cot",
-            "hf_id": "AI-MO/NuminaMath-CoT",
-            "split": "train",
-            "weight": 0.10,
-            "format": "numina_math",
-        },
-        # STEM (20 %)
+        # STEM (30 %)
         {
             "name": "nemotron-stem",
             "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
             "split": "stem",
-            "weight": 0.20,
+            "weight": 0.30,
             "format": "nemotron",
         },
         # Code (20 %)
@@ -907,34 +913,8 @@ class SFTRefreshConfig(SFTConfig):
             "name": "nemotron-code",
             "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
             "split": "code",
-            "weight": 0.10,
+            "weight": 0.20,
             "format": "nemotron",
-        },
-        {
-            "name": "evol-instruct-code",
-            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
-            "split": "train",
-            "weight": 0.10,
-            "format": "evol_code",
-        },
-        # General/IF (20 %) — keeps the chat-format anchor diverse
-        # beyond Nemotron's CoT style so the model re-learns to handle
-        # non-math prompts cleanly (the cats / planet-question probe
-        # failures suggest this is needed).
-        {
-            "name": "openhermes",
-            "hf_id": "teknium/OpenHermes-2.5",
-            "split": "train",
-            "weight": 0.10,
-            "format": "openhermes",
-        },
-        {
-            "name": "ifeval-like",
-            "hf_id": "argilla/ifeval-like-data",
-            "hf_config": "filtered",
-            "split": "train",
-            "weight": 0.10,
-            "format": "ifeval",
         },
     ]
 
