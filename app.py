@@ -771,6 +771,70 @@ def sft_ultralong():
 
 
 # =============================================================================
+# SFT_REFRESH (short SFT pass to re-anchor chat format after extend)
+# =============================================================================
+#
+# Local probe on osrt_v5_extend_final.pt showed chat-format degradation
+# (special tokens emitted in wrong positions, <|/answer|> never closes,
+# some prompts produce immediate EOS) despite the 25 % rehearsal mix
+# during pretrain_extend. This stage runs a short, low-LR SFT on top
+# of the extended ckpt to re-anchor the format wrapping. The math /
+# code learning the extend gave us is preserved; only the format
+# placement is re-tuned.
+#
+# 500 steps at seq 2048 ≈ 50 min on H100 ≈ ~$3-4. Output:
+# osrt_v5_sft_refresh_step_N.pt + osrt_v5_sft_refresh_final.pt.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_refresh():
+    """Short SFT format-anchor pass on top of pretrain_extend ckpt.
+
+    See train_config.py::SFTRefreshConfig for the full design
+    rationale. 500 steps, peak LR 5e-6 (33 % of base SFT), HRA
+    trainable, NO tool_calling in the data mix (preserves the
+    anti-hallucination win from extend).
+    """
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.sft_train import run_sft
+    from nano_osrt.train_config import SFTRefreshConfig
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    sft_refresh_cfg = SFTRefreshConfig()
+    print(
+        "sft_refresh: 500 steps, peak LR 5e-6, HRA trainable, "
+        "no tool_calling. Goal: re-anchor chat-format emission "
+        "after pretrain_extend.",
+    )
+    print(f"Resume base: {sft_refresh_cfg.pretrained_checkpoint}")
+    run_sft(model_config, sft_refresh_cfg, vol, tok)
+
+
+# =============================================================================
 # EVALUATE (lm-eval-harness pass: gsm8k + IFEval + MMLU-stem)
 # =============================================================================
 
@@ -1381,6 +1445,8 @@ def main(stage: str = "pretrain"):
     --stage sft            Balanced SFT on the final pretrained checkpoint
     --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
+    --stage sft_refresh    Short format-anchor SFT on top of extend_final.pt
+                             (500 steps, peak LR 5e-6, no tool_calling)
     --stage evaluate       lm-eval-harness pass (gsm8k + IFEval + MMLU-stem). Args:
                              --ckpt-name <filename in /vol/checkpoints/v5/>
                              --tag <pre-grpo|post-grpo|...>
@@ -1406,6 +1472,8 @@ def main(stage: str = "pretrain"):
         sft_long.remote()
     elif stage == "sft_ultralong":
         sft_ultralong.remote()
+    elif stage == "sft_refresh":
+        sft_refresh.remote()
     elif stage == "evaluate":
         evaluate.remote()
     elif stage == "grpo":
@@ -1414,5 +1482,5 @@ def main(stage: str = "pretrain"):
         print(
             f"Unknown stage: {stage}. "
             f"Use sanity, sweep, ablate, pretrain, pretrain_extend, "
-            f"sft, sft_long, sft_ultralong, evaluate, or grpo"
+            f"sft, sft_long, sft_ultralong, sft_refresh, evaluate, or grpo"
         )

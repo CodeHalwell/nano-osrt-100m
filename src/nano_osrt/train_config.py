@@ -802,6 +802,143 @@ class SFTUltraLongConfig(SFTLongConfig):
     # SFT-ultralong — only the context window does.
 
 
+class SFTRefreshConfig(SFTConfig):
+    """Short SFT pass to re-anchor chat format after pretrain_extend.
+
+    Why this exists
+    ───────────────
+    Local probe on osrt_v5_extend_final.pt (post-pretrain-extend) showed
+    chat-format degradation despite the 25 % rehearsal mix during
+    extend. Symptoms:
+
+      * Special tokens still emitted but in wrong positions —
+        "<|think|>on<|/think|><|answer|><think>... reasoning ..."
+        with <|/answer|> never closed. lm-eval's answer extractor
+        sees broken/missing structure and returns [invalid].
+      * Some prompts produce immediate <|end_of_text|> with no
+        content at all.
+      * Math content is genuinely improving (model decomposes
+        17×23 as 17×20 + 17×3 — correct method, wrong arithmetic
+        execution) — but the format wrapping is broken.
+
+    Tool-call hallucination is FIXED by extend (no tool_calling data
+    seen for 2,800 steps) — confirmed by probe. So this refresh
+    deliberately keeps tool_calling OUT of the mix to preserve that
+    win.
+
+    Design
+    ──────
+    Very short (500 steps) at very low LR (5e-6, 33 % of SFTConfig's
+    1.5e-5). Goal is to refine where the model places its existing
+    chat tags, not to reshape what it knows about math/code. The
+    extend gave us a genuinely better base; this just re-anchors the
+    SFT format on top of it.
+
+    HRA stays trainable here (hra_freeze_pretrained=False, inherited)
+    so the adapters can re-tune toward the new pretrain-extended
+    base. The frozen-HRA mode used in pretrain_extend is the opposite
+    direction — preserve HRA's old SFT learning while base absorbed
+    new content. Now that base has new content, HRA needs to adapt.
+
+    Data mix: 70 % Nemotron post-training (math/stem/code, NO
+    tool_calling) + 30 % SFTConfig diversity, all chat-formatted with
+    response-only loss masking (standard SFT behaviour from
+    sft_data.py).
+
+    Expected outcome: clean <|think|>...<|/think|><|answer|>...
+    <|/answer|> emission again, math reasoning improvements
+    preserved. Should restore extraction validity for eval.
+    """
+
+    total_steps: int = 500
+    warmup_steps: int = 25
+    seq_len: int = 2048
+    batch_size: int = 8
+    grad_accum_steps: int = 8
+    peak_lr: float = 5e-6
+    min_lr: float = 5e-7
+    log_interval: int = 25
+    ckpt_interval: int = 100
+
+    # HRA: keep trainable so adapters re-tune to the new base.
+    hra_enabled: bool = True
+    hra_rank: int = 256
+    hra_scale: float = 1.0
+    hra_lr: float = 2.5e-5            # 33 % of base SFT hra_lr (7.5e-5)
+    hra_freeze_pretrained: bool = False
+    hra_before_load: bool = True      # extend ckpt has HRA params
+
+    # Resume from the post-extend checkpoint.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend_final.pt"
+    stage_prefix: str = "sft_refresh"
+    wandb_run_name: str = "osrt-sft-refresh"
+
+    # Nemotron-heavy SFT mix WITHOUT tool_calling. The pretrain_extend
+    # eliminated tool-call hallucination; we deliberately omit
+    # nemotron-tool-calling here to preserve that win. NuminaMath +
+    # Evol-Code provide diversity beyond Nemotron's CoT style.
+    # All formats are already wired in sft_data.py::FORMAT_FN.
+    datasets: list = [  # noqa: RUF012
+        # Math (40 %)
+        {
+            "name": "nemotron-math",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "math",
+            "weight": 0.30,
+            "format": "nemotron",
+        },
+        {
+            "name": "numina-math-cot",
+            "hf_id": "AI-MO/NuminaMath-CoT",
+            "split": "train",
+            "weight": 0.10,
+            "format": "numina_math",
+        },
+        # STEM (20 %)
+        {
+            "name": "nemotron-stem",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "stem",
+            "weight": 0.20,
+            "format": "nemotron",
+        },
+        # Code (20 %)
+        {
+            "name": "nemotron-code",
+            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
+            "split": "code",
+            "weight": 0.10,
+            "format": "nemotron",
+        },
+        {
+            "name": "evol-instruct-code",
+            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
+            "split": "train",
+            "weight": 0.10,
+            "format": "evol_code",
+        },
+        # General/IF (20 %) — keeps the chat-format anchor diverse
+        # beyond Nemotron's CoT style so the model re-learns to handle
+        # non-math prompts cleanly (the cats / planet-question probe
+        # failures suggest this is needed).
+        {
+            "name": "openhermes",
+            "hf_id": "teknium/OpenHermes-2.5",
+            "split": "train",
+            "weight": 0.10,
+            "format": "openhermes",
+        },
+        {
+            "name": "ifeval-like",
+            "hf_id": "argilla/ifeval-like-data",
+            "hf_config": "filtered",
+            "split": "train",
+            "weight": 0.10,
+            "format": "ifeval",
+        },
+    ]
+
+
 class GRPOConfig:
     """GRPO config for v5 — verifiable math rewards on top of SFT."""
 
