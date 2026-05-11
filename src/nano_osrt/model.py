@@ -61,7 +61,8 @@ def compute_rope_freqs(
             effective_theta = theta * (factor ** (dim / (dim - 2)))
 
     freqs = 1.0 / (
-        effective_theta ** (
+        effective_theta
+        ** (
             torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
             / dim
         )
@@ -83,9 +84,15 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     if sin.dtype != x.dtype or sin.device != x.device:
         sin = sin.to(device=x.device, dtype=x.dtype)
     d = x.shape[-1] // 2
+
+    # PERFORMANCE OPTIMIZATION: Calculate math elements directly on slices and
+    # concatenate instead of allocating intermediate full-size x_rot tensor
+    # to reduce memory bandwidth usage and improve latency on GPUs.
     x1, x2 = x[..., :d], x[..., d:]
-    x_rot = torch.cat([-x2, x1], dim=-1)
-    return x * cos + x_rot * sin
+    cos1, cos2 = cos[..., :d], cos[..., d:]
+    sin1, sin2 = sin[..., :d], sin[..., d:]
+
+    return torch.cat([x1 * cos1 - x2 * sin1, x2 * cos2 + x1 * sin2], dim=-1)
 
 
 # ── Expert FFN ──────────────────────────────────────────────────────────
@@ -126,8 +133,11 @@ def orthogonal_expert_init(expert: ExpertFFN, seed: int, gain: float = 1.0) -> N
             rows, cols = w.shape
             # Generate random matrix with same dtype/device
             rand = torch.randn(
-                max(rows, cols), min(rows, cols),
-                generator=gen, device=w.device, dtype=w.dtype,
+                max(rows, cols),
+                min(rows, cols),
+                generator=gen,
+                device=w.device,
+                dtype=w.dtype,
             )
             q, _ = torch.linalg.qr(rand)
             # q is orthonormal along its shorter axis. After slicing:
@@ -182,10 +192,12 @@ class MoELayer(nn.Module):
         self.shared_expert = ExpertFFN(config.dim, config.shared_expert_hidden)
 
         # Routed experts
-        self.experts = nn.ModuleList([
-            ExpertFFN(config.dim, config.expert_hidden)
-            for _ in range(self.num_routed)
-        ])
+        self.experts = nn.ModuleList(
+            [
+                ExpertFFN(config.dim, config.expert_hidden)
+                for _ in range(self.num_routed)
+            ]
+        )
 
         # Router: projects (hidden + loop_emb) → num_routed logits
         self.loop_embeddings = nn.Embedding(config.recursive_loops, config.dim)
@@ -258,15 +270,9 @@ class MoELayer(nn.Module):
         self.last_per_token_entropy: list[float] = [0.0] * config.recursive_loops
         self.last_marginal_entropy: list[float] = [0.0] * config.recursive_loops
         self.last_assignment_entropy: list[float] = [0.0] * config.recursive_loops
-        self.last_clean_per_token_entropy: list[float] = [
-            0.0
-        ] * config.recursive_loops
-        self.last_clean_marginal_entropy: list[float] = [
-            0.0
-        ] * config.recursive_loops
-        self.last_clean_assignment_entropy: list[float] = [
-            0.0
-        ] * config.recursive_loops
+        self.last_clean_per_token_entropy: list[float] = [0.0] * config.recursive_loops
+        self.last_clean_marginal_entropy: list[float] = [0.0] * config.recursive_loops
+        self.last_clean_assignment_entropy: list[float] = [0.0] * config.recursive_loops
         self.last_expert_fraction: list[list[float]] = [
             [0.0] * self.num_routed for _ in range(config.recursive_loops)
         ]
@@ -279,21 +285,15 @@ class MoELayer(nn.Module):
         self.last_prebias_per_token_entropy: list[float] = [
             0.0
         ] * config.recursive_loops
-        self.last_prebias_marginal_entropy: list[float] = [
-            0.0
-        ] * config.recursive_loops
+        self.last_prebias_marginal_entropy: list[float] = [0.0] * config.recursive_loops
         self.last_prebias_assignment_entropy: list[float] = [
             0.0
         ] * config.recursive_loops
         self.last_prebias_expert_fraction: list[list[float]] = [
             [0.0] * self.num_routed for _ in range(config.recursive_loops)
         ]
-        self.last_prebias_raw_max_prob: list[float] = [
-            0.0
-        ] * config.recursive_loops
-        self.last_prebias_top_margin: list[float] = [
-            0.0
-        ] * config.recursive_loops
+        self.last_prebias_raw_max_prob: list[float] = [0.0] * config.recursive_loops
+        self.last_prebias_top_margin: list[float] = [0.0] * config.recursive_loops
         self.last_clean_raw_max_prob: list[float] = [0.0] * config.recursive_loops
         self.last_clean_top_margin: list[float] = [0.0] * config.recursive_loops
 
@@ -306,7 +306,9 @@ class MoELayer(nn.Module):
         for ei, expert in enumerate(self.experts):
             assert isinstance(expert, ExpertFFN)
             orthogonal_expert_init(
-                expert, seed=self._moe_seed * 1000 + ei, gain=1.0,
+                expert,
+                seed=self._moe_seed * 1000 + ei,
+                gain=1.0,
             )
 
     @torch._dynamo.disable
@@ -330,10 +332,9 @@ class MoELayer(nn.Module):
             return
 
         current_frac = self.expert_ema_fraction.clone()
-        current_frac[active] = (
-            self.balance_count_accum[active]
-            / self.balance_total_accum[active].unsqueeze(-1)
-        )
+        current_frac[active] = self.balance_count_accum[
+            active
+        ] / self.balance_total_accum[active].unsqueeze(-1)
         self.expert_ema_fraction[active] = torch.lerp(
             self.expert_ema_fraction[active],
             current_frac[active],
@@ -405,10 +406,12 @@ class MoELayer(nn.Module):
         # Top-k selection (raw probs, before renormalisation)
         raw_top_probs, top_idx = probs.topk(self.top_k, dim=-1)  # (N, K)
         clean_raw_top_probs, clean_top_idx = clean_probs.topk(
-            self.top_k, dim=-1,
+            self.top_k,
+            dim=-1,
         )
         prebias_raw_top_probs, raw_balance_top_idx = raw_router_probs.topk(
-            self.top_k, dim=-1,
+            self.top_k,
+            dim=-1,
         )
         if self.training and self.balance_accum_enabled:
             self._accumulate_balance_counts(clean_top_idx, loop_idx)
@@ -417,9 +420,9 @@ class MoELayer(nn.Module):
         # output would be down-weighted when K > 1 just because softmax is
         # spread across E>K experts. Renormalisation keeps the MoE branch
         # at a consistent magnitude regardless of K.
-        top_probs = raw_top_probs / raw_top_probs.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-9)
+        top_probs = raw_top_probs / raw_top_probs.sum(dim=-1, keepdim=True).clamp_min(
+            1e-9
+        )
 
         # Per-expert capacity. In training, enforce the cap to force
         # balancing pressure. In eval/inference, disable drops entirely so
@@ -451,19 +454,16 @@ class MoELayer(nn.Module):
         #   p_i = mean softmax prob for expert i (sums to 1).
         #   loss = E * sum(f_i * p_i). Minimum at uniform = 1.0.
         raw_balance_one_hot = F.one_hot(
-            raw_balance_top_idx, num_classes=self.num_routed,
+            raw_balance_top_idx,
+            num_classes=self.num_routed,
         )
         # Compute balance loss in fp32. Under bf16 autocast, f·p can
         # underflow late in training when both are near 1/E (= 0.125 for
         # E=8); fp32 keeps the product and sum precise so the gradient
         # signal survives into long runs.
-        raw_balance_f = (
-            raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
-        )
+        raw_balance_f = raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
         raw_balance_p = raw_router_probs.float().mean(dim=0)
-        self.balance_loss = self.num_routed * (
-            raw_balance_f * raw_balance_p
-        ).sum()
+        self.balance_loss = self.num_routed * (raw_balance_f * raw_balance_p).sum()
 
         # Router Z-loss (ST-MoE §3.2): mean_token (logsumexp(logits))^2.
         # Bounds the absolute magnitude of router logits so bf16/fp8
@@ -473,7 +473,7 @@ class MoELayer(nn.Module):
         # pre-Gumbel) so the penalty acts on the learned router itself.
         # fp32 for the same precision reasons as balance_loss above.
         z = torch.logsumexp(router_logits.float(), dim=-1)  # (N,)
-        self.z_loss = (z ** 2).mean()
+        self.z_loss = (z**2).mean()
 
         # Sequence-wise balance loss (DeepSeek-V3 §5.2). Penalises
         # imbalance INSIDE each individual sequence, complementing the
@@ -485,15 +485,20 @@ class MoELayer(nn.Module):
         # Uses the same raw (un-noised) routing decisions as
         # balance_loss for a coherent gradient signal.
         seq_one_hot = raw_balance_one_hot.float().view(
-            B, S, self.top_k, self.num_routed,
+            B,
+            S,
+            self.top_k,
+            self.num_routed,
         )
         f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
-        p_seq = raw_router_probs.float().view(B, S, self.num_routed).mean(
-            dim=1,
-        )                                                       # (B, E)
-        self.seq_balance_loss = self.num_routed * (
-            f_seq * p_seq
-        ).sum(dim=-1).mean()
+        p_seq = (
+            raw_router_probs.float()
+            .view(B, S, self.num_routed)
+            .mean(
+                dim=1,
+            )
+        )  # (B, E)
+        self.seq_balance_loss = self.num_routed * (f_seq * p_seq).sum(dim=-1).mean()
 
         # Dispatch: for each expert, gather every token that picked it at
         # ANY top-k rank, apply capacity, run expert, scatter-add into output
@@ -503,7 +508,7 @@ class MoELayer(nn.Module):
 
         for ei, expert in enumerate(self.experts):
             # Where (token_idx, rank) pairs where this expert is chosen
-            is_chosen = (top_idx == ei)  # (N, K), bool
+            is_chosen = top_idx == ei  # (N, K), bool
             token_indices, rank_indices = is_chosen.nonzero(as_tuple=True)  # both (T,)
 
             if token_indices.numel() == 0:
@@ -518,9 +523,10 @@ class MoELayer(nn.Module):
             # survival probability when an expert overflows. In eval
             # mode capacity == N*K so this branch never triggers.
             if token_indices.numel() > capacity:
-                total_dropped += (token_indices.numel() - capacity)
+                total_dropped += token_indices.numel() - capacity
                 perm = torch.randperm(
-                    token_indices.numel(), device=token_indices.device,
+                    token_indices.numel(),
+                    device=token_indices.device,
                 )
                 keep = perm[:capacity]
                 token_indices = token_indices[keep]
@@ -528,7 +534,7 @@ class MoELayer(nn.Module):
 
             # Run expert on selected tokens (one forward per expert per batch)
             expert_input = x_flat[token_indices]  # (T, D)
-            expert_output = expert(expert_input)   # (T, D)
+            expert_output = expert(expert_input)  # (T, D)
 
             # Gate = renormalised softmax prob for this (token, rank) pair.
             # Router gets gradient through this gate.
@@ -588,14 +594,13 @@ class MoELayer(nn.Module):
             self.last_top_margin[loop_idx] = top_margin
 
             prebias_log_probs = torch.log(raw_router_probs.clamp_min(1e-10))
-            prebias_per_token_ent = -(
-                raw_router_probs * prebias_log_probs
-            ).sum(dim=-1)
+            prebias_per_token_ent = -(raw_router_probs * prebias_log_probs).sum(dim=-1)
             prebias_p = raw_router_probs.float().mean(dim=0)
             prebias_p_log = torch.log(prebias_p.clamp_min(1e-10))
             prebias_marginal_ent = -(prebias_p * prebias_p_log).sum().item()
             prebias_one_hot = F.one_hot(
-                raw_balance_top_idx, num_classes=self.num_routed,
+                raw_balance_top_idx,
+                num_classes=self.num_routed,
             ).to(raw_router_probs.dtype)
             prebias_f = prebias_one_hot.sum(dim=(0, 1)) / (N * self.top_k)
             prebias_f_log = torch.log(prebias_f.clamp_min(1e-10))
@@ -603,9 +608,10 @@ class MoELayer(nn.Module):
             prebias_raw_max = prebias_raw_top_probs[:, 0].mean().item()
             if self.top_k >= 2:
                 prebias_top_margin = (
-                    prebias_raw_top_probs[:, 0]
-                    - prebias_raw_top_probs[:, 1]
-                ).mean().item()
+                    (prebias_raw_top_probs[:, 0] - prebias_raw_top_probs[:, 1])
+                    .mean()
+                    .item()
+                )
             else:
                 prebias_top_margin = prebias_raw_top_probs[:, 0].mean().item()
 
@@ -624,7 +630,8 @@ class MoELayer(nn.Module):
             clean_p_log = torch.log(clean_p.clamp_min(1e-10))
             clean_marginal_ent = -(clean_p * clean_p_log).sum().item()
             clean_one_hot = F.one_hot(
-                clean_top_idx, num_classes=self.num_routed,
+                clean_top_idx,
+                num_classes=self.num_routed,
             ).to(clean_probs.dtype)
             clean_f = clean_one_hot.sum(dim=(0, 1)) / (N * self.top_k)
             clean_f_log = torch.log(clean_f.clamp_min(1e-10))
@@ -632,9 +639,10 @@ class MoELayer(nn.Module):
             clean_raw_max = clean_raw_top_probs[:, 0].mean().item()
             if self.top_k >= 2:
                 clean_top_margin = (
-                    clean_raw_top_probs[:, 0]
-                    - clean_raw_top_probs[:, 1]
-                ).mean().item()
+                    (clean_raw_top_probs[:, 0] - clean_raw_top_probs[:, 1])
+                    .mean()
+                    .item()
+                )
             else:
                 clean_top_margin = clean_raw_top_probs[:, 0].mean().item()
 
@@ -674,7 +682,10 @@ def _checkpoint_block(block_fn, *args, context_fn):
     # outer model is wrapped in torch.compile because the inner call
     # re-enters the compiled graph.
     return gradient_checkpoint(
-        block_fn, *args, use_reentrant=False, context_fn=context_fn,
+        block_fn,
+        *args,
+        use_reentrant=False,
+        context_fn=context_fn,
     )
 
 
@@ -774,15 +785,21 @@ class RecursiveBlock(nn.Module):
         k_len = k.shape[2]
         if past_len > 0 and q_len > 1:
             attn_mask = torch.full(
-                (q_len, k_len), float("-inf"),
-                device=q.device, dtype=q.dtype,
+                (q_len, k_len),
+                float("-inf"),
+                device=q.device,
+                dtype=q.dtype,
             )
             attn_mask = torch.triu(attn_mask, diagonal=1 + past_len)
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=False,
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=False,
             )
         else:
-            is_causal = (q_len == k_len)
+            is_causal = q_len == k_len
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
@@ -851,12 +868,16 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
         # Per-pass low-rank adapters
         total_pairs = config.num_blocks * config.recursive_loops
         self.adapters_a = nn.ParameterList(
-            [nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
+                for _ in range(total_pairs)
+            ]
         )
         self.adapters_b = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
 
@@ -872,7 +893,11 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> tuple[
-        Tensor, list[Tensor], Tensor, Tensor, Tensor,
+        Tensor,
+        list[Tensor],
+        Tensor,
+        Tensor,
+        Tensor,
         list[tuple[Tensor, Tensor]] | None,
     ]:
         """Forward pass.
@@ -902,18 +927,15 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                         f"past_key_values[{idx}] must be a (key, value) tuple."
                     )
                 key, value = layer_past
-                if (not isinstance(key, torch.Tensor)
-                        or not isinstance(value, torch.Tensor)):
-                    raise ValueError(
-                        f"past_key_values[{idx}] must contain Tensors."
-                    )
+                if not isinstance(key, torch.Tensor) or not isinstance(
+                    value, torch.Tensor
+                ):
+                    raise ValueError(f"past_key_values[{idx}] must contain Tensors.")
                 layer_len = key.shape[2]
                 if past_length == 0:
                     past_length = layer_len
                 elif layer_len != past_length:
-                    raise ValueError(
-                        f"KV cache length mismatch at layer {idx}."
-                    )
+                    raise ValueError(f"KV cache length mismatch at layer {idx}.")
 
         required_seq_len = past_length + S
         if required_seq_len <= self.rope_cos.shape[1]:
@@ -941,9 +963,7 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
 
         use_ckpt = self.gradient_checkpointing and self.training
         if use_ckpt and (use_cache or past_key_values is not None):
-            raise ValueError(
-                "KV caching is incompatible with gradient checkpointing."
-            )
+            raise ValueError("KV caching is incompatible with gradient checkpointing.")
         presents: list[tuple[Tensor, Tensor]] | None = [] if use_cache else None
 
         for loop in range(self.config.recursive_loops):
@@ -956,9 +976,16 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                 )
 
                 if use_ckpt:
+
                     def _block_fn(
-                        _x, _a, _b, _cos, _sin,
-                        _block=block, _scale=self.adapter_scale, _loop=loop,
+                        _x,
+                        _a,
+                        _b,
+                        _cos,
+                        _sin,
+                        _block=block,
+                        _scale=self.adapter_scale,
+                        _loop=loop,
                     ):
                         return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
 
@@ -969,13 +996,22 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                         )
 
                     x = _checkpoint_block(
-                        _block_fn, x, adapter_a, adapter_b, cos, sin,
+                        _block_fn,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        cos,
+                        sin,
                         context_fn=_context_fn,
                     )
                 else:
                     x, present_kv = block(
-                        x, adapter_a, adapter_b,
-                        self.adapter_scale, cos, sin,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        self.adapter_scale,
+                        cos,
+                        sin,
                         loop_idx=loop,
                         past_key_value=layer_past,
                         use_cache=use_cache,
@@ -1002,8 +1038,11 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
 
         x = self.norm_out(x)
         return (
-            x, loop_rms,
-            total_balance_loss, total_z_loss, total_seq_balance_loss,
+            x,
+            loop_rms,
+            total_balance_loss,
+            total_z_loss,
+            total_seq_balance_loss,
             presents,
         )
 
@@ -1051,8 +1090,11 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         (
-            hidden, loop_rms,
-            balance_loss, z_loss, seq_balance_loss,
+            hidden,
+            loop_rms,
+            balance_loss,
+            z_loss,
+            seq_balance_loss,
             presents,
         ) = self.model(
             input_ids,
@@ -1074,7 +1116,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :self.config.real_vocab_size]
+            shift_logits = logits[..., :-1, : self.config.real_vocab_size]
             shift_logits = shift_logits.contiguous().float()
             shift_labels = labels[..., 1:].contiguous()
             task_loss = F.cross_entropy(
@@ -1099,8 +1141,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                     task_loss
                     + self.config.router_aux_loss_coeff * balance_norm
                     + self.config.router_z_loss_coeff * z_norm
-                    + self.config.router_seq_balance_loss_coeff
-                    * seq_balance_norm
+                    + self.config.router_seq_balance_loss_coeff * seq_balance_norm
                 )
             else:
                 loss = task_loss
@@ -1163,7 +1204,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         # `Cache | None`, but our forward returns a plain list of
         # (k, v) tuples. Cast locally so ty/mypy line up with runtime.
         PastKV = list[tuple[Tensor, Tensor] | None]
-        context = input_ids[:, -self.config.max_position_embeddings:]
+        context = input_ids[:, -self.config.max_position_embeddings :]
         out = self.forward(context, use_cache=True)
         past_key_values = cast("PastKV | None", out.past_key_values)
 
@@ -1173,12 +1214,12 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         # cleanly truncate, and we stop updating logits for it.
         batch_size = input_ids.shape[0]
         finished = torch.zeros(
-            batch_size, dtype=torch.bool, device=input_ids.device,
+            batch_size,
+            dtype=torch.bool,
+            device=input_ids.device,
         )
         logits_tensor = cast(Tensor, out.logits)
-        logits_last = (
-            logits_tensor[:, -1, :self.config.real_vocab_size].float()
-        )
+        logits_last = logits_tensor[:, -1, : self.config.real_vocab_size].float()
         generated = input_ids.clone()
 
         for step_idx in range(max_new_tokens):
@@ -1206,9 +1247,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 )
                 past_key_values = cast("PastKV | None", out.past_key_values)
                 logits_tensor = cast(Tensor, out.logits)
-                logits_last = (
-                    logits_tensor[:, -1, :self.config.real_vocab_size].float()
-                )
+                logits_last = logits_tensor[
+                    :, -1, : self.config.real_vocab_size
+                ].float()
 
             # Repetition penalty (disabled by default). Vectorised so the
             # cost stays O(B*T) on-device instead of O(B*|set|) Python-loop
@@ -1222,7 +1263,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 vocab = logits_last.shape[-1]
                 # Mask out-of-vocab tokens so gather doesn't touch them.
                 gen_clamped = generated.clamp(max=vocab - 1)
-                in_vocab = (generated < vocab)
+                in_vocab = generated < vocab
                 score = torch.gather(logits_last, 1, gen_clamped)
                 penalised = torch.where(
                     score > 0,
@@ -1239,14 +1280,14 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 next_logits = logits_last / temperature
                 if top_k > 0:
                     topk_vals, _ = torch.topk(
-                        next_logits, min(top_k, next_logits.size(-1)),
+                        next_logits,
+                        min(top_k, next_logits.size(-1)),
                     )
-                    next_logits[
-                        next_logits < topk_vals[:, -1:]
-                    ] = float("-inf")
+                    next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(
-                        next_logits, descending=True,
+                        next_logits,
+                        descending=True,
                     )
                     sorted_probs = F.softmax(sorted_logits, dim=-1)
                     cumprobs = torch.cumsum(sorted_probs, dim=-1)
