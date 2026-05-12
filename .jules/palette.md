@@ -1,0 +1,3 @@
+## 2024-05-24 - Enhancing Gradio UX with Autofocus and Tooltips
+**Learning:** Gradio's `gr.Textbox` supports `autofocus=True`, which significantly improves chat interfaces by reducing initial clicks. Additionally, using the `info` parameter on input components like `gr.Slider` provides excellent inline documentation without cluttering the UI with separate Markdown blocks. Also learned to add input length validation using `gr.Error` to prevent DoS.
+**Action:** Always include `autofocus=True` for the primary text input in chat apps, and use `info` to document complex settings like generation parameters instead of separate help text. Add input length validation.
