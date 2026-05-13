@@ -835,6 +835,64 @@ def sft_refresh():
 
 
 # =============================================================================
+# SFT_MATH (math-only SFT pass between sft_refresh and GRPO)
+# =============================================================================
+#
+# Math probe of sft_refresh_final.pt revealed think→answer decoupling
+# (think block had correct steps, answer block ignored them and
+# emitted random wrong content). 200 steps of pure math SFT trains
+# the answer block to commit to the think block's conclusion.
+# Cheap (~$1.30) and gives GRPO a coherent base before RL kicks in.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def sft_math():
+    """Math-only SFT polish on top of sft_refresh_final.pt.
+
+    See train_config.py::SFTMathConfig for design rationale. 200
+    steps, pure math mix (GSM8K + Orca-Math + MathInstruct +
+    NuminaMath-CoT, all warm-cached on gradio-winter-hack), peak
+    LR 3e-6. Goal: tighten think→answer correlation before GRPO.
+    """
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.sft_train import run_sft
+    from nano_osrt.train_config import SFTMathConfig
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    sft_math_cfg = SFTMathConfig()
+    print(
+        "sft_math: 1,000 steps, peak LR 3e-6, math-only mix. "
+        "Goal: tighten think→answer correlation before GRPO.",
+    )
+    print(f"Resume base: {sft_math_cfg.pretrained_checkpoint}")
+    run_sft(model_config, sft_math_cfg, vol, tok)
+
+
+# =============================================================================
 # EVALUATE (lm-eval-harness pass: gsm8k + IFEval + MMLU-stem)
 # =============================================================================
 
@@ -1447,6 +1505,8 @@ def main(stage: str = "pretrain"):
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
     --stage sft_refresh    Short format-anchor SFT on top of extend_final.pt
                              (500 steps, peak LR 5e-6, no tool_calling)
+    --stage sft_math       Math-only SFT polish on top of sft_refresh_final.pt
+                             (1,000 steps, peak LR 3e-6, GSM8K + Orca + MathInstruct + NuminaMath)
     --stage evaluate       lm-eval-harness pass (gsm8k + IFEval + MMLU-stem). Args:
                              --ckpt-name <filename in /vol/checkpoints/v5/>
                              --tag <pre-grpo|post-grpo|...>
@@ -1474,6 +1534,8 @@ def main(stage: str = "pretrain"):
         sft_ultralong.remote()
     elif stage == "sft_refresh":
         sft_refresh.remote()
+    elif stage == "sft_math":
+        sft_math.remote()
     elif stage == "evaluate":
         evaluate.remote()
     elif stage == "grpo":
@@ -1482,5 +1544,6 @@ def main(stage: str = "pretrain"):
         print(
             f"Unknown stage: {stage}. "
             f"Use sanity, sweep, ablate, pretrain, pretrain_extend, "
-            f"sft, sft_long, sft_ultralong, sft_refresh, evaluate, or grpo"
+            f"sft, sft_long, sft_ultralong, sft_refresh, sft_math, "
+            f"evaluate, or grpo"
         )

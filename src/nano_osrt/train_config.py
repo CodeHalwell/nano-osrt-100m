@@ -969,6 +969,99 @@ class SFTRefreshConfig(SFTConfig):
     ]
 
 
+class SFTMathConfig(SFTRefreshConfig):
+    """Math-focused SFT pass between sft_refresh and GRPO.
+
+    Why this exists
+    ───────────────
+    Math probe of osrt_v5_sft_refresh_final.pt (commit fa5c69a)
+    revealed a specific failure mode: 8/8 clean format ✓, but 6/8
+    math problems wrong because the answer block is *decoupled*
+    from the think block. Examples:
+
+      24-7-3:   think="24-7=15, 15-3=12" (correct steps)
+                answer="15+12=27" (synthesis broken)
+      6×8:      think="48" (correct)
+                answer="(6+1)*(8+1)=5*9=45" (random wrong)
+
+    The model learned the structure but doesn't commit the think
+    block's conclusion to the answer block. A short math-only SFT
+    pass hammers in (q → think → answer) examples where the answer
+    IS the think conclusion, training the answer block to draw on
+    its own reasoning.
+
+    This is the "warm-up before GRPO" — gives RL a base where the
+    think→answer pipeline is already coherent, so RL only has to
+    optimise correctness, not also fix the decoupling.
+
+    Design
+    ──────
+    200 steps × seq 2048 × batch 8 × accum 8 = ~26 M trained tokens.
+    Peak LR 3e-6 (lower than refresh's 5e-6 — we just refreshed,
+    don't want to disturb the format gain). All 4 datasets are
+    short-example math (warm-cached on gradio-winter-hack), so
+    packing rate is high.
+
+    Resume from osrt_v5_sft_refresh_final.pt (HRA already injected
+    + trained, both base and HRA stay trainable like sft_refresh).
+    """
+
+    total_steps: int = 1_000
+    warmup_steps: int = 50          # 5 % of total
+    peak_lr: float = 3e-6           # lower than refresh's 5e-6
+    min_lr: float = 3e-7
+    log_interval: int = 25
+    ckpt_interval: int = 200        # 5 ckpts over 1,000 steps
+
+    # HRA inherited as trainable. Resume from the freshly-format-
+    # anchored ckpt (sft_refresh_final.pt has HRA params in its
+    # state_dict).
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_refresh_final.pt"
+    stage_prefix: str = "sft_math"
+    wandb_run_name: str = "osrt-sft-math"
+
+    # Pure math mix — short examples that pack at seq 2048 cleanly.
+    # All 4 datasets are warm-cached on gradio-winter-hack from
+    # base SFT and sft_refresh. NuminaMath has some long examples
+    # but at 15 % weight the long ones being filtered won't starve
+    # the buffer (dominated by short GSM8K/Orca-Math/MathInstruct).
+    datasets: list = [  # noqa: RUF012
+        # GSM8K — gold-standard short math word problems
+        {
+            "name": "gsm8k",
+            "hf_id": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "train",
+            "weight": 0.30,
+            "format": "gsm8k",
+        },
+        # Orca-Math — large variety of word problems
+        {
+            "name": "orca-math",
+            "hf_id": "microsoft/orca-math-word-problems-200k",
+            "split": "train",
+            "weight": 0.30,
+            "format": "orca_math",
+        },
+        # MathInstruct — algebra/calculus heavy
+        {
+            "name": "math-instruct",
+            "hf_id": "TIGER-Lab/MathInstruct",
+            "split": "train",
+            "weight": 0.25,
+            "format": "math_instruct",
+        },
+        # NuminaMath-CoT — premium chain-of-thought math
+        {
+            "name": "numina-math-cot",
+            "hf_id": "AI-MO/NuminaMath-CoT",
+            "split": "train",
+            "weight": 0.15,
+            "format": "numina_math",
+        },
+    ]
+
+
 class GRPOConfig:
     """GRPO config for v5 — verifiable math rewards on top of SFT."""
 
@@ -1013,7 +1106,16 @@ class GRPOConfig:
     wandb_run_id: str = ""
 
     # Checkpoint
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_final.pt"
+    # Updated lineage: pretrain → SFT base → SFT-long → SFT-ultralong
+    # → pretrain_extend → sft_refresh → sft_math → GRPO. The
+    # `osrt_v5_sft_final.pt` filename never existed (base SFT was
+    # stopped at step 2500, see SFTConfig docstring); originally
+    # GRPO would have resumed from osrt_v5_sft_step_2500.pt. Now
+    # that we have the math-focused chain, GRPO should resume from
+    # osrt_v5_sft_math_final.pt — the model with cleaned format
+    # (sft_refresh) AND tightened think→answer correlation
+    # (sft_math).
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
     stage_prefix: str = "grpo"
 
     # Prompt source
