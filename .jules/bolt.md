@@ -1,0 +1,4 @@
+
+## 2024-05-18 - Optimize PyTorch Memory Bandwidth via Slice Recombination
+**Learning:** In PyTorch, constructing a full intermediate tensor like `x_rot = torch.cat([-x2, x1], dim=-1)` prior to multiplication (`x_rot * sin`) incurs unnecessary memory bandwidth overhead. By performing element-wise operations directly on the tensor slices (`x2 * sin[..., d:]`) and concatenating the final results, we can slightly reduce latency and avoid allocating an extra full-sized tensor. This is especially relevant in frequently-called operations like RoPE application inside attention blocks.
+**Action:** When implementing custom tensor operations (like Rotary Embeddings), prefer executing mathematical operations on slices and concatenating the results over allocating complete rotated/modified intermediate tensors.
