@@ -129,6 +129,39 @@ def count_reasoning_steps(thinking: str) -> int:
     return len(lines)
 
 
+def length_ramp_penalty(completion_tokens: int, max_tokens: int) -> float:
+    """Smooth length penalty that ramps as the completion approaches the
+    output budget.
+
+    Designed to discourage the model from padding its <|think|> block to
+    fill the entire generation budget — observed in math reasoning
+    models that learn "longer reasoning = more reward" without a
+    counter-pressure. The ramp targets the *use of the budget*, not
+    the absolute token count, so it scales with whatever max_gen_len
+    is configured.
+
+    Schedule (linear between breakpoints):
+        ≤ 80 % of max_tokens : 0.0   (think freely, no penalty)
+          80 %               : -0.5
+          90 %               : -0.75
+          100 %              : -1.0  (caps; model hit the cap)
+
+    Returns 0.0 if max_tokens is 0 or completion_tokens is 0 (used as
+    a no-op when GRPO doesn't pass token info — e.g. unit tests).
+    """
+    if max_tokens <= 0 or completion_tokens <= 0:
+        return 0.0
+    pct = completion_tokens / max_tokens
+    if pct < 0.80:
+        return 0.0
+    if pct >= 1.00:
+        return -1.0
+    # Linear ramp from -0.5 at 80 % to -1.0 at 100 %:
+    #   slope = (−1.0 − (−0.5)) / (1.00 − 0.80) = −2.5
+    # Verifies: 0.80→-0.5, 0.90→-0.75, 1.00→-1.0
+    return -0.5 + (pct - 0.80) * (-2.5)
+
+
 def compute_reward(
     completion: str,
     ground_truth_answer: str,
@@ -203,14 +236,27 @@ def compute_reward(
     else:
         breakdown["reasoning_bonus"] = 0.0
 
-    # 4. Truncation penalty (hit 90% of max tokens — likely degenerate loop)
-    if max_tokens > 0 and completion_tokens >= int(max_tokens * 0.9):
-        reward += truncation_penalty
-        breakdown["truncated"] = True
-        breakdown["truncation_penalty"] = truncation_penalty
-    else:
-        breakdown["truncated"] = False
-        breakdown["truncation_penalty"] = 0.0
+    # 4. Length-ramp penalty (smooth, scales toward output token budget)
+    # Replaces the old binary truncation_penalty (which only fired at
+    # 90 %). Now: 0 below 80 %, then linear ramp from -0.5 at 80 %
+    # → -0.75 at 90 % → -1.0 at 100 %. Discourages padding the think
+    # block to fill the budget without harshly penalising completions
+    # that legitimately need 60-75 % of the room.
+    # `truncation_penalty` config field is now unused (kept for
+    # backwards compat with saved configs); the ramp is hardcoded
+    # in length_ramp_penalty() above.
+    length_pen = length_ramp_penalty(completion_tokens, max_tokens)
+    reward += length_pen
+    breakdown["length_ramp_penalty"] = length_pen
+    breakdown["length_ramp_pct"] = (
+        completion_tokens / max_tokens if max_tokens > 0 else 0.0
+    )
+    # Keep `truncated` flag for compatibility with downstream logging
+    # — true iff we hit the cap (≥ 100 %).
+    breakdown["truncated"] = (
+        max_tokens > 0 and completion_tokens >= max_tokens
+    )
+    breakdown["truncation_penalty"] = 0.0  # deprecated; see length_ramp_penalty
 
     # 5. Empty thinking penalty (gaming format with no content)
     if has_format and len(thinking.split()) < 3:
