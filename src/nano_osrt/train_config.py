@@ -1067,19 +1067,33 @@ class GRPOConfig:
 
     batch_size: int = 4
     grad_accum_steps: int = 4
-    total_steps: int = 2_000
-    warmup_steps: int = 100
+    # Cut from 2000 → 500 after GRPO run 1 measured ~100 sec/step at the
+    # original config (2000 steps × 100 sec = 56h ≈ $220, way over the
+    # $30 workspace budget). Run 1's first 10 steps showed acc 4.7% →
+    # 26.6% — convergence is fast on the math-anchored base, so 500
+    # steps captures most of the curve.
+    total_steps: int = 500
+    warmup_steps: int = 25          # 5 % of 500
     peak_lr: float = 3e-6
     min_lr: float = 3e-7
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     log_interval: int = 10
-    ckpt_interval: int = 250
+    ckpt_interval: int = 100        # 5 ckpts over 500 steps (was 250)
     seq_len: int = 8192
 
     # GRPO-specific
-    group_size: int = 16
-    max_gen_len: int = 512
+    # group_size halved from 16 → 8 to halve the per-step rollout cost.
+    # 8 rollouts per prompt is still enough for meaningful intra-prompt
+    # advantage normalisation (DeepSeek-R1's "G" hyperparameter was 16
+    # but their model was much larger; for ours, 8 gives plenty of
+    # signal).
+    group_size: int = 8
+    # max_gen_len cut from 512 → 384 to reduce per-rollout token cost.
+    # gsm8k-style answers (think + answer block) typically fit in
+    # 200-300 tokens; 384 leaves comfortable headroom for the longer
+    # multi-step problems while shaving generation time.
+    max_gen_len: int = 384
     temperature: float = 0.8
     top_p: float = 0.95
     kl_coeff: float = 0.05
