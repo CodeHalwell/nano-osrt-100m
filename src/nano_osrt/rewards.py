@@ -129,6 +129,76 @@ def count_reasoning_steps(thinking: str) -> int:
     return len(lines)
 
 
+def correctness_partial_credit(
+    predicted: str | None,
+    ground_truth: str | None,
+) -> tuple[float, str]:
+    """Unsloth-style tiered correctness reward.
+
+    Instead of binary correct/wrong (which produces zero advantage
+    when all rollouts in a group are wrong — see GRPO run 2/3 stuck
+    pattern), this gives partial credit for "close" answers and
+    negative reward for "way off" or unparseable.
+
+    Returns (score, tier_label). Score ranges from +5.0 (exact) to
+    -2.5 (no extractable number).
+
+    Why partial credit matters
+    ──────────────────────────
+    At ~5 % gsm8k baseline accuracy with group_size=8, most groups
+    have ZERO correct rollouts under binary scoring → all rollouts
+    get reward 0 (or just format reward 0.2) → group-relative
+    advantage normalisation gives all zeros → no gradient → policy
+    frozen. Partial credit ensures variance in rollout rewards even
+    when none are exactly right: a rollout that produces "53"
+    against ground truth "18" gets a different reward from one that
+    produces "144" or "blah". Variance → advantages → gradient.
+
+    Tier schedule (matches the Unsloth GRPO tutorial pattern):
+        exact match     +5.0     ← what we want
+        within   5 %    +3.5
+        within  10 %    +2.5
+        within  20 %    +1.5
+        0.5x – 2.0x     -0.5     ← still in same order of magnitude
+        wrong number    -2.0     ← off by an order of magnitude+
+        no number       -2.5     ← couldn't even parse one
+    """
+    if predicted is None or predicted == "":
+        return -2.5, "no_extraction"
+    if ground_truth is None or ground_truth == "":
+        return 0.0, "no_ground_truth"
+
+    # String-strip exact match before numeric coercion (handles "53"
+    # vs " 53" vs "53.0" cases the comma-strip in numeric_match
+    # already handles).
+    if str(predicted).strip() == str(ground_truth).strip():
+        return 5.0, "exact"
+
+    try:
+        gt = float(str(ground_truth).strip().replace(",", ""))
+        pr = float(str(predicted).strip().replace(",", ""))
+    except (ValueError, TypeError):
+        return -2.0, "non_numeric"
+
+    if gt == 0:
+        # Special-case division-by-zero: only exact match is valid
+        return (5.0, "exact") if pr == 0 else (-2.0, "zero_gt_wrong")
+
+    if pr == gt:
+        return 5.0, "exact_numeric"
+
+    ratio = pr / gt
+    if 0.95 <= ratio <= 1.05:
+        return 3.5, "within_5_pct"
+    if 0.90 <= ratio <= 1.10:
+        return 2.5, "within_10_pct"
+    if 0.80 <= ratio <= 1.20:
+        return 1.5, "within_20_pct"
+    if 0.50 <= ratio <= 2.00:
+        return -0.5, "wrong_same_order"
+    return -2.0, "wrong_far_off"
+
+
 def length_ramp_penalty(completion_tokens: int, max_tokens: int) -> float:
     """Smooth length penalty that ramps as the completion approaches the
     output budget.
@@ -198,7 +268,14 @@ def compute_reward(
     reward = 0.0
     breakdown = {}
 
-    # 1. Correctness reward (core signal)
+    # 1. Correctness reward (core signal) — Unsloth-style partial credit.
+    # Replaces the original binary correctness (+1 if exact, 0 otherwise)
+    # which caused GRPO collapse on this model: at ~5 % gsm8k baseline
+    # acc with group_size=8, most groups had zero correct rollouts →
+    # uniform rewards → zero advantage → frozen updates. See
+    # correctness_partial_credit() for the tier schedule (+5.0 exact
+    # down to -2.5 no-extract). correctness_weight now scales the
+    # ENTIRE tier output (default 1.0 keeps the raw Unsloth schedule).
     predicted = extract_numeric_answer(
         completion,
         think_close=think_close,
@@ -209,10 +286,12 @@ def compute_reward(
     if gt is None:
         gt = ground_truth_answer.replace(",", "").strip()
 
-    correct = numeric_match(predicted, gt)
-    correctness_r = correctness_weight if correct else 0.0
+    tier_score, tier_label = correctness_partial_credit(predicted, gt)
+    correctness_r = tier_score * correctness_weight
+    correct = (tier_label in ("exact", "exact_numeric"))
     reward += correctness_r
     breakdown["correct"] = correct
+    breakdown["correctness_tier"] = tier_label
     breakdown["correctness_reward"] = correctness_r
 
     # 2. Format reward
