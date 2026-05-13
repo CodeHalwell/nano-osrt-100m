@@ -1074,8 +1074,15 @@ class GRPOConfig:
     # steps captures most of the curve.
     total_steps: int = 500
     warmup_steps: int = 25          # 5 % of 500
-    peak_lr: float = 3e-6
-    min_lr: float = 3e-7
+    # Cut from 3e-6 → 1.5e-6 after GRPO run 2 collapsed at step 20.
+    # Run 2 trace: acc 12.5 % (0) → 18.8 % (10) → 0 % (20, 30) → 3.1 %
+    # (40) → 0 % (50). Only 2 of 6 logged steps gave learning signal;
+    # the rest were stuck in GRPO's "all-rollouts-uniform-rewards" trap
+    # where group-relative advantage normalisation produces zero
+    # gradient. Smaller per-step updates (lower lr) prevent the early
+    # drift that pushed the policy into a 0-reward region.
+    peak_lr: float = 1.5e-6
+    min_lr: float = 1.5e-7
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     log_interval: int = 10
@@ -1094,10 +1101,25 @@ class GRPOConfig:
     # 200-300 tokens; 384 leaves comfortable headroom for the longer
     # multi-step problems while shaving generation time.
     max_gen_len: int = 384
-    temperature: float = 0.8
+    # Bumped from 0.8 → 1.0 to increase rollout diversity. With
+    # group_size=8, we need at least one of the 8 rollouts to land
+    # on a correct answer to get any advantage signal. Higher
+    # temperature → wider sampling → better chance one rollout in a
+    # group hits the right answer even on harder problems. Counters
+    # the "all 8 rollouts wrong → zero signal" failure mode from
+    # run 2.
+    temperature: float = 1.0
     top_p: float = 0.95
-    kl_coeff: float = 0.05
-    clip_range: float = 0.2
+    # Bumped from 0.05 → 0.15 to anchor the policy harder against the
+    # frozen reference (sft_math_final.pt). Run 2 hit GRPO collapse
+    # at step 20 because early policy drift (KL hit 0.017 at step 10)
+    # pushed the model into a region where most batches gave 0 % acc
+    # → uniform rewards → zero advantage → frozen updates. Stronger
+    # KL coefficient prevents that drift in the first place.
+    kl_coeff: float = 0.15
+    # Tighter PPO clip (0.2 → 0.15) further limits per-step policy
+    # change, complementing the lower lr and higher kl_coeff.
+    clip_range: float = 0.15
 
     # HRA (inherited on top of SFT-injected HRA weights)
     hra_enabled: bool = True
