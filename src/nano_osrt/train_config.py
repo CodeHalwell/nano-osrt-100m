@@ -883,38 +883,88 @@ class SFTRefreshConfig(SFTConfig):
     stage_prefix: str = "sft_refresh"
     wandb_run_name: str = "osrt-sft-refresh"
 
-    # Nemotron-only SFT mix — no NuminaMath / Evol-Code / OpenHermes /
-    # IFEval-like (cold cache caused 100+ sec/step on first attempt).
-    # These three Nemotron splits were heavily exercised during
-    # pretrain_extend (math + stem rehearsal at 25 %, plus the new
-    # nemotron-code split here is small enough to cache quickly).
-    # No tool_calling — that habit is gone after extend, keep it gone.
-    # Pure-Nemotron mix risks over-fit to one teacher's CoT style at
-    # 500+ steps but is fine for a 200-step format-anchor pass.
+    # Diverse mix favouring SHORT examples that pack efficiently at
+    # seq 2048. Reverted from the Nemotron-only experiment (sft_refresh
+    # runs 1+4 on codhe-hugging-mcp) where most Nemotron examples
+    # exceeded seq_len and were skipped by SFTStream's length filter,
+    # starving the packing buffer to ~100+ sec/step.
+    #
+    # This mix mirrors most of the original SFTConfig — all proven to
+    # stream cleanly at 6 sec/step on gradio-winter-hack workspace
+    # during base SFT and SFT-long. Critical: NO tool_calling — that
+    # habit was eliminated during pretrain_extend, keep it gone.
     datasets: list = [  # noqa: RUF012
-        # Math (50 %) — primary signal
+        # Math (35 %) — short word problems pack well at seq 2048
         {
-            "name": "nemotron-math",
-            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-            "split": "math",
-            "weight": 0.50,
-            "format": "nemotron",
+            "name": "gsm8k",
+            "hf_id": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "train",
+            "weight": 0.15,
+            "format": "gsm8k",
         },
-        # STEM (30 %)
         {
-            "name": "nemotron-stem",
-            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-            "split": "stem",
-            "weight": 0.30,
-            "format": "nemotron",
+            "name": "orca-math",
+            "hf_id": "microsoft/orca-math-word-problems-200k",
+            "split": "train",
+            "weight": 0.10,
+            "format": "orca_math",
         },
-        # Code (20 %)
         {
-            "name": "nemotron-code",
-            "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-            "split": "code",
-            "weight": 0.20,
-            "format": "nemotron",
+            "name": "math-instruct",
+            "hf_id": "TIGER-Lab/MathInstruct",
+            "split": "train",
+            "weight": 0.10,
+            "format": "math_instruct",
+        },
+        # Code (20 %) — Alpaca-style code is short
+        {
+            "name": "evol-instruct-code",
+            "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
+            "split": "train",
+            "weight": 0.10,
+            "format": "evol_code",
+        },
+        {
+            "name": "code-instructions-122k",
+            "hf_id": "TokenBender/code_instructions_122k_alpaca_style",
+            "split": "train",
+            "weight": 0.10,
+            "format": "alpaca_code",
+        },
+        # General (30 %) — Alpaca + OpenHermes for chat-format anchor
+        # diversity beyond pure math/code (probe revealed cats /
+        # planet-question prompts triggered model failure modes
+        # because they're outside the math distribution).
+        {
+            "name": "alpaca-cleaned",
+            "hf_id": "yahma/alpaca-cleaned",
+            "split": "train",
+            "weight": 0.15,
+            "format": "alpaca",
+        },
+        {
+            "name": "openhermes",
+            "hf_id": "teknium/OpenHermes-2.5",
+            "split": "train",
+            "weight": 0.15,
+            "format": "openhermes",
+        },
+        # Instruction following (15 %)
+        {
+            "name": "ifeval-like",
+            "hf_id": "argilla/ifeval-like-data",
+            "hf_config": "filtered",
+            "split": "train",
+            "weight": 0.10,
+            "format": "ifeval",
+        },
+        {
+            "name": "longform",
+            "hf_id": "akoksal/LongForm",
+            "split": "train",
+            "weight": 0.05,
+            "format": "longform",
         },
     ]
 
