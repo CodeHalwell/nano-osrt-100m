@@ -488,11 +488,31 @@ class SFTStream(IterableDataset):
                 example = next(streams[idx])
             except StopIteration:
                 # Mid-run reconnect uses the same retry-aware open path.
-                ds = _open_stream(idx, seed_offset=rng.randint(1, 10000))
-                streams[idx] = iter(ds)
+                # Catch ALL exceptions from the post-reconnect next() —
+                # it's a fresh HF stream that may itself hit httpx
+                # errors. sft_math run 1 died at step ~625 because
+                # the inner next() raised RuntimeError ("Cannot send
+                # a request, as the client has been closed") which
+                # only the OUTER except Exception was meant to catch.
+                # Falling through to `continue` skips the bad sample;
+                # the next loop iteration will pick a stream and try
+                # again, hitting the outer retry logic if the failure
+                # repeats.
                 try:
+                    ds = _open_stream(
+                        idx, seed_offset=rng.randint(1, 10000),
+                    )
+                    streams[idx] = iter(ds)
                     example = next(streams[idx])
                 except StopIteration:
+                    continue
+                except Exception as inner_exc:
+                    print(
+                        f"[SFTWorker] {ds_name}: post-reconnect "
+                        f"{type(inner_exc).__name__}: "
+                        f"{str(inner_exc)[:120]} — skipping example",
+                        flush=True,
+                    )
                     continue
             except Exception as exc:
                 # Mid-iteration failures: HF httpx "client has been
