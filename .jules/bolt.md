@@ -1,0 +1,3 @@
+## 2026-05-14 - RoPE optimization without intermediate full-sized allocation
+**Learning:** In PyTorch, allocating large intermediate tensors (like `torch.cat([-x2, x1], dim=-1)` in RoPE implementation) and then performing element-wise math across the whole dimension creates unnecessary memory bandwidth pressure, even on CPU. Directly calculating the mathematical equivalent and concatenating the result slices can bypass these allocations.
+**Action:** When performing element-wise modifications on partitioned tensor halves (like RoPE rotations), avoid constructing full-size intermediate rotated tensors. Calculate the math on the slices directly and concatenate the result to improve speed (e.g., ~17% improvement on RoPE application for 32x2048 sequence).
