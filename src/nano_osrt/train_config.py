@@ -1072,8 +1072,15 @@ class GRPOConfig:
     # $30 workspace budget). Run 1's first 10 steps showed acc 4.7% →
     # 26.6% — convergence is fast on the math-anchored base, so 500
     # steps captures most of the curve.
-    total_steps: int = 500
-    warmup_steps: int = 25          # 5 % of 500
+    # Extended from 500 → 700 after run 5 completed: probe of
+    # grpo_final.pt showed format/structure consolidation but acc
+    # plateaued at ~3/8 on hand probe. Cooling cosine tail (LR
+    # 1.5e-7) hadn't fully consolidated; extra 200 steps at very
+    # low LR may push the volatile peak band (15-28%) toward
+    # sustained acc. Resume from step_500 (renamed from final.pt
+    # on the volume so the scan picks it up).
+    total_steps: int = 700
+    warmup_steps: int = 25          # warmup unchanged — already past it
     # Cut from 3e-6 → 1.5e-6 after GRPO run 2 collapsed at step 20.
     # Run 2 trace: acc 12.5 % (0) → 18.8 % (10) → 0 % (20, 30) → 3.1 %
     # (40) → 0 % (50). Only 2 of 6 logged steps gave learning signal;
