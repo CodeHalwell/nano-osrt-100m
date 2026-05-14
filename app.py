@@ -1250,7 +1250,13 @@ def grpo():
             optimizer.load_state_dict(grpo_ckpt["optimizer_state_dict"])
         except Exception as e:
             print(f"  Optimizer state mismatch, starting fresh: {e}")
-        start_step = grpo_ckpt["step"] + 1
+        # Fall back to the filename-extracted step (best_grpo_step) when
+        # the ckpt itself doesn't carry a "step" field — happens when a
+        # final.pt is renamed to step_N.pt (the final-save path only
+        # writes model_state_dict, not the step int, so naive resume
+        # crashes with KeyError: 'step'). Caught during the
+        # 500→700 extension restart.
+        start_step = grpo_ckpt.get("step", best_grpo_step) + 1
         # Do NOT rebuild ref_model here. ref_model was frozen from the
         # SFT-loaded policy at line 470 and must remain the SFT anchor.
         # Rebuilding it from the resumed (already-drifted) policy would
