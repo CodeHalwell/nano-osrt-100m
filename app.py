@@ -1268,12 +1268,18 @@ def grpo():
     start_time = time.time()
 
     for step in range(start_step, cfg.total_steps):
-        # LR schedule
-        if step < cfg.warmup_steps:
-            lr = cfg.peak_lr * step / cfg.warmup_steps
+        # LR schedule. lr_anchor_step lets a resumed run re-warm:
+        # the warmup/cosine treats `step - anchor` as the effective
+        # step, so the new phase gets a real gradient instead of
+        # the near-zero LR a continued cosine would yield.
+        anchor = getattr(cfg, "lr_anchor_step", 0)
+        eff_step = max(step - anchor, 0)
+        eff_total = max(cfg.total_steps - anchor, 1)
+        if eff_step < cfg.warmup_steps:
+            lr = cfg.peak_lr * eff_step / cfg.warmup_steps
         else:
-            progress = (step - cfg.warmup_steps) / max(
-                cfg.total_steps - cfg.warmup_steps, 1,
+            progress = (eff_step - cfg.warmup_steps) / max(
+                eff_total - cfg.warmup_steps, 1,
             )
             lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
                 1 + math.cos(math.pi * progress)

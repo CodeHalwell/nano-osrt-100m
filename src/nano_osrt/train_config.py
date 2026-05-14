@@ -1079,8 +1079,23 @@ class GRPOConfig:
     # low LR may push the volatile peak band (15-28%) toward
     # sustained acc. Resume from step_500 (renamed from final.pt
     # on the volume so the scan picks it up).
-    total_steps: int = 700
-    warmup_steps: int = 25          # warmup unchanged — already past it
+    # Extended from 700 → 800 after the 501-700 run: mean acc rose
+    # to ~14.5% (vs ~9% in 201-500) with peaks at 21.9%, 43.8%,
+    # 21.9%, 34.4%. Trajectory still upward, but the cosine tail
+    # had already cooled to near-zero by step 700. To get real
+    # gradient on the new 100 steps, re-warm via lr_anchor_step:
+    # the schedule treats `step - lr_anchor_step` as effective
+    # step, so warmup runs over steps 700-720 and cosine cools
+    # 720→800. peak_lr held at 1.5e-6, kl_coeff bumped 0.15 →
+    # 0.20 because the policy has drifted further from the SFT
+    # reference over 700 steps.
+    total_steps: int = 800
+    warmup_steps: int = 20          # short re-warm over steps 700-720
+    # Steps elapsed before this LR phase. The warmup/cosine schedule
+    # uses `step - lr_anchor_step` so re-warming after a resume
+    # gives real gradient instead of the near-zero LR a continued
+    # cosine would yield. Default 0 = no anchor (fresh run).
+    lr_anchor_step: int = 700
     # Cut from 3e-6 → 1.5e-6 after GRPO run 2 collapsed at step 20.
     # Run 2 trace: acc 12.5 % (0) → 18.8 % (10) → 0 % (20, 30) → 3.1 %
     # (40) → 0 % (50). Only 2 of 6 logged steps gave learning signal;
@@ -1123,7 +1138,11 @@ class GRPOConfig:
     # pushed the model into a region where most batches gave 0 % acc
     # → uniform rewards → zero advantage → frozen updates. Stronger
     # KL coefficient prevents that drift in the first place.
-    kl_coeff: float = 0.15
+    # Bumped 0.15 → 0.20 for the 700→800 re-warm extension. Reference
+    # is still the original SFT baseline, but the policy has moved
+    # 700 steps further from it; tighter KL keeps the re-warmed
+    # update from over-shooting.
+    kl_coeff: float = 0.20
     # Tighter PPO clip (0.2 → 0.15) further limits per-step policy
     # change, complementing the lower lr and higher kl_coeff.
     clip_range: float = 0.15
