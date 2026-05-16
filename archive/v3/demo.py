@@ -10,9 +10,8 @@ import argparse
 
 import gradio as gr
 import torch
-from transformers import AutoTokenizer
-
 from src.nano_osrt.hf_model import NanoOSRTForCausalLM
+from transformers import AutoTokenizer
 
 # ── Model loading ───────────────────────────────────────────────────────
 
@@ -161,6 +160,7 @@ def create_demo():
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    autofocus=True,
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
@@ -171,22 +171,27 @@ def create_demo():
                 temperature = gr.Slider(
                     minimum=0.0, maximum=2.0, value=0.2, step=0.05,
                     label="Temperature",
+                    info="Controls randomness. Higher = more creative.",
                 )
                 top_p = gr.Slider(
                     minimum=0.0, maximum=1.0, value=0.95, step=0.05,
                     label="Top-p",
+                    info="Nucleus sampling. Lower = more focused.",
                 )
                 top_k = gr.Slider(
                     minimum=0, maximum=100, value=50, step=5,
                     label="Top-k",
+                    info="Limits pool of next tokens. 0 to disable.",
                 )
                 max_tokens = gr.Slider(
                     minimum=32, maximum=1024, value=512, step=32,
                     label="Max tokens",
+                    info="Maximum length of the generated response.",
                 )
                 repetition_penalty = gr.Slider(
                     minimum=1.0, maximum=2.0, value=1.2, step=0.05,
                     label="Repetition penalty",
+                    info="Penalizes repeating tokens. >1.0 reduces loops.",
                 )
 
                 gr.Markdown(
