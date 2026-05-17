@@ -1,0 +1,3 @@
+## 2024-05-19 - Optimize PyTorch RoPE computation
+**Learning:** PyTorch operations involving element-wise math on sliced tensors (like RoPE) allocate intermediate full-size tensors, increasing memory bandwidth and latency.
+**Action:** Calculate and concatenate the results directly (e.g., `torch.cat([math_part1, math_part2], dim=-1)`) instead of allocating intermediate full-size tensors to reduce memory bandwidth usage.
