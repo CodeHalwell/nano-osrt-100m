@@ -161,6 +161,7 @@ def create_demo():
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    autofocus=True,
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
@@ -171,22 +172,27 @@ def create_demo():
                 temperature = gr.Slider(
                     minimum=0.0, maximum=2.0, value=0.2, step=0.05,
                     label="Temperature",
+                    info="Controls randomness. Lower is more deterministic.",
                 )
                 top_p = gr.Slider(
                     minimum=0.0, maximum=1.0, value=0.95, step=0.05,
                     label="Top-p",
+                    info="Nucleus sampling. Higher values include more diverse tokens.",
                 )
                 top_k = gr.Slider(
                     minimum=0, maximum=100, value=50, step=5,
                     label="Top-k",
+                    info="Limits vocabulary to the top K most likely tokens.",
                 )
                 max_tokens = gr.Slider(
                     minimum=32, maximum=1024, value=512, step=32,
                     label="Max tokens",
+                    info="Maximum length of the generated response.",
                 )
                 repetition_penalty = gr.Slider(
                     minimum=1.0, maximum=2.0, value=1.2, step=0.05,
                     label="Repetition penalty",
+                    info="Penalizes repeated tokens. 1.0 means no penalty.",
                 )
 
                 gr.Markdown(
