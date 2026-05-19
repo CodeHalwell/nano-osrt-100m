@@ -1,0 +1,3 @@
+## 2024-05-19 - RoPE Slicing Tensor Allocation Overhead
+**Learning:** In PyTorch, computing operations on mathematically partitioned arrays (like Rotary Positional Embeddings where a tensor is split into `x1` and `x2`) by first explicitly allocating and concatenating intermediate full-size reversed tensors (e.g. `x_rot = torch.cat([-x2, x1], dim=-1)`) introduces measurable memory bandwidth overhead and allocations that slow down inference.
+**Action:** Always compute the partitioned math directly on the sub-slices and concatenate the final result (`torch.cat([x1*cos - x2*sin, x2*cos + x1*sin], dim=-1)`) to minimize allocations in hot autoregressive loops.

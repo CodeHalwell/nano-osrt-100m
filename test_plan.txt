@@ -1,0 +1,2 @@
+1. Implement optimized `apply_rope` in `src/nano_osrt/model.py`.
+2. Add a `pytest` to `tests/test_model.py` to verify accuracy.
