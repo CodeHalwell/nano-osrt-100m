@@ -1,0 +1,3 @@
+## 2024-06-25 - Avoid Intermediate Tensor Allocation for PyTorch RoPE operations
+**Learning:** In PyTorch, allocating large intermediate tensors (e.g. `x_rot = torch.cat([-x2, x1], dim=-1)`) for element-wise operations like Rotary Position Embeddings (RoPE) inside the forward pass of every layer causes unnecessary memory bandwidth overhead and garbage collection pressure, leading to measurable slowdowns.
+**Action:** When implementing mathematical operations on sliced tensors, push the math down to the slices and calculate the final concatenated result directly in one step (e.g., `torch.cat([math_on_x1, math_on_x2], dim=-1)`). This avoids allocating intermediate tensors of the same size and reduces peak memory bandwidth usage.
