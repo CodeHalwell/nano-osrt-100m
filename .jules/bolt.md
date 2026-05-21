@@ -1,0 +1,3 @@
+## 2024-05-21 - [Optimize RoPE Tensor Allocations]
+**Learning:** In PyTorch, applying Rotary Position Embeddings (RoPE) by first concatenating halves to form a rotated tensor `x_rot`, then performing math on the whole tensor (`x * cos + x_rot * sin`), involves allocating unnecessary intermediate full-sized tensors which causes memory bandwidth bottlenecks.
+**Action:** To optimize element-wise math on sliced tensors, calculate and concatenate the results directly (`torch.cat([math_part1, math_part2], dim=-1)`) instead of allocating intermediate full-size tensors to reduce memory bandwidth usage.
