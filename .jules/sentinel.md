@@ -1,0 +1,4 @@
+## 2024-05-21 - [Gradio inputs lacking inherent length limits]
+**Vulnerability:** Gradio inputs (e.g., in `demo.py`) do not have inherent length limits. This can lead to Denial of Service (DoS) or memory exhaustion during model inference if a malicious user submits an excessively large payload.
+**Learning:** Gradio UI components like `gr.Textbox` do not automatically restrict the length of text they accept, and large inputs can be passed directly to backend processes like generation streams, causing resource exhaustion.
+**Prevention:** Always explicitly validate input string lengths in the backend handler (e.g., `def respond(...)`) and raise `gr.Error` for excessively large payloads before processing them.
