@@ -95,14 +95,27 @@ def generate_stream(
             out = MODEL.forward(context)
             next_logits = out["logits"][:, -1, : MODEL.config.real_vocab_size].float()
 
-            # Repetition penalty
+            # Repetition penalty: vectorised boolean mask avoids CPU-GPU sync
+            # and supports batch sizes > 1 (original loop hardcoded [0]).
             if repetition_penalty != 1.0:
-                for token_id in set(generated[0].tolist()):
-                    if token_id < next_logits.shape[-1]:
-                        if next_logits[0, token_id] > 0:
-                            next_logits[0, token_id] /= repetition_penalty
-                        else:
-                            next_logits[0, token_id] *= repetition_penalty
+                vocab_size = next_logits.shape[-1]
+                mask = torch.zeros(
+                    (generated.shape[0], vocab_size),
+                    dtype=torch.bool,
+                    device=next_logits.device,
+                )
+                clamped = generated.clamp(max=vocab_size - 1)
+                mask.scatter_(1, clamped, True)
+                mask &= generated < vocab_size  # exclude out-of-vocab ids
+                next_logits = torch.where(
+                    mask,
+                    torch.where(
+                        next_logits > 0,
+                        next_logits / repetition_penalty,
+                        next_logits * repetition_penalty,
+                    ),
+                    next_logits,
+                )
 
             if temperature > 0:
                 next_logits = next_logits / temperature
