@@ -261,6 +261,13 @@ def create_demo():
             # Input length validation to prevent DoS / memory exhaustion
             if len(message) > 4000:
                 raise gr.Error("Message exceeds maximum length limit.")
+            if len(chat_history) > 100:
+                raise gr.Error("Chat history exceeds maximum turns limit.")
+            for msg_obj in chat_history:
+                if len(str(msg_obj.get("content", ""))) > 4000:
+                    raise gr.Error(
+                        "A message in chat history exceeds maximum length limit."
+                    )
 
             # Add user message to both histories
             chat_history = chat_history + [{"role": "user", "content": message}]
@@ -273,7 +280,9 @@ def create_demo():
             # Stream generation
             for partial in generate_stream(
                 message,
-                chat_history[:-1],  # exclude the user msg we just added (it's in the prompt builder)
+                chat_history[
+                    :-1
+                ],  # exclude the user msg we just added (it's in the prompt builder)
                 temperature,
                 top_p,
                 top_k,
