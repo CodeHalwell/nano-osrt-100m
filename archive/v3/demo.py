@@ -171,7 +171,11 @@ def create_demo():
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(height=500, label="Chat")
+                chatbot = gr.Chatbot(
+                    height=500,
+                    label="Chat",
+                    placeholder="**NanoOSRT v3**\n\nReady to chat! Try selecting one of the examples below or ask me a math or coding question.",
+                )
                 msg = gr.Textbox(
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
@@ -273,7 +277,9 @@ def create_demo():
             # Stream generation
             for partial in generate_stream(
                 message,
-                chat_history[:-1],  # exclude the user msg we just added (it's in the prompt builder)
+                chat_history[
+                    :-1
+                ],  # exclude the user msg we just added (it's in the prompt builder)
                 temperature,
                 top_p,
                 top_k,
