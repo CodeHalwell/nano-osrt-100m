@@ -262,6 +262,18 @@ def create_demo():
             if len(message) > 4000:
                 raise gr.Error("Message exceeds maximum length limit.")
 
+            # State payload validation to prevent DoS via malicious history arrays
+            if len(chat_history) > 100 or len(display_history) > 100:
+                raise gr.Error("Conversation history exceeds maximum turn limit.")
+
+            for msg in chat_history:
+                if (
+                    isinstance(msg, dict)
+                    and "content" in msg
+                    and len(msg["content"]) > 16000
+                ):
+                    raise gr.Error("A historical message exceeds maximum length limit.")
+
             # Add user message to both histories
             chat_history = chat_history + [{"role": "user", "content": message}]
             display_history = display_history + [
@@ -273,7 +285,9 @@ def create_demo():
             # Stream generation
             for partial in generate_stream(
                 message,
-                chat_history[:-1],  # exclude the user msg we just added (it's in the prompt builder)
+                chat_history[
+                    :-1
+                ],  # exclude the user msg we just added (it's in the prompt builder)
                 temperature,
                 top_p,
                 top_k,
