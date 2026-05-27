@@ -180,6 +180,8 @@ def create_demo():
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    max_lines=10,
+                    info="Press Shift+Enter for a new line, Enter to submit",
                     autofocus=True,
                 )
                 with gr.Row():
