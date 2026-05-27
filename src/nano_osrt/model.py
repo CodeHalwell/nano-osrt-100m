@@ -437,8 +437,10 @@ class MoELayer(nn.Module):
         # Dispatch/noisy assignment stats. These keep the existing telemetry
         # semantics: last_expert_fraction and marginal_entropy describe the
         # actual noisy dispatch path while Gumbel exploration is enabled.
-        dispatch_one_hot = F.one_hot(top_idx, num_classes=self.num_routed)
-        f = dispatch_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+        # Use bincount instead of F.one_hot(...).sum() to avoid 3D intermediate tensor allocation
+        f = torch.bincount(top_idx.view(-1), minlength=self.num_routed).float() / (
+            N * self.top_k
+        )
         p = probs.float().mean(dim=0)
 
         # Switch balance loss extended to top-k. Compute it on the RAW router
@@ -450,15 +452,14 @@ class MoELayer(nn.Module):
         #         Count each top-k membership, divide by N*K so sum(f)=1.
         #   p_i = mean softmax prob for expert i (sums to 1).
         #   loss = E * sum(f_i * p_i). Minimum at uniform = 1.0.
-        raw_balance_one_hot = F.one_hot(
-            raw_balance_top_idx,
-            num_classes=self.num_routed,
-        )
         # Compute balance loss in fp32. Under bf16 autocast, f·p can
         # underflow late in training when both are near 1/E (= 0.125 for
         # E=8); fp32 keeps the product and sum precise so the gradient
         # signal survives into long runs.
-        raw_balance_f = raw_balance_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+        # Use bincount instead of F.one_hot(...).sum() to avoid 3D intermediate tensor allocation
+        raw_balance_f = torch.bincount(
+            raw_balance_top_idx.view(-1), minlength=self.num_routed
+        ).float() / (N * self.top_k)
         raw_balance_p = raw_router_probs.float().mean(dim=0)
         self.balance_loss = self.num_routed * (raw_balance_f * raw_balance_p).sum()
 
@@ -481,11 +482,15 @@ class MoELayer(nn.Module):
         # gradient to push the router away from intra-sequence collapse.
         # Uses the same raw (un-noised) routing decisions as
         # balance_loss for a coherent gradient signal.
-        seq_one_hot = raw_balance_one_hot.float().view(
-            B,
-            S,
-            self.top_k,
-            self.num_routed,
+        seq_one_hot = (
+            F.one_hot(raw_balance_top_idx, num_classes=self.num_routed)
+            .float()
+            .view(
+                B,
+                S,
+                self.top_k,
+                self.num_routed,
+            )
         )
         f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
         p_seq = (
@@ -595,11 +600,10 @@ class MoELayer(nn.Module):
             prebias_p = raw_router_probs.float().mean(dim=0)
             prebias_p_log = torch.log(prebias_p.clamp_min(1e-10))
             prebias_marginal_ent = -(prebias_p * prebias_p_log).sum().item()
-            prebias_one_hot = F.one_hot(
-                raw_balance_top_idx,
-                num_classes=self.num_routed,
-            ).to(raw_router_probs.dtype)
-            prebias_f = prebias_one_hot.sum(dim=(0, 1)) / (N * self.top_k)
+            # Use bincount instead of F.one_hot(...).sum() to avoid 3D intermediate tensor allocation
+            prebias_f = torch.bincount(
+                raw_balance_top_idx.view(-1), minlength=self.num_routed
+            ).to(raw_router_probs.dtype) / (N * self.top_k)
             prebias_f_log = torch.log(prebias_f.clamp_min(1e-10))
             prebias_assign_ent = -(prebias_f * prebias_f_log).sum().item()
             prebias_raw_max = prebias_raw_top_probs[:, 0].mean().item()
@@ -626,11 +630,10 @@ class MoELayer(nn.Module):
             clean_p = clean_probs.mean(dim=0)
             clean_p_log = torch.log(clean_p.clamp_min(1e-10))
             clean_marginal_ent = -(clean_p * clean_p_log).sum().item()
-            clean_one_hot = F.one_hot(
-                clean_top_idx,
-                num_classes=self.num_routed,
-            ).to(clean_probs.dtype)
-            clean_f = clean_one_hot.sum(dim=(0, 1)) / (N * self.top_k)
+            # Use bincount instead of F.one_hot(...).sum() to avoid 3D intermediate tensor allocation
+            clean_f = torch.bincount(
+                clean_top_idx.view(-1), minlength=self.num_routed
+            ).to(clean_probs.dtype) / (N * self.top_k)
             clean_f_log = torch.log(clean_f.clamp_min(1e-10))
             clean_assign_ent = -(clean_f * clean_f_log).sum().item()
             clean_raw_max = clean_raw_top_probs[:, 0].mean().item()
