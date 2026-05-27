@@ -180,7 +180,9 @@ def create_demo():
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    max_lines=10,
                     autofocus=True,
+                    info="Press Shift+Enter for a new line, or click Send to submit",
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
