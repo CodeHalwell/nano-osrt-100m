@@ -482,17 +482,15 @@ class MoELayer(nn.Module):
         # gradient to push the router away from intra-sequence collapse.
         # Uses the same raw (un-noised) routing decisions as
         # balance_loss for a coherent gradient signal.
-        seq_one_hot = (
-            F.one_hot(raw_balance_top_idx, num_classes=self.num_routed)
-            .float()
-            .view(
-                B,
-                S,
-                self.top_k,
-                self.num_routed,
-            )
+        # ⚡ Bolt Optimization: Replace F.one_hot with scatter_add_ to compute sequence fractions.
+        # This avoids allocating a 4D intermediate tensor and is significantly faster.
+        f_seq = torch.zeros(
+            B, self.num_routed, dtype=torch.float32, device=raw_balance_top_idx.device
         )
-        f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)  # (B, E)
+        indices = raw_balance_top_idx.view(B, -1)
+        ones = torch.ones_like(indices, dtype=torch.float32)
+        f_seq.scatter_add_(1, indices, ones)
+        f_seq = f_seq / (S * self.top_k)  # (B, E)
         p_seq = (
             raw_router_probs.float()
             .view(B, S, self.num_routed)
