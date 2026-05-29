@@ -186,6 +186,7 @@ def create_demo():
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
+                    stop_btn = gr.Button("Stop", variant="stop")
                     clear_btn = gr.Button("Clear")
 
             with gr.Column(scale=1):
@@ -312,7 +313,7 @@ def create_demo():
             chat_history = chat_history + [{"role": "assistant", "content": final}]
             yield chat_history, display_history, ""
 
-        msg.submit(
+        msg_event = msg.submit(
             respond,
             [
                 msg,
@@ -326,7 +327,7 @@ def create_demo():
             ],
             [chat_state, chatbot, msg],
         )
-        submit_btn.click(
+        sub_event = submit_btn.click(
             respond,
             [
                 msg,
@@ -339,6 +340,9 @@ def create_demo():
                 repetition_penalty,
             ],
             [chat_state, chatbot, msg],
+        )
+        stop_btn.click(
+            fn=None, inputs=None, outputs=None, cancels=[msg_event, sub_event]
         )
         clear_btn.click(lambda: ([], [], ""), outputs=[chat_state, chatbot, msg])
 
