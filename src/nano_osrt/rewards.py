@@ -38,7 +38,8 @@ def extract_numeric_answer(
         start = text.rindex(answer_open) + len(answer_open)
         end = (
             text.index(answer_close, start)
-            if answer_close in text[start:] else len(text)
+            if answer_close in text[start:]
+            else len(text)
         )
         inside = text[start:end]
         numbers = re.findall(r"-?[\d,]+\.?\d*", inside)
@@ -117,9 +118,11 @@ def count_reasoning_steps(thinking: str) -> int:
         return 0
 
     # Count numbered steps (1. 2. 3. or Step 1, Step 2)
+    # Using [ \t]* instead of \s* to prevent ReDoS from overlapping newline matches
     numbered = re.findall(
-        r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)",
-        thinking, re.IGNORECASE,
+        r"(?:^|\n)[ \t]*(?:\d+[\.\):]|step\s+\d+)",
+        thinking,
+        re.IGNORECASE,
     )
     if len(numbered) >= 2:
         return len(numbered)
@@ -288,7 +291,7 @@ def compute_reward(
 
     tier_score, tier_label = correctness_partial_credit(predicted, gt)
     correctness_r = tier_score * correctness_weight
-    correct = (tier_label in ("exact", "exact_numeric"))
+    correct = tier_label in ("exact", "exact_numeric")
     reward += correctness_r
     breakdown["correct"] = correct
     breakdown["correctness_tier"] = tier_label
@@ -332,9 +335,7 @@ def compute_reward(
     )
     # Keep `truncated` flag for compatibility with downstream logging
     # — true iff we hit the cap (≥ 100 %).
-    breakdown["truncated"] = (
-        max_tokens > 0 and completion_tokens >= max_tokens
-    )
+    breakdown["truncated"] = max_tokens > 0 and completion_tokens >= max_tokens
     breakdown["truncation_penalty"] = 0.0  # deprecated; see length_ramp_penalty
 
     # 5. Empty thinking penalty (gaming format with no content)
@@ -371,7 +372,7 @@ def compute_group_advantages(rewards: list[float]) -> list[float]:
 
     mean = sum(rewards) / n
     var = sum((r - mean) ** 2 for r in rewards) / n
-    std = var ** 0.5
+    std = var**0.5
 
     if std < 1e-8:
         return [0.0] * n
