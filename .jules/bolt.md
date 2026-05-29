@@ -8,3 +8,6 @@
 ## 2025-05-27 - Remove one_hot in favor of bincount
 **Learning:** Using `F.one_hot(indices).sum()` to count token assignments to experts creates a large 3D intermediate tensor (e.g., `(B*S, K, E)`), which causes unnecessary peak memory spikes and slows down MoE routing via memory bandwidth constraints.
 **Action:** Replace `F.one_hot(indices, num_classes=E).sum(...)` with `torch.bincount(indices.view(-1), minlength=E)`. This computes the assignment counts directly using integers, saving memory and offering a speedup. Always check for downstream references to the removed one-hot variable before deleting it completely (e.g., it might be used to construct sequential routing signals).
+## 2025-05-29 - Avoid one_hot for 2D aggregation
+**Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
+**Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
