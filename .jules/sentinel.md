@@ -7,3 +7,8 @@
 **Vulnerability:** Missing length validation for historical state payloads in Gradio UI.
 **Learning:** Gradio stateful components (like `gr.Chatbot` or `gr.State`) pass history arrays back from the client, allowing malicious actors to bypass immediate input limits by injecting large payloads into the history, leading to memory exhaustion.
 **Prevention:** Always explicitly validate the length of both immediate input strings and historical state payloads (including individual message contents) before processing.
+
+## 2024-05-29 - ReDoS in Whitespace Regex
+**Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
+**Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
+**Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
