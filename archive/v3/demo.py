@@ -175,6 +175,7 @@ def create_demo():
                     height=500,
                     label="Chat",
                     placeholder="**NanoOSRT v3**\n\nReady to chat! Try selecting one of the examples below or ask me a math or coding question.",
+                    buttons=["copy", "share"],
                 )
                 msg = gr.Textbox(
                     placeholder="Ask me anything... (try code or math questions)",
