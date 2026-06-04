@@ -385,7 +385,8 @@ def pretrain_extend2_sanity():
     # v17: open-math-reasoning    → SAFE (loss 2.40, vram 66.5GB)
     # v18: open-thoughts-114k     → SAFE (loss 2.32, vram 66.5GB)
     # v19: 5 passers combined     → SAFE (loss 1.98, vram 66.5GB)
-    # v20: add cosmopedia-python-edu
+    # v20: cosmopedia-python-edu  → CRASHED (3rd code-content dataset to crash)
+    # v21: cosmopedia-v2 (non-Python subset)
     sanity_cfg.phases["extend"]["datasets"] = [
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
          "weight": 0.20, "format": "arxiv"},
@@ -398,8 +399,8 @@ def pretrain_extend2_sanity():
         {"name": "open-thoughts-114k", "hf_id": "open-thoughts/OpenThoughts-114k",
          "hf_config": "default", "weight": 0.15, "format": "openthoughts"},
         # Candidate under test:
-        {"name": "cosmopedia-python-edu", "hf_id": "HuggingFaceTB/cosmopedia-v2",
-         "hf_config": "python-edu", "weight": 0.15},
+        {"name": "cosmopedia-v2", "hf_id": "HuggingFaceTB/cosmopedia-v2",
+         "hf_config": "cosmopedia-v2", "weight": 0.15},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
