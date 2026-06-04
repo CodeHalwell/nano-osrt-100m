@@ -376,21 +376,10 @@ def pretrain_extend2_sanity():
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
-    # Restore normal batch — memory wasn't the issue (batch=2 still cancelled).
-    sanity_cfg.phases["extend"]["batch_size"] = 8
-    # Dataset bisection v11: v10 (baseline + code + general) cancelled.
-    # Splitting code from general — sanity v11 has baseline + code only.
-    sanity_cfg.phases["extend"]["datasets"] = [
-        # Baseline (known good)
-        {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.40, "format": "arxiv"},
-        {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
-         "weight": 0.20},
-        # v13: Magicoder OSS only (drop Evol, keep baseline)
-        {"name": "magicoder-oss-instruct",
-         "hf_id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
-         "weight": 0.40, "format": "magicoder_oss"},
-    ]
+    # Use the full 8-stream PretrainExtend2Config datasets (Magicoders
+    # dropped, replaced by cosmopedia-v2/python-edu for code anchor).
+    # No bisection override — sanity now exercises the actual mix
+    # that the full run will use.
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")

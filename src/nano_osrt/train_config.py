@@ -609,36 +609,41 @@ class PretrainExtend2Config(PretrainExtendConfig):
             "batch_size": 8,
             "grad_accum_steps": 8,
             "datasets": [
-                # ─── Code (30%) ──────────────────────────────────────
-                # Two Magicoder sources for language diversity without
-                # depending on starcoderdata's auto-gate (dropped to
-                # remove the access blocker). Evol-Instruct is
-                # Python-heavy, OSS-Instruct covers C++/Java/Go/Rust.
+                # ─── Code (15%) — python-edu only ───────────────────
+                # Both Magicoder sources (Evol + OSS) caused a hard
+                # C++ terminate/SIGABRT crash on the very first
+                # forward pass — isolated via 4-way bisection (sanity
+                # v9-v13). Root cause not yet identified; the crash
+                # is reproducible with either Magicoder dataset alone
+                # on top of the otherwise-working extend1 baseline.
+                # Skipping them entirely for this run.
+                # cosmopedia-v2/python-edu provides synthetic Python
+                # textbook content as a code-capability anchor without
+                # the Magicoder bug.
                 {
-                    "name": "magicoder-evol-instruct",
-                    "hf_id": "ise-uiuc/Magicoder-Evol-Instruct-110K",
-                    "weight": 0.20,
-                    "format": "magicoder",
+                    "name": "cosmopedia-python-edu",
+                    "hf_id": "HuggingFaceTB/cosmopedia-v2",
+                    "hf_config": "python-edu",
+                    "weight": 0.15,
+                    # Generic _extract_text handles `text` field.
                 },
-                {
-                    "name": "magicoder-oss-instruct",
-                    "hf_id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
-                    "weight": 0.10,
-                    "format": "magicoder_oss",
-                },
-                # ─── Math/Science (40%) ──────────────────────────────
+                # ─── Math/Science (45%) ──────────────────────────────
+                # Bumped from 40% to absorb part of the dropped 30%
+                # code budget. OpenR1 + OpenMathReasoning are the
+                # strongest signal we have for the probe's arithmetic
+                # gap so giving them more share is well-spent.
                 {
                     "name": "openr1-math-220k",
                     "hf_id": "open-r1/OpenR1-Math-220k",
                     "hf_config": "default",
-                    "weight": 0.15,
+                    "weight": 0.18,
                     "format": "openr1_math",
                 },
                 {
                     "name": "open-math-reasoning",
                     "hf_id": "nvidia/OpenMathReasoning",
                     "split": "cot",
-                    "weight": 0.15,
+                    "weight": 0.17,
                     "format": "openmath_reasoning",
                 },
                 {
@@ -647,31 +652,27 @@ class PretrainExtend2Config(PretrainExtendConfig):
                     "weight": 0.10,
                     "format": "arxiv",  # same `text` field shape
                 },
-                # ─── Pure reasoning (15%) ────────────────────────────
+                # ─── Pure reasoning (20%) ────────────────────────────
+                # Bumped from 15% to absorb the rest of the dropped
+                # code budget. OpenThoughts has the broadest reasoning
+                # coverage (math + code + logic + science) so it's
+                # the natural home for additional weight.
                 {
                     "name": "open-thoughts-114k",
                     "hf_id": "open-thoughts/OpenThoughts-114k",
                     "hf_config": "default",
-                    "weight": 0.10,
+                    "weight": 0.15,
                     "format": "openthoughts",
                 },
                 {
                     "name": "bbh-logical-deduction-7",
                     "hf_id": "lukaemon/bbh",
-                    # Picked logical_deduction_seven_objects — hardest
-                    # variant (more options than 3/5-object versions),
-                    # so the most reasoning signal per example. BBH
-                    # subtasks are small (~250 examples each) so we
-                    # cycle multiple times during training — acceptable
-                    # because the reasoning template is what we're
-                    # teaching, not memorisation of these specific
-                    # puzzles.
                     "hf_config": "logical_deduction_seven_objects",
                     "split": "test",   # bbh has only `test` split
                     "weight": 0.05,
                     "format": "bbh",
                 },
-                # ─── General-capability anchor (15%) ─────────────────
+                # ─── General-capability anchor (20%) ─────────────────
                 {
                     "name": "ultrachat-200k",
                     "hf_id": "HuggingFaceH4/ultrachat_200k",
@@ -683,13 +684,13 @@ class PretrainExtend2Config(PretrainExtendConfig):
                     "name": "cosmopedia-v2",
                     "hf_id": "HuggingFaceTB/cosmopedia-v2",
                     "hf_config": "cosmopedia-v2",
-                    "weight": 0.04,
+                    "weight": 0.05,
                     # Generic _extract_text handles `text` field.
                 },
                 {
                     "name": "fineweb-edu",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.03,
+                    "weight": 0.07,
                     # Generic _extract_text handles `text` field.
                 },
             ],
