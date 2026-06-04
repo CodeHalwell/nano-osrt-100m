@@ -386,10 +386,10 @@ def pretrain_extend2_sanity():
          "weight": 0.40, "format": "arxiv"},
         {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
          "weight": 0.20},
-        # v12: Magicoder Evol only (drop OSS)
-        {"name": "magicoder-evol-instruct",
-         "hf_id": "ise-uiuc/Magicoder-Evol-Instruct-110K",
-         "weight": 0.40, "format": "magicoder"},
+        # v13: Magicoder OSS only (drop Evol, keep baseline)
+        {"name": "magicoder-oss-instruct",
+         "hf_id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
+         "weight": 0.40, "format": "magicoder_oss"},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
