@@ -378,30 +378,21 @@ def pretrain_extend2_sanity():
     sanity_cfg.phases["extend"]["end"] = 50
     # Restore normal batch — memory wasn't the issue (batch=2 still cancelled).
     sanity_cfg.phases["extend"]["batch_size"] = 8
-    # Dataset bisection v10: v9 (extend1-only streams) ran step 0
-    # cleanly at 66.5 GB VRAM, confirming the issue is in one of the
-    # 8 new datasets. Halving the search: keep the extend1 baseline
-    # and ADD the code + general groups (4 datasets). If sanity runs,
-    # the bug is in math/reasoning (OpenR1, OpenMathReasoning,
-    # OpenThoughts, BBH). If it crashes, bug is in code or general.
+    # Dataset bisection v11: v10 (baseline + code + general) cancelled.
+    # Splitting code from general — sanity v11 has baseline + code only.
     sanity_cfg.phases["extend"]["datasets"] = [
         # Baseline (known good)
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.30, "format": "arxiv"},
+         "weight": 0.40, "format": "arxiv"},
         {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
          "weight": 0.20},
-        # Code group
+        # Code group only
         {"name": "magicoder-evol-instruct",
          "hf_id": "ise-uiuc/Magicoder-Evol-Instruct-110K",
-         "weight": 0.15, "format": "magicoder"},
+         "weight": 0.20, "format": "magicoder"},
         {"name": "magicoder-oss-instruct",
          "hf_id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
-         "weight": 0.15, "format": "magicoder_oss"},
-        # General group
-        {"name": "ultrachat-200k", "hf_id": "HuggingFaceH4/ultrachat_200k",
-         "split": "train_sft", "weight": 0.10},
-        {"name": "cosmopedia-v2", "hf_id": "HuggingFaceTB/cosmopedia-v2",
-         "hf_config": "cosmopedia-v2", "weight": 0.10},
+         "weight": 0.20, "format": "magicoder_oss"},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
