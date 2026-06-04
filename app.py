@@ -386,13 +386,14 @@ def pretrain_extend2_sanity():
     # v18: open-thoughts-114k     → SAFE
     # v19: 5 passers combined     → SAFE
     # v20: cosmopedia-python-edu  → CRASHED (code content)
-    # v21: cosmopedia-v2          → SAFE (step 5 reached, vram 68GB)
-    # v22: ultrachat-200k
+    # v21: cosmopedia-v2          → SAFE
+    # v22: ultrachat-200k         → SAFE (loss 2.23, vram 66.5GB)
+    # v23: bbh (last candidate)
     sanity_cfg.phases["extend"]["datasets"] = [
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.18, "format": "arxiv"},
+         "weight": 0.16, "format": "arxiv"},
         {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
-         "weight": 0.18},
+         "weight": 0.16},
         {"name": "openr1-math-220k", "hf_id": "open-r1/OpenR1-Math-220k",
          "hf_config": "default", "weight": 0.13, "format": "openr1_math"},
         {"name": "open-math-reasoning", "hf_id": "nvidia/OpenMathReasoning",
@@ -400,10 +401,13 @@ def pretrain_extend2_sanity():
         {"name": "open-thoughts-114k", "hf_id": "open-thoughts/OpenThoughts-114k",
          "hf_config": "default", "weight": 0.13, "format": "openthoughts"},
         {"name": "cosmopedia-v2", "hf_id": "HuggingFaceTB/cosmopedia-v2",
-         "hf_config": "cosmopedia-v2", "weight": 0.13},
-        # Candidate under test:
+         "hf_config": "cosmopedia-v2", "weight": 0.12},
         {"name": "ultrachat-200k", "hf_id": "HuggingFaceH4/ultrachat_200k",
          "split": "train_sft", "weight": 0.12},
+        # Candidate under test:
+        {"name": "bbh-logical-deduction-7", "hf_id": "lukaemon/bbh",
+         "hf_config": "logical_deduction_seven_objects",
+         "split": "test", "weight": 0.05, "format": "bbh"},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
