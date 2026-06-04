@@ -300,6 +300,78 @@ def pretrain_extend2():
     run_pretrain_extend(model_config, extend2_cfg, vol, tokenizer_name)
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def pretrain_extend2_sanity():
+    """50-step smoke test of pretrain_extend2 — verify all 10 streams
+    connect, format functions yield clean batches end-to-end, and the
+    training loop completes a few cycles before committing $28 on the
+    full 3,000-step run.
+
+    Total cost ~$1 (~10 min including compile time). Disables
+    checkpoint saving so the volume isn't polluted with throwaway
+    sanity ckpts. Overrides `wandb_run_name` so the smoke run is
+    visually separated from real extend2 runs in the dashboard.
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import PretrainExtend2Config
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tokenizer_name = tokenizer_path
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    # Subclass so we don't mutate the real config. ckpt_interval set
+    # past total_steps so save path is never triggered. warmup_steps
+    # cut to 10 (still 20% of total) so we actually exit the warmup
+    # and see a cosine-shaped LR at least once before the run ends.
+    class SanityCfg(PretrainExtend2Config):
+        total_steps = 50
+        warmup_steps = 10
+        ckpt_interval = 999_999
+        log_interval = 5
+        eval_interval = 999_999
+        wandb_run_name = "osrt-pretrain-extend2-sanity"
+
+    sanity_cfg = SanityCfg()
+    sanity_cfg.phases["extend2"]["end"] = 50
+
+    print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
+          "validating all streams + format functions.")
+    print(f"Resume base: {sanity_cfg.pretrained_checkpoint}")
+
+    run_pretrain_extend(model_config, sanity_cfg, vol, tokenizer_name)
+
+
 # =============================================================================
 # SANITY (200-step smoke test)
 # =============================================================================
@@ -1585,6 +1657,9 @@ def main(stage: str = "pretrain"):
                              (~3,000 steps, seq 2048, 30/40/15/15
                               code/math/reasoning/general mix with R1
                               cold-start traces, HRA frozen)
+    --stage pretrain_extend2_sanity  50-step smoke test of the extend2
+                             pipeline; validates all 10 streams + format
+                             functions before committing $28 on the full run
     --stage sft            Balanced SFT on the final pretrained checkpoint
     --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
@@ -1613,6 +1688,8 @@ def main(stage: str = "pretrain"):
         pretrain_extend.remote()
     elif stage == "pretrain_extend2":
         pretrain_extend2.remote()
+    elif stage == "pretrain_extend2_sanity":
+        pretrain_extend2_sanity.remote()
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

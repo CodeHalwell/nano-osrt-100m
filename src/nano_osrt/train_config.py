@@ -606,6 +606,10 @@ class PretrainExtend2Config(PretrainExtendConfig):
             "grad_accum_steps": 8,
             "datasets": [
                 # ─── Code (30%) ──────────────────────────────────────
+                # Two Magicoder sources for language diversity without
+                # depending on starcoderdata's auto-gate (dropped to
+                # remove the access blocker). Evol-Instruct is
+                # Python-heavy, OSS-Instruct covers C++/Java/Go/Rust.
                 {
                     "name": "magicoder-evol-instruct",
                     "hf_id": "ise-uiuc/Magicoder-Evol-Instruct-110K",
@@ -613,16 +617,10 @@ class PretrainExtend2Config(PretrainExtendConfig):
                     "format": "magicoder",
                 },
                 {
-                    "name": "starcoderdata-python",
-                    "hf_id": "bigcode/starcoderdata",
-                    # python subset is the largest and our anchor
-                    # language. starcoderdata is auto-gated (instant
-                    # approve on first request) — if access not yet
-                    # granted, the worker will raise GatedRepoError
-                    # at stream open which is loud enough to debug.
-                    "hf_config": "python",
+                    "name": "magicoder-oss-instruct",
+                    "hf_id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
                     "weight": 0.10,
-                    # Generic _extract_text handles `content` field.
+                    "format": "magicoder_oss",
                 },
                 # ─── Math/Science (40%) ──────────────────────────────
                 {
