@@ -381,13 +381,14 @@ def pretrain_extend2_sanity():
     # ONE candidate dataset. If sanity runs, that candidate is safe;
     # advance to the next one. If it crashes, that candidate is the
     # bug. Change the `_BISECT_CANDIDATE` value below to step through.
-    # v16: openr1-math-220k       → SAFE (step 0, vram 66.5GB, loss 2.33)
+    # v16: openr1-math-220k       → SAFE (loss 2.33, vram 66.5GB)
+    # v17: open-math-reasoning    → SAFE (loss 2.40, vram 66.5GB)
     _BISECT_CANDIDATE = {
-        "name": "open-math-reasoning",
-        "hf_id": "nvidia/OpenMathReasoning",
-        "split": "cot",
+        "name": "open-thoughts-114k",
+        "hf_id": "open-thoughts/OpenThoughts-114k",
+        "hf_config": "default",
         "weight": 0.30,
-        "format": "openmath_reasoning",
+        "format": "openthoughts",
     }
     sanity_cfg.phases["extend"]["datasets"] = [
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
