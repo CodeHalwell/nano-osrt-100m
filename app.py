@@ -381,26 +381,29 @@ def pretrain_extend2_sanity():
     # ONE candidate dataset. If sanity runs, that candidate is safe;
     # advance to the next one. If it crashes, that candidate is the
     # bug. Change the `_BISECT_CANDIDATE` value below to step through.
-    # v16: openr1-math-220k       → SAFE (loss 2.33, vram 66.5GB)
-    # v17: open-math-reasoning    → SAFE (loss 2.40, vram 66.5GB)
-    # v18: open-thoughts-114k     → SAFE (loss 2.32, vram 66.5GB)
-    # v19: 5 passers combined     → SAFE (loss 1.98, vram 66.5GB)
-    # v20: cosmopedia-python-edu  → CRASHED (3rd code-content dataset to crash)
-    # v21: cosmopedia-v2 (non-Python subset)
+    # v16: openr1-math-220k       → SAFE
+    # v17: open-math-reasoning    → SAFE
+    # v18: open-thoughts-114k     → SAFE
+    # v19: 5 passers combined     → SAFE
+    # v20: cosmopedia-python-edu  → CRASHED (code content)
+    # v21: cosmopedia-v2          → SAFE (step 5 reached, vram 68GB)
+    # v22: ultrachat-200k
     sanity_cfg.phases["extend"]["datasets"] = [
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.20, "format": "arxiv"},
+         "weight": 0.18, "format": "arxiv"},
         {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
-         "weight": 0.20},
+         "weight": 0.18},
         {"name": "openr1-math-220k", "hf_id": "open-r1/OpenR1-Math-220k",
-         "hf_config": "default", "weight": 0.15, "format": "openr1_math"},
+         "hf_config": "default", "weight": 0.13, "format": "openr1_math"},
         {"name": "open-math-reasoning", "hf_id": "nvidia/OpenMathReasoning",
-         "split": "cot", "weight": 0.15, "format": "openmath_reasoning"},
+         "split": "cot", "weight": 0.13, "format": "openmath_reasoning"},
         {"name": "open-thoughts-114k", "hf_id": "open-thoughts/OpenThoughts-114k",
-         "hf_config": "default", "weight": 0.15, "format": "openthoughts"},
-        # Candidate under test:
+         "hf_config": "default", "weight": 0.13, "format": "openthoughts"},
         {"name": "cosmopedia-v2", "hf_id": "HuggingFaceTB/cosmopedia-v2",
-         "hf_config": "cosmopedia-v2", "weight": 0.15},
+         "hf_config": "cosmopedia-v2", "weight": 0.13},
+        # Candidate under test:
+        {"name": "ultrachat-200k", "hf_id": "HuggingFaceH4/ultrachat_200k",
+         "split": "train_sft", "weight": 0.12},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
