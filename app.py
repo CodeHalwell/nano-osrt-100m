@@ -361,6 +361,12 @@ def pretrain_extend2_sanity():
         log_interval = 5
         eval_interval = 999_999
         wandb_run_name = "osrt-pretrain-extend2-sanity"
+        # Skip torch.compile in eager mode — compile takes ~10 min
+        # of silent GPU time which appears to trigger Modal's idle-
+        # cancellation in the gradio-winter-hack workspace. Eager is
+        # ~2-3× slower per step but starts producing step events
+        # immediately, which keeps the container looking active.
+        compile_enabled = False
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50

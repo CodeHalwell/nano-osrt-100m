@@ -1350,10 +1350,17 @@ def run_pretrain_extend(
             f"({trainable_after / 1e6:.1f}M)",
         )
 
-    print("\nCompiling model with torch.compile...")
-    compile_start = time.time()
-    model = torch.compile(model)
-    print(f"Model compile done in {time.time() - compile_start:.1f}s")
+    # `compile_enabled` opt-out lets a stage skip torch.compile entirely.
+    # Eager is ~2-3× slower per step but starts emitting step events
+    # immediately — useful for sanity stages and for workspaces where
+    # silent compile time triggers Modal's idle-cancellation heuristic.
+    if getattr(extend_cfg, "compile_enabled", True):
+        print("\nCompiling model with torch.compile...")
+        compile_start = time.time()
+        model = torch.compile(model)
+        print(f"Model compile done in {time.time() - compile_start:.1f}s")
+    else:
+        print("\nSkipping torch.compile (compile_enabled=False, eager mode).")
 
     # ── W&B ────────────────────────────────────────────────────────
     use_wandb = extend_cfg.wandb_log and wandb is not None
