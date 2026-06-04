@@ -590,6 +590,14 @@ class PretrainExtend2Config(PretrainExtendConfig):
     wandb_run_name: str = "osrt-pretrain-extend2"
     wandb_run_id: str = ""
 
+    # DataLoader sizing: lowered from 4 → 1 because extend2's 9-stream
+    # mix at 4 workers triggered "Connection reset by peer" + "Bad file
+    # descriptor" cascades from HF Hub. 4 × 9 = 36 simultaneous HF
+    # streaming connections is over what HF's load balancer tolerates
+    # for a single client. 1 × 9 = 9 connections is safely under.
+    dataloader_num_workers: int = 1
+    dataloader_prefetch_factor: int = 2
+
     # ── Data mix (single phase, seq 2048) ──────────────────────────
     # 11 streams across 4 categories. Format functions live in
     # data.py::FORMAT_FN_PRETRAIN; streams without a `format` key

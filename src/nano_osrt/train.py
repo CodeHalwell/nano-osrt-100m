@@ -1511,6 +1511,8 @@ def run_pretrain_extend(
         tokenizer_name,
         batch_size,
         step,
+        num_workers=getattr(extend_cfg, "dataloader_num_workers", 4),
+        prefetch_factor=getattr(extend_cfg, "dataloader_prefetch_factor", 4),
     )
     loader_iter = iter(loader)
     print(f"    DataLoader ready in {time.time() - load_t:.1f}s")

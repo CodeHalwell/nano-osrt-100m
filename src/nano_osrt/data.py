@@ -581,6 +581,8 @@ def make_loader(
     tokenizer_name: str,
     batch_size: int,
     step_num: int,
+    num_workers: int = 4,
+    prefetch_factor: int = 4,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     """Build a streaming DataLoader for a training phase.
 
@@ -614,13 +616,20 @@ def make_loader(
     # first print, DataLoader iter() blocks forever. Spawn starts fresh
     # interpreters and re-imports modules cleanly; TokenStream's simple
     # fields (list[dict], int, str) serialise cleanly across the boundary.
+    # num_workers default of 4 preserved for backwards compat; stages
+    # with many small HF streams should lower this (each worker spawns
+    # its own copy of every stream, so total HF connections grow as
+    # num_workers × n_streams — at 4×9 = 36 we hit "Bad file descriptor"
+    # and "Connection reset by peer" cascades that crash workers and
+    # then the input). Pass num_workers=1 from the stage config to cut
+    # the connection storm.
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-        multiprocessing_context="spawn",
+        persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
     )
