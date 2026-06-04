@@ -376,10 +376,25 @@ def pretrain_extend2_sanity():
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
-    # Use the full 8-stream PretrainExtend2Config datasets (Magicoders
-    # dropped, replaced by cosmopedia-v2/python-edu for code anchor).
-    # No bisection override — sanity now exercises the actual mix
-    # that the full run will use.
+    # One-at-a-time bisection: start from the known-good v9 baseline
+    # (open-web-math + fineweb-edu — both ran step 0 cleanly) and add
+    # ONE candidate dataset. If sanity runs, that candidate is safe;
+    # advance to the next one. If it crashes, that candidate is the
+    # bug. Change the `_BISECT_CANDIDATE` value below to step through.
+    _BISECT_CANDIDATE = {
+        "name": "openr1-math-220k",
+        "hf_id": "open-r1/OpenR1-Math-220k",
+        "hf_config": "default",
+        "weight": 0.30,
+        "format": "openr1_math",
+    }
+    sanity_cfg.phases["extend"]["datasets"] = [
+        {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
+         "weight": 0.35, "format": "arxiv"},
+        {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
+         "weight": 0.35},
+        _BISECT_CANDIDATE,
+    ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")
