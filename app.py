@@ -364,13 +364,15 @@ def pretrain_extend2_sanity():
         # Skip torch.compile — eager starts producing step events
         # immediately (compile takes ~10 min of silent GPU time).
         compile_enabled = False
-        # Disable wandb for sanity. The previous sanity runs were
-        # cancelled by wandb's "ChkStopThr" — wandb spawns a polling
-        # thread that asks the W&B server every ~30s if the dashboard
-        # has clicked Stop on this run. A stale dashboard tab or
-        # autorefresh extension can accidentally trigger it. Sanity
-        # doesn't need wandb metrics anyway.
         wandb_log = False
+        # Differential diagnosis: extend1 (which worked) resumed from
+        # sft_ultralong_final.pt; extend2 (which auto-cancels mid-
+        # first-forward-pass) resumes from osrt_v5_grpo_final.pt.
+        # Swapping to the pre-GRPO sft_math ckpt for sanity isolates
+        # whether the GRPO checkpoint itself is the trigger.
+        pretrained_checkpoint = (
+            "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
+        )
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
