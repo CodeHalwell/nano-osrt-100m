@@ -376,11 +376,24 @@ def pretrain_extend2_sanity():
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
-    # Memory cap diagnostic: drop batch 8→2 to test whether the
-    # workspace is enforcing a ~50GB GPU memory cap. extend2 sanity
-    # was hitting 56.2 GB and getting auto-cancelled while sanity
-    # control at 49 GB ran fine.
-    sanity_cfg.phases["extend"]["batch_size"] = 2
+    # Restore normal batch — memory wasn't the issue (batch=2 still cancelled).
+    sanity_cfg.phases["extend"]["batch_size"] = 8
+    # Dataset bisection: keep ONLY the two streams that overlap with
+    # extend1 (which ran 2800 steps successfully). If sanity v9 runs,
+    # the issue is one of the 8 new sources or their format functions.
+    sanity_cfg.phases["extend"]["datasets"] = [
+        {
+            "name": "open-web-math",
+            "hf_id": "open-web-math/open-web-math",
+            "weight": 0.5,
+            "format": "arxiv",
+        },
+        {
+            "name": "fineweb-edu",
+            "hf_id": "HuggingFaceFW/fineweb-edu",
+            "weight": 0.5,
+        },
+    ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")
