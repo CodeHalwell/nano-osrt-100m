@@ -113,11 +113,178 @@ def _format_nemotron_math_pretrain(example: dict) -> str:
     return ""
 
 
+# ── Cold-start reasoning trace extractors (DeepSeek-R1 style) ───────────
+# Used by PretrainExtend2Config to inject high-density reasoning data.
+# Per the R1 paper, exposure to long-form <think> traces during
+# continued pretraining is the most efficient way to teach a small
+# model to "think before answering". The HRA delta from prior SFT/GRPO
+# stays frozen so the gain accumulates as a base-weight knowledge
+# update without disturbing the GRPO-tuned answer format.
+#
+# R1-style datasets natively emit `<think>...</think>` (HTML-style)
+# while our model's special tokens are `<|think|>...<|/think|>`
+# (pipe-delimited). We rewrite the tags during text extraction so the
+# model trains on its own format consistently — otherwise the inner
+# `<think>` would tokenise as raw BPE pieces and the model would learn
+# a parallel, non-canonical reasoning format.
+
+
+_R1_TAG_REWRITES = (
+    ("<think>",  "<|think|>"),
+    ("</think>", "<|/think|>"),
+    # OpenThoughts uses these alternative tags for the same purpose.
+    ("<|begin_of_thought|>", "<|think|>"),
+    ("<|end_of_thought|>",   "<|/think|>"),
+    ("<|begin_of_solution|>", "<|answer|>"),
+    ("<|end_of_solution|>",   "<|/answer|>"),
+)
+
+
+def _rewrite_reasoning_tags(text: str) -> str:
+    """Map R1/OpenThoughts inner tags to our canonical special tokens."""
+    for src, dst in _R1_TAG_REWRITES:
+        if src in text:
+            text = text.replace(src, dst)
+    return text
+
+
+def _format_openr1_math(example: dict) -> str:
+    """open-r1/OpenR1-Math-220k rows — DeepSeek-R1 reasoning traces.
+
+    Schema: `problem` + `generations` (list of R1 outputs, each with
+    `<think>...</think>` wrappers) + `answer` + `correctness_math_verify`
+    (list of bools). Picks the first verified-correct generation;
+    skips the row entirely if none are correct, to avoid training the
+    model on R1's mistakes.
+    """
+    problem = example.get("problem")
+    generations = example.get("generations")
+    answer = example.get("answer")
+    verify = example.get("correctness_math_verify")
+    if not (isinstance(problem, str) and problem.strip()):
+        return ""
+    if not (isinstance(generations, list) and generations):
+        return ""
+    pick = None
+    if isinstance(verify, list) and len(verify) == len(generations):
+        for i, ok in enumerate(verify):
+            if ok and isinstance(generations[i], str) and generations[i].strip():
+                pick = generations[i]
+                break
+    if pick is None:
+        return ""
+    pick = _rewrite_reasoning_tags(pick)
+    answer_str = str(answer or "").strip()
+    return (
+        f"<|user|>{problem}<|assistant|>{pick}"
+        f"<|answer|>{answer_str}<|/answer|>"
+    )
+
+
+def _format_openmath_reasoning(example: dict) -> str:
+    """nvidia/OpenMathReasoning/cot rows — DeepSeek-R1 math traces.
+
+    Schema: `problem` + `generated_solution` (already wraps `<think>`)
+    + `expected_answer`. Skips rows where the solution is n/a (a few
+    edge-case rows in the cot split lack a generation).
+    """
+    problem = example.get("problem")
+    solution = example.get("generated_solution")
+    answer = example.get("expected_answer")
+    if not (isinstance(problem, str) and problem.strip()):
+        return ""
+    if not (isinstance(solution, str) and solution.strip()) or solution == "n/a":
+        return ""
+    solution = _rewrite_reasoning_tags(solution)
+    answer_str = str(answer or "").strip()
+    return (
+        f"<|user|>{problem}<|assistant|>{solution}"
+        f"<|answer|>{answer_str}<|/answer|>"
+    )
+
+
+def _format_openthoughts(example: dict) -> str:
+    """open-thoughts/OpenThoughts-114k rows — multi-domain R1 traces.
+
+    Schema: `conversations` (list of {from, value} dicts, alternating
+    user/assistant). Takes the first user/assistant pair (one Q+A per
+    row in practice) and rewrites the inner thought tags.
+    """
+    convs = example.get("conversations")
+    if not (isinstance(convs, list) and len(convs) >= 2):
+        return ""
+    user_msg = next((m for m in convs if m.get("from") == "user"), None)
+    assistant_msg = next((m for m in convs if m.get("from") == "assistant"), None)
+    if not user_msg or not assistant_msg:
+        return ""
+    q = user_msg.get("value", "")
+    a = assistant_msg.get("value", "")
+    if not (isinstance(q, str) and q.strip() and isinstance(a, str) and a.strip()):
+        return ""
+    a = _rewrite_reasoning_tags(a)
+    return f"<|user|>{q}<|assistant|>{a}"
+
+
+def _format_magicoder(example: dict) -> str:
+    """ise-uiuc/Magicoder-Evol-Instruct-110K rows — evolved coding tasks.
+
+    Schema: `instruction` + `response`. Wrap as chat so the model
+    sees the instruction-following pattern in pretraining context.
+    """
+    instr = example.get("instruction")
+    resp = example.get("response")
+    if not (isinstance(instr, str) and instr.strip()):
+        return ""
+    if not (isinstance(resp, str) and resp.strip()):
+        return ""
+    return f"<|user|>{instr}<|assistant|>{resp}"
+
+
+def _format_magicoder_oss(example: dict) -> str:
+    """ise-uiuc/Magicoder-OSS-Instruct-75K rows — multi-language OSS code.
+
+    Schema: `problem` + `solution` (plus `lang`, `seed` we ignore).
+    """
+    prob = example.get("problem")
+    sol = example.get("solution")
+    if not (isinstance(prob, str) and prob.strip()):
+        return ""
+    if not (isinstance(sol, str) and sol.strip()):
+        return ""
+    return f"<|user|>{prob}<|assistant|>{sol}"
+
+
+def _format_bbh(example: dict) -> str:
+    """lukaemon/bbh rows — BIG-Bench Hard reasoning tasks.
+
+    Schema: `input` (the puzzle) + `target` (short answer like '(A)').
+    No `<think>` block — BBH targets are direct answers, so we keep
+    the chat structure minimal. The R1/OpenMath streams cover the
+    long-form CoT pattern; BBH covers the answer-precision pattern.
+    """
+    inp = example.get("input")
+    tgt = example.get("target")
+    if not (isinstance(inp, str) and inp.strip()):
+        return ""
+    if not (isinstance(tgt, str) and tgt.strip()):
+        return ""
+    return (
+        f"<|user|>{inp}<|assistant|>"
+        f"<|answer|>{tgt}<|/answer|>"
+    )
+
+
 FORMAT_FN_PRETRAIN = {
     "nemotron_sft": _format_nemotron_sft_text,
     "stack_code": _format_stack_code,
     "arxiv": _format_arxiv,
     "nemotron_math": _format_nemotron_math_pretrain,
+    "openr1_math": _format_openr1_math,
+    "openmath_reasoning": _format_openmath_reasoning,
+    "openthoughts": _format_openthoughts,
+    "magicoder": _format_magicoder,
+    "magicoder_oss": _format_magicoder_oss,
+    "bbh": _format_bbh,
 }
 
 

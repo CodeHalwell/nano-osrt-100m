@@ -232,6 +232,75 @@ def pretrain_extend():
 
 
 # =============================================================================
+# PRETRAIN_EXTEND2 — broadened mid-training pass
+# =============================================================================
+# Reuses run_pretrain_extend (the training loop is config-driven). Resumes
+# from osrt_v5_grpo_final.pt (canonical step-700 GRPO ckpt) with HRA frozen
+# so the SFT+GRPO investment in chat/answer format stays put while the base
+# weights absorb new reasoning/code/math knowledge. Output checkpoints use
+# the `extend2` prefix to avoid colliding with extend1's scan.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def pretrain_extend2():
+    """Second mid-training pass — broader reasoning + code + science mix.
+
+    See train_config.py::PretrainExtend2Config for the design
+    rationale (DeepSeek-R1 cold-start strategy, 30/40/15/15 mix,
+    HRA freeze, tag-rewrite for R1 traces). Single phase, seq 2048,
+    ~3,000 steps, ~$28 of H100 time. Resumes from GRPO step-700.
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import PretrainExtend2Config
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tokenizer_name = tokenizer_path
+
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    print(f"Tokenizer loaded: vocab_size={len(tok)}")
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+
+    extend2_cfg = PretrainExtend2Config()
+    print(
+        "pretrain_extend2: 3,000 steps at seq 2048, peak LR 1e-5, "
+        "HRA frozen, 30/40/15/15 code/math/reasoning/general mix.",
+    )
+    print(f"Resume base: {extend2_cfg.pretrained_checkpoint}")
+
+    run_pretrain_extend(model_config, extend2_cfg, vol, tokenizer_name)
+
+
+# =============================================================================
 # SANITY (200-step smoke test)
 # =============================================================================
 
@@ -1512,6 +1581,10 @@ def main(stage: str = "pretrain"):
     --stage pretrain_extend  Continued pretraining on top of SFT-ultralong ckpt
                              (~1,800 steps, seq 4096, math/science/code mix +
                               SFT-formatted rehearsal, HRA frozen)
+    --stage pretrain_extend2 Broader mid-training on top of GRPO step-700 ckpt
+                             (~3,000 steps, seq 2048, 30/40/15/15
+                              code/math/reasoning/general mix with R1
+                              cold-start traces, HRA frozen)
     --stage sft            Balanced SFT on the final pretrained checkpoint
     --stage sft_long       Long-context SFT (seq 4096) resuming from sft_final.pt with Nemotron mix
     --stage sft_ultralong  Ultra-long-context SFT (seq 8192) resuming from sft_long_final.pt
@@ -1538,6 +1611,8 @@ def main(stage: str = "pretrain"):
         pretrain.remote()
     elif stage == "pretrain_extend":
         pretrain_extend.remote()
+    elif stage == "pretrain_extend2":
+        pretrain_extend2.remote()
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

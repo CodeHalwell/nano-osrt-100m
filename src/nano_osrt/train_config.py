@@ -504,6 +504,197 @@ class PretrainExtendConfig(PretrainConfig):
     }
 
 
+class PretrainExtend2Config(PretrainExtendConfig):
+    """Second mid-training pass — broadened reasoning + code + science.
+
+    Built after the GRPO step-700 probe showed the model handles
+    single-digit arithmetic but fails on two-digit subtraction,
+    multiplication, and order-of-ops. The diagnosis: GRPO can only
+    optimize capabilities the base model already has. The fix is
+    more pretraining on reasoning-dense data, NOT more RL.
+
+    Strategy
+    ────────
+    Follows the DeepSeek-R1 cold-start playbook: inject high-density
+    `<think>` traces from real R1 distillations (OpenR1-Math-220k,
+    OpenMathReasoning, OpenThoughts-114k) alongside evolved code
+    (Magicoder), pure logic (BBH), and general-capability anchors
+    (UltraChat, cosmopedia-v2, fineweb-edu).
+
+    Lineage
+    ───────
+    Resume from `osrt_v5_grpo_final.pt` (canonical step-700 GRPO ckpt)
+    with HRA frozen. The 86M HRA delta holds the GRPO-tuned answer
+    format + chat tags learned through SFT + RL; only the 363M base
+    weights absorb new pretrain knowledge. After this stage, a short
+    sft_refresh (200 steps) re-anchors chat format if it has drifted.
+
+    Mix (matches 30/40/15/15 target per user spec):
+      Code 30%       — Magicoder-Evol-Instruct (20) + starcoderdata (10)
+      Math/Sci 40%   — OpenR1-Math (15) + OpenMathReasoning (15) +
+                       open-web-math (10)
+      Reasoning 15%  — OpenThoughts (10) + BBH (5)
+      General 15%    — UltraChat (8) + cosmopedia-v2 (4) + fineweb-edu (3)
+
+    Cost
+    ────
+    ~3,000 steps × 8.4 sec/step × $4/hr H100 ≈ $28. Yields ~100M
+    new training tokens at the configured batch/seq, concentrated
+    in reasoning + code categories where the probe identified gaps.
+
+    Tag rewrite
+    ───────────
+    R1-style sources emit `<think>...</think>` (HTML) while our
+    tokenizer's special tokens are `<|think|>...<|/think|>` (pipe).
+    Each cold-start format function in data.py rewrites these tags
+    so the model trains on its own format consistently — without the
+    rewrite, the inner reasoning blocks would tokenise as raw BPE
+    and create a parallel non-canonical reasoning format.
+    """
+
+    # ── Schedule ─────────────────────────────────────────────────────
+    # 3,000 steps at seq 2048. Shorter seq than extend1's 4096 because
+    # most R1 reasoning traces fit comfortably in 1,500-2,000 tokens
+    # (problem + think + answer); seq 4096 would waste compute on
+    # padding. peak_lr 1e-5 is one-third below extend1's 1.5e-5 — we
+    # are starting from a GRPO-tuned policy that has converged tighter
+    # than the SFT-ultralong base extend1 resumed from, so the
+    # gradient step size needs proportionally smaller to avoid
+    # overshooting the carefully-found GRPO optimum.
+    total_steps: int = 3_000
+    warmup_steps: int = 60          # 2% — short re-warm
+    peak_lr: float = 1e-5           # below extend1's 1.5e-5
+    min_lr: float = 1e-6            # cosine to 10% of peak
+
+    # Muon hybrid mirrors extend1; lower peak_lr propagates via the
+    # same _peak_lr tagging in train.py.
+    muon_lr: float = 3e-3
+    muon_min_lr: float = 3e-4
+
+    log_interval: int = 25
+    ckpt_interval: int = 200        # ~15 ckpts over 3,000 steps
+    eval_interval: int = 250
+    eval_steps: int = 20
+
+    # ── Resume ───────────────────────────────────────────────────────
+    # GRPO step-700 ckpt — the canonical post-RL math model. HRA
+    # frozen preserves the SFT+GRPO investment (chat format + answer
+    # format + math accuracy) while base weights absorb new knowledge.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_grpo_final.pt"
+    hra_frozen: bool = True
+    hra_before_load: bool = True
+
+    # Distinct ckpt prefix — `extend2` keeps resume scans from
+    # crossing with extend1's `extend_step_N.pt`.
+    stage_prefix: str = "extend2"
+    wandb_run_name: str = "osrt-pretrain-extend2"
+    wandb_run_id: str = ""
+
+    # ── Data mix (single phase, seq 2048) ──────────────────────────
+    # 11 streams across 4 categories. Format functions live in
+    # data.py::FORMAT_FN_PRETRAIN; streams without a `format` key
+    # use the generic _extract_text path (text/content/messages
+    # auto-detected).
+    phases: dict = {  # noqa: RUF012
+        "extend2": {
+            "start": 0,
+            "end": 3_000,
+            "seq_len": 2048,
+            # Seq-2048 sizing — same as base pretrain phase 1, leaves
+            # headroom for the larger batch needed by reasoning data.
+            "batch_size": 8,
+            "grad_accum_steps": 8,
+            "datasets": [
+                # ─── Code (30%) ──────────────────────────────────────
+                {
+                    "name": "magicoder-evol-instruct",
+                    "hf_id": "ise-uiuc/Magicoder-Evol-Instruct-110K",
+                    "weight": 0.20,
+                    "format": "magicoder",
+                },
+                {
+                    "name": "starcoderdata-python",
+                    "hf_id": "bigcode/starcoderdata",
+                    # python subset is the largest and our anchor
+                    # language. starcoderdata is auto-gated (instant
+                    # approve on first request) — if access not yet
+                    # granted, the worker will raise GatedRepoError
+                    # at stream open which is loud enough to debug.
+                    "hf_config": "python",
+                    "weight": 0.10,
+                    # Generic _extract_text handles `content` field.
+                },
+                # ─── Math/Science (40%) ──────────────────────────────
+                {
+                    "name": "openr1-math-220k",
+                    "hf_id": "open-r1/OpenR1-Math-220k",
+                    "hf_config": "default",
+                    "weight": 0.15,
+                    "format": "openr1_math",
+                },
+                {
+                    "name": "open-math-reasoning",
+                    "hf_id": "nvidia/OpenMathReasoning",
+                    "split": "cot",
+                    "weight": 0.15,
+                    "format": "openmath_reasoning",
+                },
+                {
+                    "name": "open-web-math",
+                    "hf_id": "open-web-math/open-web-math",
+                    "weight": 0.10,
+                    "format": "arxiv",  # same `text` field shape
+                },
+                # ─── Pure reasoning (15%) ────────────────────────────
+                {
+                    "name": "open-thoughts-114k",
+                    "hf_id": "open-thoughts/OpenThoughts-114k",
+                    "hf_config": "default",
+                    "weight": 0.10,
+                    "format": "openthoughts",
+                },
+                {
+                    "name": "bbh-logical-deduction-7",
+                    "hf_id": "lukaemon/bbh",
+                    # Picked logical_deduction_seven_objects — hardest
+                    # variant (more options than 3/5-object versions),
+                    # so the most reasoning signal per example. BBH
+                    # subtasks are small (~250 examples each) so we
+                    # cycle multiple times during training — acceptable
+                    # because the reasoning template is what we're
+                    # teaching, not memorisation of these specific
+                    # puzzles.
+                    "hf_config": "logical_deduction_seven_objects",
+                    "split": "test",   # bbh has only `test` split
+                    "weight": 0.05,
+                    "format": "bbh",
+                },
+                # ─── General-capability anchor (15%) ─────────────────
+                {
+                    "name": "ultrachat-200k",
+                    "hf_id": "HuggingFaceH4/ultrachat_200k",
+                    "split": "train_sft",
+                    "weight": 0.08,
+                    # Generic _extract_text handles `messages` field.
+                },
+                {
+                    "name": "cosmopedia-v2",
+                    "hf_id": "HuggingFaceTB/cosmopedia-v2",
+                    "hf_config": "cosmopedia-v2",
+                    "weight": 0.04,
+                    # Generic _extract_text handles `text` field.
+                },
+                {
+                    "name": "fineweb-edu",
+                    "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "weight": 0.03,
+                    # Generic _extract_text handles `text` field.
+                },
+            ],
+        },
+    }
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 
