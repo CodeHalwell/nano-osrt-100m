@@ -383,19 +383,20 @@ def pretrain_extend2_sanity():
     # bug. Change the `_BISECT_CANDIDATE` value below to step through.
     # v16: openr1-math-220k       → SAFE (loss 2.33, vram 66.5GB)
     # v17: open-math-reasoning    → SAFE (loss 2.40, vram 66.5GB)
-    _BISECT_CANDIDATE = {
-        "name": "open-thoughts-114k",
-        "hf_id": "open-thoughts/OpenThoughts-114k",
-        "hf_config": "default",
-        "weight": 0.30,
-        "format": "openthoughts",
-    }
+    # v18: open-thoughts-114k     → SAFE (loss 2.32, vram 66.5GB)
+    # v19: combine all passers + baseline = 5 streams (sanity check
+    # that they play nice together, since v10 with 6 streams crashed)
     sanity_cfg.phases["extend"]["datasets"] = [
         {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.35, "format": "arxiv"},
+         "weight": 0.20, "format": "arxiv"},
         {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
-         "weight": 0.35},
-        _BISECT_CANDIDATE,
+         "weight": 0.20},
+        {"name": "openr1-math-220k", "hf_id": "open-r1/OpenR1-Math-220k",
+         "hf_config": "default", "weight": 0.20, "format": "openr1_math"},
+        {"name": "open-math-reasoning", "hf_id": "nvidia/OpenMathReasoning",
+         "split": "cot", "weight": 0.20, "format": "openmath_reasoning"},
+        {"name": "open-thoughts-114k", "hf_id": "open-thoughts/OpenThoughts-114k",
+         "hf_config": "default", "weight": 0.20, "format": "openthoughts"},
     ]
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
