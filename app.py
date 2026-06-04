@@ -376,6 +376,11 @@ def pretrain_extend2_sanity():
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
+    # Memory cap diagnostic: drop batch 8→2 to test whether the
+    # workspace is enforcing a ~50GB GPU memory cap. extend2 sanity
+    # was hitting 56.2 GB and getting auto-cancelled while sanity
+    # control at 49 GB ran fine.
+    sanity_cfg.phases["extend"]["batch_size"] = 2
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")
