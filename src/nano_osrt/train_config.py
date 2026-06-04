@@ -595,8 +595,12 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # data.py::FORMAT_FN_PRETRAIN; streams without a `format` key
     # use the generic _extract_text path (text/content/messages
     # auto-detected).
+    # Phase key is hardcoded as "extend" in train.py::run_pretrain_extend
+    # (lines 1376, 1488). Keeping the key name shared with extend1 lets
+    # the same training loop drive both stages; the `stage_prefix` field
+    # is what distinguishes their checkpoint filenames.
     phases: dict = {  # noqa: RUF012
-        "extend2": {
+        "extend": {
             "start": 0,
             "end": 3_000,
             "seq_len": 2048,

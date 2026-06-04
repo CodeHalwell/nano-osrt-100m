@@ -363,7 +363,7 @@ def pretrain_extend2_sanity():
         wandb_run_name = "osrt-pretrain-extend2-sanity"
 
     sanity_cfg = SanityCfg()
-    sanity_cfg.phases["extend2"]["end"] = 50
+    sanity_cfg.phases["extend"]["end"] = 50
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")
