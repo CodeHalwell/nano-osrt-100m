@@ -331,6 +331,45 @@ class TokenStream(IterableDataset):
         # The ablate stage hit this exact failure: cell A worked but
         # cell B's load_dataset raised "Cannot send a request, as the
         # client has been closed" before yielding a single batch.
+        def _cycling_iter(ds, ds_name: str, ds_seed: int):
+            """Wrap a (shuffled) streaming dataset in an infinite cycle.
+
+            Small datasets like Magicoder (110K rows), OpenThoughts
+            (114K), and BBH (250) exhaust their streaming iterators
+            during a multi-thousand-step run, and the debt-based
+            sampler then deadlocks: every worker thrashes on the same
+            empty-stream reconnect because the unfulfilled deficit
+            keeps the sampler picking it. Cycling internally means
+            the stream is always ready to yield, so the deficit
+            actually drains and the sampler moves on.
+
+            On each cycle we re-shuffle with a new seed so the same
+            underlying rows arrive in a different order — better for
+            small datasets where repeated exposure to the same
+            template is the whole point (e.g. BBH's 250 logic puzzles
+            teach reasoning structure, not specific puzzles).
+            """
+            cycles = 0
+            current_seed = ds_seed
+            while True:
+                for ex in ds:
+                    yield ex
+                cycles += 1
+                if cycles == 1:
+                    print(
+                        f"[DataWorker] {ds_name} stream exhausted — "
+                        f"cycling with re-shuffle (small dataset, "
+                        f"expected for Magicoder/OpenThoughts/BBH).",
+                        flush=True,
+                    )
+                current_seed += 1
+                try:
+                    ds = ds.shuffle(buffer_size=5_000, seed=current_seed)
+                except Exception:
+                    # Some shuffled IterableDatasets refuse double-
+                    # shuffle. Just re-iterate without re-shuffling.
+                    pass
+
         def _open_stream(stream_idx: int, seed_offset: int = 0):
             ds_cfg = self.dataset_configs[stream_idx]
             load_kwargs = {
@@ -346,9 +385,13 @@ class TokenStream(IterableDataset):
                     skip_n = ds_cfg.get("skip", 0)
                     if skip_n > 0:
                         ds = ds.skip(skip_n)
-                    return ds.shuffle(
-                        buffer_size=5_000, seed=seed + seed_offset,
-                    )
+                    ds_seed = seed + seed_offset
+                    shuffled = ds.shuffle(buffer_size=5_000, seed=ds_seed)
+                    # Return an infinite-cycle wrapper so small
+                    # streaming datasets (Magicoder, OpenThoughts,
+                    # BBH) never trigger the StopIteration → reconnect
+                    # path that deadlocks the debt-based sampler.
+                    return _cycling_iter(shuffled, ds_cfg["hf_id"], ds_seed)
                 except Exception as exc:
                     last_exc = exc
                     print(
