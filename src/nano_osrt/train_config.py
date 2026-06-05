@@ -787,6 +787,47 @@ class LoopFixConfig(PretrainExtend2Config):
     wandb_run_id: str = ""
 
 
+class LoopFixV2Config(LoopFixConfig):
+    """Stacked architecture fixes on top of base loop_fix.
+
+    Layered on the aux LM-head loss from LoopFixConfig:
+
+      1. Loop dropout (stochastic depth) — with prob=0.2, truncate
+         the recursive chain to a random length in [3, 6]. Forces
+         each loop to be standalone-useful for next-token prediction
+         in some fraction of batches.
+
+      2. Aux-weight curriculum — ramp aux_loop_loss_weight from
+         0.02 → 0.10 over the first 200 steps. Avoids the initial
+         loss shock seen in sanity (main task loss climbed 1.57 →
+         2.03 in first 25 steps before recovering).
+
+      3. Per-loop aux weights — bias toward earlier loops, which
+         start with less prediction-relevant info and need more
+         pressure to become useful. Weights [2.0, 1.5, 1.0, 0.7, 0.5]
+         apply the most pressure to loop 0 (the laggard in our probe).
+
+    Resumes from loop_fix's final ckpt (or extend2_final.pt if loop_fix
+    hasn't run yet). 1500 steps, same compile/spawn machinery.
+    """
+
+    # Loop dropout settings (passed to the model via NanoOSRTConfig).
+    loop_dropout_prob: float = 0.2
+    loop_dropout_min_loops: int = 3
+
+    # Aux-weight curriculum (read by train.py training loop).
+    aux_loop_curriculum_steps: int = 200
+    aux_loop_weight_start: float = 0.02
+    # The "final" aux_loop_loss_weight is inherited from LoopFixConfig (0.1).
+
+    # Per-loop aux weights bias toward earlier loops (also passed via
+    # model config). Length must equal recursive_loops - 1 = 5.
+    per_loop_aux_weights: list[float] = [2.0, 1.5, 1.0, 0.7, 0.5]  # noqa: RUF012
+
+    stage_prefix: str = "loopfixv2"
+    wandb_run_name: str = "osrt-loopfixv2"
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 

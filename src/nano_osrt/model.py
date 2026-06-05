@@ -26,6 +26,7 @@ Default config (measured on the actual model):
 """
 
 import math
+import random
 from contextlib import contextmanager
 from typing import cast
 
@@ -959,6 +960,25 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
             and self.training
         )
 
+        # Loop dropout (stochastic depth). With probability
+        # loop_dropout_prob in training, truncate the loop chain to a
+        # random length in [min_loops, recursive_loops]. The main task
+        # loss then flows from a shorter chain's final output, forcing
+        # the truncation point loop to be standalone-useful. Complements
+        # the aux loss — aux pushes intermediate loops to predict in
+        # parallel, dropout makes their predictions become the actual
+        # model output some fraction of the time.
+        n_loops_to_run = self.config.recursive_loops
+        if (
+            self.training
+            and getattr(self.config, "loop_dropout_prob", 0.0) > 0.0
+            and random.random() < self.config.loop_dropout_prob
+        ):
+            min_loops = max(2, getattr(self.config, "loop_dropout_min_loops", 3))
+            max_loops = self.config.recursive_loops
+            if max_loops > min_loops:
+                n_loops_to_run = random.randint(min_loops, max_loops)
+
         use_ckpt = self.gradient_checkpointing and self.training
         if use_ckpt and (use_cache or past_key_values is not None):
             raise ValueError(
@@ -966,7 +986,7 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
             )
         presents: list[tuple[Tensor, Tensor]] | None = [] if use_cache else None
 
-        for loop in range(self.config.recursive_loops):
+        for loop in range(n_loops_to_run):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
                 adapter_a = self.adapters_a[idx]
@@ -1017,13 +1037,15 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                     )
 
             # Capture pre-norm_loop hidden for aux-loss computation.
-            # Only capture non-final loops (the final loop's hidden
-            # already feeds the main LM head, so no aux needed for it).
-            if capture_aux and loop < self.config.recursive_loops - 1:
+            # Only capture non-final loops of THIS forward pass — under
+            # loop dropout, the "final" loop varies per batch. The
+            # hidden state at position n_loops_to_run - 1 will feed
+            # the main LM head, so no aux for it.
+            if capture_aux and loop < n_loops_to_run - 1:
                 intermediate_hiddens.append(x)
 
             loop_rms.append(x.float().pow(2).mean().sqrt())
-            if loop < self.config.recursive_loops - 1:
+            if loop < n_loops_to_run - 1:
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
@@ -1133,16 +1155,24 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             # norm_out + the (weight-tied) LM head, and computes CE
             # against the same shifted labels. Adds gradient signal to
             # intermediate loops 0..N-2.
+            #
+            # Per-loop weighting: if config.per_loop_aux_weights is set
+            # (list of length n_intermediate_loops), each loop's CE is
+            # multiplied by its weight before summing. Otherwise all
+            # intermediate losses use the uniform aux_loop_loss_weight.
             aux_loop_total = torch.tensor(0.0, device=task_loss.device)
             per_loop_aux: list[Tensor] = []
             intermediate_hiddens = self.model.last_intermediate_hiddens
             aux_weight = getattr(self.config, "aux_loop_loss_weight", 0.0)
+            per_loop_weights = getattr(
+                self.config, "per_loop_aux_weights", None,
+            )
             if (
                 self.training
                 and aux_weight > 0.0
                 and intermediate_hiddens
             ):
-                for h_loop in intermediate_hiddens:
+                for i, h_loop in enumerate(intermediate_hiddens):
                     h_norm = self.model.norm_out(h_loop)
                     h_logits = F.linear(h_norm, self.model.embedding.weight)
                     h_shift = h_logits[
@@ -1154,7 +1184,18 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                         ignore_index=-100,
                     )
                     per_loop_aux.append(aux_l)
-                    aux_loop_total = aux_loop_total + aux_l
+                    # Per-loop scaling. When per_loop_weights is set,
+                    # use it (must be at least as long as the captured
+                    # intermediates); else uniform weight 1.0 (then
+                    # the overall aux_weight multiplies the sum).
+                    if (
+                        per_loop_weights is not None
+                        and i < len(per_loop_weights)
+                    ):
+                        w = per_loop_weights[i]
+                    else:
+                        w = 1.0
+                    aux_loop_total = aux_loop_total + w * aux_l
 
             # Total loss: add aux losses ONLY during training. Eval loss must
             # be pure task CE so eval perplexity and held-out comparisons

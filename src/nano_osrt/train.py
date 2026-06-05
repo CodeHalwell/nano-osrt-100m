@@ -1538,8 +1538,36 @@ def run_pretrain_extend(
     # Gumbel buffer fill (no-op since extend_cfg sets tau init = 0).
     set_router_gumbel_tau(model, extend_cfg.router_gumbel_tau_init)
 
+    # Aux-loss curriculum setup. When extend_cfg has
+    # aux_loop_curriculum_steps > 0, linearly ramp the model's
+    # aux_loop_loss_weight from aux_loop_weight_start → the model's
+    # initial aux_loop_loss_weight over the first N steps. Lets the
+    # model adapt smoothly without an initial loss shock.
+    base_cfg = inner.config
+    final_aux_weight = getattr(base_cfg, "aux_loop_loss_weight", 0.0)
+    aux_curriculum_steps = getattr(
+        extend_cfg, "aux_loop_curriculum_steps", 0,
+    )
+    aux_curriculum_start = getattr(
+        extend_cfg, "aux_loop_weight_start", final_aux_weight,
+    )
+
     while step < extend_cfg.total_steps:
         lr = _set_param_group_lrs(optimizer, step, extend_cfg)
+
+        # Curriculum: linearly ramp aux_loop_loss_weight on the MODEL
+        # config (where forward reads it). Side-effect mutation is fine
+        # since each rank has its own config object.
+        if aux_curriculum_steps > 0 and final_aux_weight > 0:
+            if step < aux_curriculum_steps:
+                ratio = step / aux_curriculum_steps
+                base_cfg.aux_loop_loss_weight = (
+                    aux_curriculum_start
+                    + ratio * (final_aux_weight - aux_curriculum_start)
+                )
+            else:
+                base_cfg.aux_loop_loss_weight = final_aux_weight
+
         optimizer.zero_grad(set_to_none=True)
 
         accum_task_loss = torch.tensor(0.0, device=device)

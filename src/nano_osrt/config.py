@@ -109,6 +109,27 @@ class NanoOSRTConfig(PretrainedConfig):
         # the primary objective. Set to 0 to disable.
         aux_loop_loss_weight: float = 0.0,
 
+        # --- Per-loop aux weights (optional override) ---
+        # If set (length must equal recursive_loops - 1), overrides
+        # the uniform aux_loop_loss_weight with per-loop scaling. E.g.
+        # [0.20, 0.15, 0.10, 0.05, 0.05] applies more gradient pressure
+        # to earlier loops (which start with less prediction-relevant
+        # info and need more help to become useful). When None, all
+        # intermediate loops are weighted uniformly by aux_loop_loss_weight.
+        per_loop_aux_weights: list[float] | None = None,
+
+        # --- Loop dropout (stochastic depth for recursive loops) ---
+        # With probability loop_dropout_prob during training, truncate
+        # the recursive loop chain to a random length in
+        # [loop_dropout_min_loops, recursive_loops]. The main task loss
+        # then flows from a shorter chain's output, forcing earlier
+        # loops to be standalone-useful for prediction. Complements
+        # the aux-loss fix — aux pushes intermediate loops to predict,
+        # dropout makes those predictions actually drive the model
+        # output some fraction of the time. Set prob=0 to disable.
+        loop_dropout_prob: float = 0.0,
+        loop_dropout_min_loops: int = 3,
+
         # --- Balance-bias controller (DeepSeek-style) ---
         # Per-expert additive bias applied to router logits as part of the
         # routing mechanism in both train and eval. Bias is per recursive loop
@@ -196,6 +217,9 @@ class NanoOSRTConfig(PretrainedConfig):
         self.router_z_loss_coeff = router_z_loss_coeff
         self.router_seq_balance_loss_coeff = router_seq_balance_loss_coeff
         self.aux_loop_loss_weight = aux_loop_loss_weight
+        self.per_loop_aux_weights = per_loop_aux_weights
+        self.loop_dropout_prob = loop_dropout_prob
+        self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_bias_enabled = router_balance_bias_enabled
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
