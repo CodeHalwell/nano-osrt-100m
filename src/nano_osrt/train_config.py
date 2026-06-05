@@ -571,12 +571,12 @@ class PretrainExtend2Config(PretrainExtendConfig):
     muon_lr: float = 3e-3
     muon_min_lr: float = 3e-4
 
-    # log_interval=1: emit a step event every iteration. Eager-mode
-    # step time is ~10s; with log_interval=25 we'd be silent for 250s
-    # between events, longer than the workspace's apparent ~2-minute
-    # input-progress heartbeat (which auto-cancels otherwise-healthy
-    # runs). Step-by-step logging keeps Modal seeing continuous output.
-    log_interval: int = 1
+    # log_interval=25 — once .spawn() is the launch mechanism (the
+    # cancellation we saw on .remote() was caller-disconnect related,
+    # not heartbeat related), we don't need step-by-step logging.
+    # 25-step interval is sane for a 3000-step run (~120 step events
+    # total instead of 3000), keeps wandb/console output manageable.
+    log_interval: int = 25
     ckpt_interval: int = 200        # ~15 ckpts over 3,000 steps
     eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk)
     eval_steps: int = 20
@@ -605,15 +605,14 @@ class PretrainExtend2Config(PretrainExtendConfig):
     dataloader_num_workers: int = 1
     dataloader_prefetch_factor: int = 2
 
-    # torch.compile DISABLED: on the gradio-winter-hack workspace, the
-    # ~1-5 minute silent JIT compile that happens during the first
-    # forward pass triggers Modal's input cancellation (input has no
-    # visible progress for too long → killed). GRPO survived compile
-    # only because model.generate() does many tiny forward passes that
-    # emit continuous GPU activity. Single big forward+backward in a
-    # pretraining step is too quiet. Eager is ~2-3x slower but emits
-    # step events immediately, keeping the input visibly alive.
-    compile_enabled: bool = False
+    # torch.compile re-enabled: earlier disable was based on a wrong
+    # hypothesis — the actual cause of the ~2-min cancellations was
+    # .remote() inside a local_entrypoint losing the caller. .spawn()
+    # fixed it (see feedback_modal_spawn_for_long_tasks memory).
+    # With .spawn() handling the caller-disconnect issue, compile's
+    # silent first-forward JIT is fine. 2-3x speedup → finishes in
+    # ~3hr instead of ~8hr, saves ~$15.
+    compile_enabled: bool = True
 
     # ── Data mix (single phase, seq 2048) ──────────────────────────
     # 11 streams across 4 categories. Format functions live in
