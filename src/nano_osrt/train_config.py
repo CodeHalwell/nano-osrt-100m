@@ -592,12 +592,13 @@ class PretrainExtend2Config(PretrainExtendConfig):
     eval_steps: int = 20
 
     # ── Resume ───────────────────────────────────────────────────────
-    # Pre-GRPO sft_math ckpt — same SFT base that GRPO consumed, but
-    # without the RL-tuned policy on top. We'll redo the GRPO pass
-    # after extend2 anyway (the mid-training will broaden capability
-    # which GRPO can then re-optimize for math correctness). HRA is
-    # still frozen for the SFT-trained delta.
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
+    # Points at the extend2 step_5600 ckpt — the resume target for
+    # phase 3 (consolidation cosine). run_pretrain_extend's startup
+    # check requires `pretrained_checkpoint` to exist on the volume
+    # regardless of whether a step-named ckpt also exists; pointing
+    # it at step_5600 keeps the check happy AND matches what the
+    # resume scan would load. Migrated from gradio-winter-hack.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend2_step_5600.pt"
     hra_frozen: bool = True
     hra_before_load: bool = True
 
