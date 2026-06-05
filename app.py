@@ -484,10 +484,12 @@ def loop_fix_v2():
     cfg.phases["extend"]["end"] = cfg.total_steps
     cfg.phases["extend"]["batch_size"] = 4
     cfg.phases["extend"]["grad_accum_steps"] = 16
-    # Resume base: loop_fix's final.pt. The full loop_fix run produces
-    # osrt_v5_loopfix_final.pt; if that doesn't exist yet, fall back
-    # to extend2_final.pt so the stage can still launch.
-    cfg.pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_loopfix_final.pt"
+    # Resume base: loop_fix's step_400 (we plan to stop loop_fix early
+    # at step 400 — fast gains were done by step 200, diminishing
+    # returns thereafter; the v2 stacked-fix run is the better use of
+    # the remaining compute). Update to loopfix_final.pt if we end up
+    # running loop_fix to completion.
+    cfg.pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_loopfix_step_400.pt"
 
     model_config = NanoOSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
