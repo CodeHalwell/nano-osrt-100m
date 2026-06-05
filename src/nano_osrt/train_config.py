@@ -582,10 +582,12 @@ class PretrainExtend2Config(PretrainExtendConfig):
     eval_steps: int = 20
 
     # ── Resume ───────────────────────────────────────────────────────
-    # GRPO step-700 ckpt — the canonical post-RL math model. HRA
-    # frozen preserves the SFT+GRPO investment (chat format + answer
-    # format + math accuracy) while base weights absorb new knowledge.
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_grpo_final.pt"
+    # Pre-GRPO sft_math ckpt — same SFT base that GRPO consumed, but
+    # without the RL-tuned policy on top. We'll redo the GRPO pass
+    # after extend2 anyway (the mid-training will broaden capability
+    # which GRPO can then re-optimize for math correctness). HRA is
+    # still frozen for the SFT-trained delta.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_math_final.pt"
     hra_frozen: bool = True
     hra_before_load: bool = True
 
