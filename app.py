@@ -354,6 +354,12 @@ def loop_fix():
     # Phase end is informational (the loop stops on total_steps), but
     # set it for accurate printed banner.
     loopfix_cfg.phases["extend"]["end"] = loopfix_cfg.total_steps
+    # Aux losses materialise 5 extra logit tensors (B × T × V) per
+    # forward pass at the same precision as the main logits — ~10 GB
+    # extra at batch=8/seq=2048. Cut batch 8→4 and bump accum 8→16 to
+    # keep effective batch=64 while halving activation memory.
+    loopfix_cfg.phases["extend"]["batch_size"] = 4
+    loopfix_cfg.phases["extend"]["grad_accum_steps"] = 16
 
     # Critical: pass aux_loop_loss_weight to the MODEL config so the
     # model's forward actually computes the aux losses. Without this,
@@ -403,6 +409,8 @@ def loop_fix_sanity_inner():
 
     sanity_cfg = SanityLoopFix()
     sanity_cfg.phases["extend"]["end"] = 8_150
+    sanity_cfg.phases["extend"]["batch_size"] = 4
+    sanity_cfg.phases["extend"]["grad_accum_steps"] = 16
     model_config = NanoOSRTConfig(
         vocab_size=len(tok), real_vocab_size=len(tok),
         bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
