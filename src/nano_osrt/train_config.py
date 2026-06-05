@@ -561,18 +561,20 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # than the SFT-ultralong base extend1 resumed from, so the
     # gradient step size needs proportionally smaller to avoid
     # overshooting the carefully-found GRPO optimum.
-    # Extended 3000 → 8000 after the first 3000-step run completed
-    # with loss still cleanly trending down (2.01 → 1.68 mean, min
-    # 1.52). Streaming HF dataset shuffles use new seeds on resume
-    # so the +5000 steps see fresh data, not retreads. lr_anchor_step
-    # makes the warmup/cosine treat `step - 3000` as the effective
-    # step, so the schedule re-warms cleanly from peak instead of
-    # jumping LR back up mid-cool.
-    total_steps: int = 8_000
-    lr_anchor_step: int = 3_000     # resume point — schedule re-anchors here
-    warmup_steps: int = 60          # re-warm length over steps 3000-3060
-    peak_lr: float = 1e-5           # same peak as original run
-    min_lr: float = 1e-6            # cosine to 10% of peak by step 8000
+    # Phase progression (lr_anchor_step makes each "phase" a fresh
+    # cosine from re-warm → peak → cool, layered onto the same model):
+    #   Phase 1: steps    0 → 3000  (peak 1e-5, sft_math base)
+    #   Phase 2: steps 3000 → 5600  (peak 1e-5 re-warm; cut short at 5600)
+    #   Phase 3: steps 5600 → 8100  (peak 7e-6, tight consolidation cool)
+    # Phase 3 finishes mid-training with a fresh cosine: lower peak
+    # (7e-6 vs phase 1/2's 1e-5) for consolidation rather than
+    # exploration, deeper cool (min_lr 7e-7 vs 1e-6) for a tight
+    # final state. ~2500 steps × ~1.5 sec compiled = ~62 min, ~$4.
+    total_steps: int = 8_100
+    lr_anchor_step: int = 5_600     # resume point — phase 3 anchors here
+    warmup_steps: int = 60          # re-warm length over steps 5600-5660
+    peak_lr: float = 7e-6           # cooler peak for consolidation
+    min_lr: float = 7e-7            # 10% of peak — tight final cool
 
     # Muon hybrid mirrors extend1; lower peak_lr propagates via the
     # same _peak_lr tagging in train.py.
