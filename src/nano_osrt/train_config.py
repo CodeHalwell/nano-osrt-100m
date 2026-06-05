@@ -598,6 +598,16 @@ class PretrainExtend2Config(PretrainExtendConfig):
     dataloader_num_workers: int = 1
     dataloader_prefetch_factor: int = 2
 
+    # torch.compile DISABLED: on the gradio-winter-hack workspace, the
+    # ~1-5 minute silent JIT compile that happens during the first
+    # forward pass triggers Modal's input cancellation (input has no
+    # visible progress for too long → killed). GRPO survived compile
+    # only because model.generate() does many tiny forward passes that
+    # emit continuous GPU activity. Single big forward+backward in a
+    # pretraining step is too quiet. Eager is ~2-3x slower but emits
+    # step events immediately, keeping the input visibly alive.
+    compile_enabled: bool = False
+
     # ── Data mix (single phase, seq 2048) ──────────────────────────
     # 11 streams across 4 categories. Format functions live in
     # data.py::FORMAT_FN_PRETRAIN; streams without a `format` key
