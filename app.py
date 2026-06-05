@@ -300,6 +300,138 @@ def pretrain_extend2():
     run_pretrain_extend(model_config, extend2_cfg, vol, tokenizer_name)
 
 
+# =============================================================================
+# LOOP_FIX — architecture-fix continuation with per-loop aux LM-head losses
+# =============================================================================
+# Recursive-loop probe (probe_recursion.py, 2026-06-05) showed loop 5 doing
+# ~6.0 of the CE loss reduction while loops 1-4 contributed ~0.75 combined.
+# This stage attaches the weight-tied LM head to each non-final loop's hidden
+# state (after norm_out for path consistency) and adds the resulting CE
+# losses to the main loss with `aux_loop_loss_weight`. Forces gradient signal
+# into the intermediate loops. ~1500 step continuation from extend2_final.
+# See train_config.py::LoopFixConfig for the full design.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def loop_fix():
+    """Per-loop aux-loss continuation from extend2_final.
+
+    The aux_loop_loss_weight on NanoOSRTConfig (model config) is the
+    real switch — without it the model forward is unchanged. We thread
+    it through here from the training config (LoopFixConfig).
+    """
+    import os
+
+    import modal as _modal
+    from transformers import AutoTokenizer
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import LoopFixConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+
+    tokenizer_path = "/vol/tokenizer"
+    tokenizer_name = tokenizer_path
+    print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
+    tok = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    loopfix_cfg = LoopFixConfig()
+    # Phase end is informational (the loop stops on total_steps), but
+    # set it for accurate printed banner.
+    loopfix_cfg.phases["extend"]["end"] = loopfix_cfg.total_steps
+
+    # Critical: pass aux_loop_loss_weight to the MODEL config so the
+    # model's forward actually computes the aux losses. Without this,
+    # the training config's aux_loop_loss_weight is a no-op.
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=loopfix_cfg.aux_loop_loss_weight,
+    )
+
+    print(
+        f"loop_fix: {loopfix_cfg.total_steps - loopfix_cfg.lr_anchor_step} "
+        f"steps continuation, peak_lr={loopfix_cfg.peak_lr}, "
+        f"aux_loop_loss_weight={loopfix_cfg.aux_loop_loss_weight}.",
+    )
+    print(f"Resume base: {loopfix_cfg.pretrained_checkpoint}")
+
+    run_pretrain_extend(model_config, loopfix_cfg, vol, tokenizer_name)
+
+
+def loop_fix_sanity_inner():
+    """Body of the 50-step sanity smoke test for loop_fix.
+    Shared between the real sanity stage and any future ad-hoc test.
+    """
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import LoopFixConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    class SanityLoopFix(LoopFixConfig):
+        total_steps = 8_150          # = lr_anchor_step (8100) + 50
+        warmup_steps = 10
+        log_interval = 5
+        ckpt_interval = 999_999
+        eval_interval = 999_999
+        wandb_log = False
+        compile_enabled = False      # fast first-step events
+
+    sanity_cfg = SanityLoopFix()
+    sanity_cfg.phases["extend"]["end"] = 8_150
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=sanity_cfg.aux_loop_loss_weight,
+    )
+    print(f"loop_fix SANITY: 50 steps from extend2_final, "
+          f"aux_loop_loss_weight={sanity_cfg.aux_loop_loss_weight}.")
+    run_pretrain_extend(model_config, sanity_cfg, vol, "/vol/tokenizer")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def loop_fix_sanity():
+    loop_fix_sanity_inner()
+
+
 @app.function(
     gpu="H100",
     image=image,
@@ -1713,6 +1845,12 @@ def main(stage: str = "pretrain"):
     elif stage == "pretrain_extend2_sanity":
         call = pretrain_extend2_sanity.spawn()
         print(f"Spawned pretrain_extend2_sanity as call: {call.object_id}")
+    elif stage == "loop_fix":
+        call = loop_fix.spawn()
+        print(f"Spawned loop_fix as call: {call.object_id}")
+    elif stage == "loop_fix_sanity":
+        call = loop_fix_sanity.spawn()
+        print(f"Spawned loop_fix_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

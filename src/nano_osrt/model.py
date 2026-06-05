@@ -865,6 +865,13 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
 
         self.gradient_checkpointing = False
 
+        # Side-effect storage for per-loop auxiliary LM-head losses.
+        # Populated by forward() when aux_loop_loss_weight > 0 and the
+        # model is in training mode. Consumed by NanoOSRTForCausalLM
+        # to compute the aux loss term, and by the train loop for
+        # per-loop logging.
+        self.last_intermediate_hiddens: list[Tensor] | None = None
+
     def forward(
         self,
         input_ids: Tensor,
@@ -939,6 +946,19 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
         total_z_loss = torch.tensor(0.0, device=x.device)
         total_seq_balance_loss = torch.tensor(0.0, device=x.device)
 
+        # Per-loop aux-loss capture (architecture fix for loop collapse).
+        # Enabled when config.aux_loop_loss_weight > 0 and training. We
+        # capture the hidden state at the END of each non-final loop
+        # (after the 3 blocks, BEFORE norm_loop) so the aux LM head can
+        # apply norm_out to it and predict the next token from the
+        # intermediate representation. Forces gradient signal into
+        # loops 0..N-2 instead of letting loop N-1 absorb everything.
+        intermediate_hiddens: list[Tensor] = []
+        capture_aux = (
+            getattr(self.config, "aux_loop_loss_weight", 0.0) > 0.0
+            and self.training
+        )
+
         use_ckpt = self.gradient_checkpointing and self.training
         if use_ckpt and (use_cache or past_key_values is not None):
             raise ValueError(
@@ -996,11 +1016,23 @@ class NanoOSRTModel(NanoOSRTPreTrainedModel):
                         total_seq_balance_loss + block.moe.seq_balance_loss
                     )
 
+            # Capture pre-norm_loop hidden for aux-loss computation.
+            # Only capture non-final loops (the final loop's hidden
+            # already feeds the main LM head, so no aux needed for it).
+            if capture_aux and loop < self.config.recursive_loops - 1:
+                intermediate_hiddens.append(x)
+
             loop_rms.append(x.float().pow(2).mean().sqrt())
             if loop < self.config.recursive_loops - 1:
                 x = self.norm_loop(x)
 
         x = self.norm_out(x)
+        # Expose intermediate hiddens to the CausalLM wrapper. Set to
+        # None when not capturing so downstream code can do a cheap
+        # truthy check.
+        self.last_intermediate_hiddens = (
+            intermediate_hiddens if capture_aux else None
+        )
         return (
             x, loop_rms,
             total_balance_loss, total_z_loss, total_seq_balance_loss,
@@ -1035,6 +1067,11 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         self.last_z_loss_normalised: Tensor | None = None
         self.last_seq_balance_loss: Tensor | None = None
         self.last_seq_balance_loss_normalised: Tensor | None = None
+        # Per-loop aux losses (when aux_loop_loss_weight > 0 + training).
+        # Indexed loop 0..N-2 (final loop has no aux). Each entry is the
+        # raw CE loss for predicting next-token from that loop's hidden.
+        self.last_per_loop_aux_losses: list[Tensor] = []
+        self.last_aux_loop_total: Tensor | None = None
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embedding
@@ -1071,6 +1108,8 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         self.last_z_loss_normalised = None
         self.last_seq_balance_loss = None
         self.last_seq_balance_loss_normalised = None
+        self.last_per_loop_aux_losses = []
+        self.last_aux_loop_total = None
 
         loss = None
         if labels is not None:
@@ -1089,6 +1128,34 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             z_norm = z_loss / n_moe_layers
             seq_balance_norm = seq_balance_loss / n_moe_layers
 
+            # Per-loop aux LM-head losses (architecture fix). Captures the
+            # hidden state at the END of each non-final loop, applies
+            # norm_out + the (weight-tied) LM head, and computes CE
+            # against the same shifted labels. Adds gradient signal to
+            # intermediate loops 0..N-2.
+            aux_loop_total = torch.tensor(0.0, device=task_loss.device)
+            per_loop_aux: list[Tensor] = []
+            intermediate_hiddens = self.model.last_intermediate_hiddens
+            aux_weight = getattr(self.config, "aux_loop_loss_weight", 0.0)
+            if (
+                self.training
+                and aux_weight > 0.0
+                and intermediate_hiddens
+            ):
+                for h_loop in intermediate_hiddens:
+                    h_norm = self.model.norm_out(h_loop)
+                    h_logits = F.linear(h_norm, self.model.embedding.weight)
+                    h_shift = h_logits[
+                        ..., :-1, :self.config.real_vocab_size
+                    ].contiguous().float()
+                    aux_l = F.cross_entropy(
+                        h_shift.view(-1, self.config.real_vocab_size),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                    per_loop_aux.append(aux_l)
+                    aux_loop_total = aux_loop_total + aux_l
+
             # Total loss: add aux losses ONLY during training. Eval loss must
             # be pure task CE so eval perplexity and held-out comparisons
             # aren't polluted by hyperparameter choices. Training loops that
@@ -1101,9 +1168,16 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                     + self.config.router_z_loss_coeff * z_norm
                     + self.config.router_seq_balance_loss_coeff
                     * seq_balance_norm
+                    + aux_weight * aux_loop_total
                 )
             else:
                 loss = task_loss
+
+            # Stash per-loop aux losses (detached) for telemetry.
+            self.last_per_loop_aux_losses = [l.detach() for l in per_loop_aux]
+            self.last_aux_loop_total = (
+                aux_loop_total.detach() if per_loop_aux else None
+            )
 
             # Expose components for logging — always set, regardless of mode.
             self.last_task_loss = task_loss.detach()

@@ -1614,6 +1614,36 @@ def run_pretrain_extend(
             tok_per_sec = eff_batch * seq_len / max(
                 elapsed / steps_done, 1e-8,
             )
+
+            # Recursion telemetry: per-loop aux CE loss (if enabled) and
+            # per-loop adapter contribution magnitude. The per-loop aux
+            # loss tells us whether intermediate loops are learning to
+            # predict next-token. The adapter magnitude tells us whether
+            # those loops' adapters are growing or staying tiny. Together
+            # they answer "is the recursive depth being used?" in real time.
+            per_loop_aux = [
+                l.item() for l in inner.last_per_loop_aux_losses
+            ] if hasattr(inner, "last_per_loop_aux_losses") else []
+            aux_total = (
+                inner.last_aux_loop_total.item()
+                if getattr(inner, "last_aux_loop_total", None) is not None
+                else None
+            )
+            base_model = inner.model if hasattr(inner, "model") else inner
+            n_loops = base_model.config.recursive_loops
+            n_blocks = base_model.config.num_blocks
+            adapter_scale_val = base_model.adapter_scale
+            per_loop_adapter_norm: list[float] = []
+            with torch.no_grad():
+                for loop_i in range(n_loops):
+                    total = 0.0
+                    for blk in range(n_blocks):
+                        idx = loop_i * n_blocks + blk
+                        a = base_model.adapters_a[idx]
+                        b = base_model.adapters_b[idx]
+                        total += adapter_scale_val * (a @ b).norm().item()
+                    per_loop_adapter_norm.append(total / n_blocks)
+
             print(
                 f"step {step:>5d}/{extend_cfg.total_steps} | "
                 f"task {accum_task_loss.item():.4f} | "
@@ -1629,6 +1659,18 @@ def run_pretrain_extend(
                 f"gate={moe_summary['moe_gate']:.3f}",
                 flush=True,
             )
+            if per_loop_aux:
+                aux_str = " ".join(f"{v:.3f}" for v in per_loop_aux)
+                print(
+                    f"           aux: total={aux_total:.3f}  "
+                    f"per_loop=[{aux_str}]",
+                    flush=True,
+                )
+            adapter_str = " ".join(f"{v:.3f}" for v in per_loop_adapter_norm)
+            print(
+                f"           rec: adapter_||scaled_a@b||_per_loop=[{adapter_str}]",
+                flush=True,
+            )
             if use_wandb:
                 log_dict = {
                     "extend/task_loss": accum_task_loss.item(),
@@ -1637,6 +1679,12 @@ def run_pretrain_extend(
                     "extend/vram_gb": vram_gb,
                     "extend/tok_per_sec": tok_per_sec,
                 }
+                if aux_total is not None:
+                    log_dict["extend/aux_loop_total"] = aux_total
+                    for i, v in enumerate(per_loop_aux):
+                        log_dict[f"extend/aux_loop_L{i}"] = v
+                for i, v in enumerate(per_loop_adapter_norm):
+                    log_dict[f"extend/adapter_norm_L{i}"] = v
                 log_dict.update(moe_metrics)
                 wandb.log(log_dict, step=step)
         elif step < 100:

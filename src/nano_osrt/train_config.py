@@ -725,6 +725,64 @@ class PretrainExtend2Config(PretrainExtendConfig):
     }
 
 
+class LoopFixConfig(PretrainExtend2Config):
+    """Architecture-fix continuation: per-loop auxiliary LM-head losses.
+
+    Motivation
+    ──────────
+    The recursive-loop probe (probe_recursion.py, 2026-06-05) showed
+    that loop 5 (the final loop) was doing ~6.0 points of CE loss
+    reduction by itself, while loops 1-4 contributed a total of ~0.75
+    points across all of them. Effective depth of the 18-effective-
+    layer model was closer to ~6 layers (3 blocks × 2 functional loops:
+    initial projection + final answer projection). This is a classic
+    "loop collapse" — gradient signal flowed entirely through the
+    final loop because only its output fed the LM head.
+
+    Fix
+    ───
+    Attach the SAME weight-tied LM head to the hidden state at the
+    end of each non-final loop (after norm_out for path consistency).
+    Compute CE loss against the same next-token labels. Add to main
+    loss with `aux_loop_loss_weight`. This forces the intermediate
+    loops to learn predictive representations rather than just
+    setting up the final loop.
+
+    Same data mix + same checkpoint resume as PretrainExtend2 phase 3.
+    Short run (1500 steps, ~$5) to validate the architecture fix
+    before committing the rest of the post-training budget. Re-run
+    probe_recursion.py against the resulting ckpt to confirm loops
+    1-4 are now contributing more.
+
+    Schedule
+    ────────
+    Fresh cosine: re-warm 60 steps → peak 5e-6 → cosine to 5e-7 by
+    step 1500. Lower peak than extend2 phase 3 (7e-6) because the
+    aux losses add ~0.5× extra gradient pressure and we don't want
+    to destabilise the model.
+    """
+
+    total_steps: int = 9_600     # 8100 (extend2 final) + 1500
+    lr_anchor_step: int = 8_100
+    warmup_steps: int = 60
+    peak_lr: float = 5e-6
+    min_lr: float = 5e-7
+
+    # The headline fix. With 6 loops, 5 non-final loops contribute aux
+    # losses. At weight 0.1 each, total aux = ~0.5× main loss when
+    # all intermediate losses ≈ main loss. Big enough to drive
+    # learning, small enough to keep main task dominant.
+    aux_loop_loss_weight: float = 0.1
+
+    log_interval: int = 25
+    ckpt_interval: int = 200
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend2_final.pt"
+    stage_prefix: str = "loopfix"
+    wandb_run_name: str = "osrt-loopfix"
+    wandb_run_id: str = ""
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 

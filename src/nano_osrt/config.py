@@ -95,6 +95,20 @@ class NanoOSRTConfig(PretrainedConfig):
         # global aux loss does the heavy lifting.
         router_seq_balance_loss_coeff: float = 0.0,
 
+        # --- Per-loop auxiliary LM-head loss (architecture fix) ---
+        # When > 0, an aux CE loss is computed on the hidden state at
+        # the END of each recursive loop except the last one, by
+        # applying norm_out + (weight-tied) LM head and comparing to
+        # the same next-token labels. Each per-loop loss is added to
+        # the main loss with this weight. Forces gradient signal into
+        # intermediate loops that would otherwise collapse to "minor
+        # refinement" mode (see probe_recursion findings 2026-06-05).
+        # Total aux contribution scales with (n_loops - 1) × weight;
+        # at 6 loops and weight 0.1 the aux block is +0.5× main loss
+        # which is large enough to drive learning without overpowering
+        # the primary objective. Set to 0 to disable.
+        aux_loop_loss_weight: float = 0.0,
+
         # --- Balance-bias controller (DeepSeek-style) ---
         # Per-expert additive bias applied to router logits as part of the
         # routing mechanism in both train and eval. Bias is per recursive loop
@@ -181,6 +195,7 @@ class NanoOSRTConfig(PretrainedConfig):
         self.router_aux_loss_coeff = router_aux_loss_coeff
         self.router_z_loss_coeff = router_z_loss_coeff
         self.router_seq_balance_loss_coeff = router_seq_balance_loss_coeff
+        self.aux_loop_loss_weight = aux_loop_loss_weight
         self.router_balance_bias_enabled = router_balance_bias_enabled
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
