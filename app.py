@@ -1701,9 +1701,18 @@ def main(stage: str = "pretrain"):
     elif stage == "pretrain_extend":
         pretrain_extend.remote()
     elif stage == "pretrain_extend2":
-        pretrain_extend2.remote()
+        # .spawn() instead of .remote() — the local CLI exits cleanly
+        # in detached mode, and .remote() inside a local_entrypoint can
+        # be cancelled when the caller disconnects (Modal warns about
+        # this on launch). Observed: extend2 cancelled at ~2 min from
+        # container start regardless of compile/wandb/ckpt/log config.
+        # .spawn() is true fire-and-forget; the function continues even
+        # if the local entrypoint exits immediately.
+        call = pretrain_extend2.spawn()
+        print(f"Spawned pretrain_extend2 as call: {call.object_id}")
     elif stage == "pretrain_extend2_sanity":
-        pretrain_extend2_sanity.remote()
+        call = pretrain_extend2_sanity.spawn()
+        print(f"Spawned pretrain_extend2_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":
