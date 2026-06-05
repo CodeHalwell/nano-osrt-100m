@@ -561,10 +561,18 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # than the SFT-ultralong base extend1 resumed from, so the
     # gradient step size needs proportionally smaller to avoid
     # overshooting the carefully-found GRPO optimum.
-    total_steps: int = 3_000
-    warmup_steps: int = 60          # 2% — short re-warm
-    peak_lr: float = 1e-5           # below extend1's 1.5e-5
-    min_lr: float = 1e-6            # cosine to 10% of peak
+    # Extended 3000 → 8000 after the first 3000-step run completed
+    # with loss still cleanly trending down (2.01 → 1.68 mean, min
+    # 1.52). Streaming HF dataset shuffles use new seeds on resume
+    # so the +5000 steps see fresh data, not retreads. lr_anchor_step
+    # makes the warmup/cosine treat `step - 3000` as the effective
+    # step, so the schedule re-warms cleanly from peak instead of
+    # jumping LR back up mid-cool.
+    total_steps: int = 8_000
+    lr_anchor_step: int = 3_000     # resume point — schedule re-anchors here
+    warmup_steps: int = 60          # re-warm length over steps 3000-3060
+    peak_lr: float = 1e-5           # same peak as original run
+    min_lr: float = 1e-6            # cosine to 10% of peak by step 8000
 
     # Muon hybrid mirrors extend1; lower peak_lr propagates via the
     # same _peak_lr tagging in train.py.

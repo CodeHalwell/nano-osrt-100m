@@ -64,16 +64,26 @@ def _set_param_group_lrs(
     present) have their own peak_lr/min_lr stored on the group dict and
     are scaled along the same cosine ratio so all optimizers reach
     their min at the end of training.
+
+    `lr_anchor_step` (optional cfg attr, default 0) lets a resumed
+    extension run re-warm without an LR jump-up: the warmup/cosine
+    treats `step - anchor` as the effective step, so a continuation
+    starts cleanly from warmup again instead of recomputing cosine
+    progress against the new total_steps (which would jump LR back to
+    near-peak mid-cool). Same mechanism as GRPOConfig.lr_anchor_step.
     """
-    if step < cfg.warmup_steps:
-        ratio = step / cfg.warmup_steps
+    anchor = getattr(cfg, "lr_anchor_step", 0)
+    eff_step = max(step - anchor, 0)
+    eff_total = max(cfg.total_steps - anchor, 1)
+    if eff_step < cfg.warmup_steps:
+        ratio = eff_step / cfg.warmup_steps
         for pg in optimizer.param_groups:
             peak = pg.get("_peak_lr", cfg.peak_lr)
             pg["lr"] = peak * ratio
         return cfg.peak_lr * ratio
 
-    progress = (step - cfg.warmup_steps) / max(
-        cfg.total_steps - cfg.warmup_steps, 1,
+    progress = (eff_step - cfg.warmup_steps) / max(
+        eff_total - cfg.warmup_steps, 1,
     )
     cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
     for pg in optimizer.param_groups:
