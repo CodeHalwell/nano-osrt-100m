@@ -571,9 +571,14 @@ class PretrainExtend2Config(PretrainExtendConfig):
     muon_lr: float = 3e-3
     muon_min_lr: float = 3e-4
 
-    log_interval: int = 25
+    # log_interval=1: emit a step event every iteration. Eager-mode
+    # step time is ~10s; with log_interval=25 we'd be silent for 250s
+    # between events, longer than the workspace's apparent ~2-minute
+    # input-progress heartbeat (which auto-cancels otherwise-healthy
+    # runs). Step-by-step logging keeps Modal seeing continuous output.
+    log_interval: int = 1
     ckpt_interval: int = 200        # ~15 ckpts over 3,000 steps
-    eval_interval: int = 250
+    eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk)
     eval_steps: int = 20
 
     # ── Resume ───────────────────────────────────────────────────────
