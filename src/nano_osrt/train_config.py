@@ -616,23 +616,24 @@ class PretrainExtend2Config(PretrainExtendConfig):
             # headroom for the larger batch needed by reasoning data.
             "batch_size": 8,
             "grad_accum_steps": 8,
-            # 7-stream working mix isolated via sanity v9-v23 bisection.
-            # Dropped (caused C++ terminate/SIGABRT on first forward pass
-            # — root cause unidentified, suspected token-level interaction
-            # with the model on code-content):
+            # 9-stream working mix isolated via sanity v9-v25 bisection.
+            # Dropped (caused C++ terminate/SIGABRT on first forward
+            # pass — root cause unidentified, but reproducibly bad):
             #   * ise-uiuc/Magicoder-Evol-Instruct-110K
             #   * ise-uiuc/Magicoder-OSS-Instruct-75K
             #   * HuggingFaceTB/cosmopedia-v2 python-edu subset
-            #   * lukaemon/bbh (v23 auto-cancelled after step 0;
-            #     not isolated whether BBH or another factor, but
-            #     skipped per user direction)
+            #   * lukaemon/bbh (not cleanly isolated; skipped)
+            # Note: pattern correlates with "datasets containing code
+            # content alongside text" — suspect the BPE pre-tokenizer
+            # hits an edge case on a specific token sequence that
+            # tips the model into a non-finite forward pass.
             "datasets": [
                 # ─── Math/Science (45%) ──────────────────────────────
                 {
                     "name": "openr1-math-220k",
                     "hf_id": "open-r1/OpenR1-Math-220k",
                     "hf_config": "default",
-                    "weight": 0.20,
+                    "weight": 0.18,
                     "format": "openr1_math",
                 },
                 {
@@ -645,7 +646,7 @@ class PretrainExtend2Config(PretrainExtendConfig):
                 {
                     "name": "open-web-math",
                     "hf_id": "open-web-math/open-web-math",
-                    "weight": 0.10,
+                    "weight": 0.07,
                     "format": "arxiv",  # same `text` field shape
                 },
                 # ─── Reasoning (20%) ────────────────────────────────
@@ -653,28 +654,43 @@ class PretrainExtend2Config(PretrainExtendConfig):
                     "name": "open-thoughts-114k",
                     "hf_id": "open-thoughts/OpenThoughts-114k",
                     "hf_config": "default",
-                    "weight": 0.20,
+                    "weight": 0.15,
                     "format": "openthoughts",
                 },
-                # ─── General-capability anchor (35%) ────────────────
+                {
+                    "name": "dolmino-flan",
+                    "hf_id": "allenai/dolmino-mix-1124",
+                    "hf_config": "flan",
+                    "weight": 0.08,
+                    # Generic _extract_text handles `text` field.
+                },
+                # ─── Science / academic (10%) ───────────────────────
+                {
+                    "name": "dolmino-pes2o",
+                    "hf_id": "allenai/dolmino-mix-1124",
+                    "hf_config": "pes2o",
+                    "weight": 0.10,
+                    # Generic _extract_text handles `text` field.
+                },
+                # ─── General-capability anchor (25%) ────────────────
                 {
                     "name": "ultrachat-200k",
                     "hf_id": "HuggingFaceH4/ultrachat_200k",
                     "split": "train_sft",
-                    "weight": 0.12,
+                    "weight": 0.10,
                     # Generic _extract_text handles `messages` field.
                 },
                 {
                     "name": "cosmopedia-v2",
                     "hf_id": "HuggingFaceTB/cosmopedia-v2",
                     "hf_config": "cosmopedia-v2",
-                    "weight": 0.13,
+                    "weight": 0.10,
                     # Generic _extract_text handles `text` field.
                 },
                 {
                     "name": "fineweb-edu",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.10,
+                    "weight": 0.07,
                     # Generic _extract_text handles `text` field.
                 },
             ],

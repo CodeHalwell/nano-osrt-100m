@@ -376,38 +376,8 @@ def pretrain_extend2_sanity():
 
     sanity_cfg = SanityCfg()
     sanity_cfg.phases["extend"]["end"] = 50
-    # One-at-a-time bisection: start from the known-good v9 baseline
-    # (open-web-math + fineweb-edu — both ran step 0 cleanly) and add
-    # ONE candidate dataset. If sanity runs, that candidate is safe;
-    # advance to the next one. If it crashes, that candidate is the
-    # bug. Change the `_BISECT_CANDIDATE` value below to step through.
-    # v25: 7 working streams + dolmino-mix-1124 flan + pes2o subsets.
-    # If sanity passes, lock these 9 into the full PretrainExtend2Config
-    # and launch the real 3000-step run. dolmino is the modern Dolma
-    # successor designed specifically as a mid-training mix; flan adds
-    # CoT instruction-following coverage, pes2o adds academic depth.
-    sanity_cfg.phases["extend"]["datasets"] = [
-        # Working core
-        {"name": "open-web-math", "hf_id": "open-web-math/open-web-math",
-         "weight": 0.10, "format": "arxiv"},
-        {"name": "fineweb-edu", "hf_id": "HuggingFaceFW/fineweb-edu",
-         "weight": 0.10},
-        {"name": "openr1-math-220k", "hf_id": "open-r1/OpenR1-Math-220k",
-         "hf_config": "default", "weight": 0.16, "format": "openr1_math"},
-        {"name": "open-math-reasoning", "hf_id": "nvidia/OpenMathReasoning",
-         "split": "cot", "weight": 0.14, "format": "openmath_reasoning"},
-        {"name": "open-thoughts-114k", "hf_id": "open-thoughts/OpenThoughts-114k",
-         "hf_config": "default", "weight": 0.15, "format": "openthoughts"},
-        {"name": "cosmopedia-v2", "hf_id": "HuggingFaceTB/cosmopedia-v2",
-         "hf_config": "cosmopedia-v2", "weight": 0.10},
-        {"name": "ultrachat-200k", "hf_id": "HuggingFaceH4/ultrachat_200k",
-         "split": "train_sft", "weight": 0.10},
-        # NEW candidates under test:
-        {"name": "dolmino-flan", "hf_id": "allenai/dolmino-mix-1124",
-         "hf_config": "flan", "weight": 0.08},
-        {"name": "dolmino-pes2o", "hf_id": "allenai/dolmino-mix-1124",
-         "hf_config": "pes2o", "weight": 0.07},
-    ]
+    # Datasets now live in PretrainExtend2Config; sanity inherits
+    # the locked 9-stream working mix verified via v9-v25 bisection.
 
     print("pretrain_extend2 SANITY: 50 steps, no ckpts, no eval — "
           "validating all streams + format functions.")
