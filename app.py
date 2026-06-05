@@ -399,7 +399,9 @@ def loop_fix_sanity_inner():
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
     class SanityLoopFix(LoopFixConfig):
-        total_steps = 8_150          # = lr_anchor_step (8100) + 50
+        # Fresh step counter — no lr_anchor_step.
+        total_steps = 50
+        lr_anchor_step = 0
         warmup_steps = 10
         log_interval = 5
         ckpt_interval = 999_999
@@ -408,7 +410,7 @@ def loop_fix_sanity_inner():
         compile_enabled = False      # fast first-step events
 
     sanity_cfg = SanityLoopFix()
-    sanity_cfg.phases["extend"]["end"] = 8_150
+    sanity_cfg.phases["extend"]["end"] = 50
     sanity_cfg.phases["extend"]["batch_size"] = 4
     sanity_cfg.phases["extend"]["grad_accum_steps"] = 16
     model_config = NanoOSRTConfig(

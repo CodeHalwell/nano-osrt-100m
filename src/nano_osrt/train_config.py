@@ -762,8 +762,12 @@ class LoopFixConfig(PretrainExtend2Config):
     to destabilise the model.
     """
 
-    total_steps: int = 9_600     # 8100 (extend2 final) + 1500
-    lr_anchor_step: int = 8_100
+    # Fresh stage with its own step counter (stage_prefix=loopfix has
+    # no existing step ckpts so resume scan starts at step 0). Don't
+    # use lr_anchor_step here — that pattern is for resuming WITHIN
+    # the same stage_prefix. New prefix = fresh counter.
+    total_steps: int = 1_500
+    lr_anchor_step: int = 0
     warmup_steps: int = 60
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
