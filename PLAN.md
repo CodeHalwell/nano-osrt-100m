@@ -1,6 +1,6 @@
 # nano-osrt — Post-extend3 Plan
 
-**Owner:** Daniel · **Last update:** 2026-06-06 · **Current state:** MOPD step 200/1000 (in progress)
+**Owner:** Daniel · **Last update:** 2026-06-06 · **Current state:** grpo_multi running on codhe (300 steps, ~6hr)
 
 Living document — update inline as we progress. Per-stage cost reconciliation
 and probe results captured at the bottom of each stage block.
@@ -12,10 +12,10 @@ and probe results captured at the bottom of each stage block.
 | asset | status |
 |---|---|
 | Architecture | ✅ Fixed (loopfixv2 + extend3 with aux_loop_loss_weight + loop dropout) |
-| Best ckpt | `extend3_merged.pt` (Test 3 + inference verified, no `<\|answer\|>` yet) |
-| Rollouts | ✅ 13,368 done (Gemini 5,440 + DeepSeek 7,924 + ~10 unknown) |
-| MOPD | 🟢 in progress on codhe-hugging-mcp (step 200/1000) |
-| Budget — Modal | ~$19 codhe-hugging-mcp + $15 danielhalwell = $34 |
+| MOPD | ✅ complete — `mopd_final.pt` is canonical (inference 33% → 50%, first `<\|answer\|>` tag) |
+| Rollouts | ✅ 13,368 (Gemini 5,440 + DeepSeek v4-flash 7,924) |
+| GRPO multi-env | 🟢 in progress on codhe-hugging-mcp (300 steps, ~6hr) |
+| Budget — Modal | $19 codhe + $15 danielhalwell + **$280 build-small (NEW)** = **$314** |
 | Budget — API | ~$210 Gemini + DeepSeek used ~$5 = plenty left |
 
 ### Teacher provider catalog (in scripts/collect_rollouts.py)
