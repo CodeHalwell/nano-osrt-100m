@@ -1694,9 +1694,16 @@ class MultiEnvGRPOConfig(GRPOConfig):
     means group rewards are computed on tightly-scoped completions.
     """
 
-    total_steps: int = 1_500
+    # CONSTRAINED BUDGET: 300 steps fits in ~$24 across the codhe-
+    # hugging-mcp + danielhalwell workspaces given the actual
+    # measured per-step time of ~70-90 sec (sanity uncompiled was
+    # 93s; compiled with grad_accum=4 will be ~65-80s). Sanity
+    # trajectory showed math EMA climbing +0.30/step and overall
+    # +0.36/step — at that rate 300 steps captures the meaningful
+    # learning window before diminishing returns.
+    total_steps: int = 300
     lr_anchor_step: int = 0
-    warmup_steps: int = 30
+    warmup_steps: int = 20
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
 
@@ -1708,8 +1715,11 @@ class MultiEnvGRPOConfig(GRPOConfig):
     per_loop_aux_weights: None = None
 
     # GRPO sampling — wider than math-only GRPO for env diversity.
+    # max_gen_len trimmed 512 → 384 (matches the math-only GRPO
+    # config). Saves ~25 % rollout time. gsm8k / IFEval / MBPP
+    # responses very rarely need the extra headroom.
     group_size: int = 8
-    max_gen_len: int = 512
+    max_gen_len: int = 384
     temperature: float = 1.0
     top_p: float = 0.95
     kl_coeff: float = 0.05  # was 0.20 in math-only; want more policy movement
@@ -1730,7 +1740,7 @@ class MultiEnvGRPOConfig(GRPOConfig):
     stop_token_ids: tuple[int, ...] = (10, 11)  # noqa: RUF012
 
     log_interval: int = 10
-    ckpt_interval: int = 150
+    ckpt_interval: int = 75  # 4 ckpts over 300 steps
 
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_mopd_final.pt"
     stage_prefix: str = "grpo_multi"
