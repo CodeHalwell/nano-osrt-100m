@@ -1694,23 +1694,28 @@ class MultiEnvGRPOConfig(GRPOConfig):
     means group rewards are computed on tightly-scoped completions.
     """
 
-    # CONSTRAINED BUDGET: 300 steps fits in ~$24 across the codhe-
-    # hugging-mcp + danielhalwell workspaces given the actual
-    # measured per-step time of ~70-90 sec (sanity uncompiled was
-    # 93s; compiled with grad_accum=4 will be ~65-80s). Sanity
-    # trajectory showed math EMA climbing +0.30/step and overall
-    # +0.36/step — at that rate 300 steps captures the meaningful
-    # learning window before diminishing returns.
-    total_steps: int = 300
-    lr_anchor_step: int = 0
-    warmup_steps: int = 20
+    # GRPO step_75 → 150 EXTENSION with tightened architecture-fix
+    # knobs. Step-75 probe showed depth utilization REGRESSED (n=6
+    # CE 3.00 → 4.30, "more loops hurt" verdict) while inference
+    # accuracy improved (3/6 → 4/6). The original GRPO knobs
+    # (aux=0.03, dropout=0.05) didn't preserve depth use under
+    # policy-gradient pressure. Resume from step_75 with:
+    #   - aux_loop_loss_weight 0.03 → 0.10 (3.3× stronger depth signal)
+    #   - loop_dropout_prob   0.05 → 0.00 (no truncation; full chain
+    #     for every rollout so the model can't shortcut)
+    #   - strict_template_weight 0.5 → 1.0 (stronger penalty on the
+    #     multi-answer-block failure mode that reappeared)
+    # lr_anchor_step=75 re-warms over 10 steps so the new objective
+    # gets gradient instead of the near-zero cosine tail.
+    total_steps: int = 150
+    lr_anchor_step: int = 75
+    warmup_steps: int = 10
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
 
-    # Architecture-fix knobs — lower than mid-training. Preserve
-    # depth use without dominating the policy gradient.
-    aux_loop_loss_weight: float = 0.03
-    loop_dropout_prob: float = 0.05
+    # Tightened architecture-fix knobs (see total_steps note above).
+    aux_loop_loss_weight: float = 0.10
+    loop_dropout_prob: float = 0.00
     loop_dropout_min_loops: int = 3
     per_loop_aux_weights: None = None
 
@@ -1734,7 +1739,8 @@ class MultiEnvGRPOConfig(GRPOConfig):
     reward_approx_format_neg: float = -1.0
     reward_number_match: float = 1.5
     reward_number_miss: float = -0.5
-    reward_strict_template_weight: float = 0.5
+    reward_strict_template_weight: float = 1.0  # 0.5 → 1.0 for tighter
+    # multi-answer-block penalty during the step 75→150 extension
 
     # Stop-token IDs for rollout generation. <|/answer|>=10, <|user|>=11.
     stop_token_ids: tuple[int, ...] = (10, 11)  # noqa: RUF012
