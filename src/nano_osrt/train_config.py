@@ -893,6 +893,67 @@ class PretrainExtend3Config(PretrainExtend2Config):
     wandb_run_id: str = ""
 
 
+class MOPDConfig(PretrainExtend3Config):
+    """Multi-teacher On-Policy Distillation (MOPD) from Gemini rollouts.
+
+    Trains on a local JSONL of teacher rollouts (see
+    scripts/collect_rollouts.py) using the same training loop as
+    pretrain_extend, but with the rollout_dataset_path override that
+    swaps in make_rollout_loader instead of the streaming HF loader.
+
+    Per-record format the loader produces:
+        <|user|>{prompt}<|assistant|><|think|>{thinking}<|/think|>
+        <|answer|>{response}<|/answer|>
+    Labels are -100 on the user prefix so cross-entropy fires ONLY on
+    the assistant turn (thinking + answer). This is what makes it
+    distillation rather than full-sequence LM training.
+
+    The architecture-fix knobs (aux loop loss, loop dropout) remain ON
+    at the same low values as extend3 so the recursive depth keeps
+    being exercised during distillation — drift back to depth collapse
+    would defeat the point of having built that capability.
+
+    Schedule
+    ────────
+    Lower peak LR (1.5e-6) than mid-training because this is alignment
+    on a small, high-quality dataset — we want gentle nudges, not big
+    weight moves. 1000 steps at batch=4/accum=16 = ~64K examples seen
+    (≈ 14 epochs over 4.4K rollouts). Cosine to 1.5e-7. ~$5-7 Modal.
+
+    Resume from extend3_final.pt (or extend3_merged.pt if we run the
+    merge first).
+    """
+
+    total_steps: int = 1_000
+    lr_anchor_step: int = 0
+    warmup_steps: int = 50
+    peak_lr: float = 1.5e-6
+    min_lr: float = 1.5e-7
+
+    # Keep the architecture fix active during distillation so the model
+    # doesn't drift back toward loop collapse on a different objective.
+    # Same values as extend3.
+    aux_loop_loss_weight: float = 0.05
+    loop_dropout_prob: float = 0.10
+    loop_dropout_min_loops: int = 3
+    per_loop_aux_weights: None = None
+    aux_loop_curriculum_steps: int = 50
+    aux_loop_weight_start: float = 0.02
+
+    # The crucial override — when set, run_pretrain_extend swaps in
+    # make_rollout_loader (data.py) for make_loader. Path is inside the
+    # Modal container, so it's mounted via volume below.
+    rollout_dataset_path: str = "/vol/rollouts/mopd_v1.jsonl"
+
+    log_interval: int = 25
+    ckpt_interval: int = 200
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend3_final.pt"
+    stage_prefix: str = "mopd"
+    wandb_run_name: str = "osrt-mopd"
+    wandb_run_id: str = ""
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 

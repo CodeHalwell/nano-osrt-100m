@@ -89,6 +89,14 @@ hf_cache_vol = modal.Volume.from_name(
     "osrt-hf-cache", create_if_missing=True,
 )
 
+# MOPD rollout volume — holds Gemini teacher-rollout JSONL collected
+# via scripts/collect_rollouts.py. Uploaded from local before launching
+# the mopd stage. Per-workspace; create_if_missing so first launch on a
+# fresh workspace works without manual setup.
+rollouts_vol = modal.Volume.from_name(
+    "osrt-rollouts", create_if_missing=True,
+)
+
 
 # =============================================================================
 # PRE-TRAINING
@@ -705,6 +713,154 @@ def pretrain_extend3_sanity():
         f"pretrain_extend3 SANITY: 50 steps, peak_lr={cfg.peak_lr}, "
         f"aux={cfg.aux_loop_loss_weight}, dropout={cfg.loop_dropout_prob}."
     )
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
+# =============================================================================
+# MOPD — Multi-teacher On-Policy Distillation from Gemini rollouts
+# =============================================================================
+# Trains on a local JSONL of teacher rollouts (collected via
+# scripts/collect_rollouts.py + uploaded to the osrt-rollouts volume).
+# Reuses run_pretrain_extend with the rollout_dataset_path override so all
+# the architecture-fix telemetry, LR schedule, MoE balance, and checkpoint
+# infrastructure works unchanged. Resumes from extend3_final.pt.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def mopd():
+    """MOPD distillation on Gemini-rollout JSONL from extend3_final.pt.
+
+    Reads /vol/rollouts/mopd_v1.jsonl (upload from local with
+    `modal volume put osrt-rollouts rollouts/mopd_v1.jsonl mopd_v1.jsonl`
+    before launching). 1000 steps, peak_lr 1.5e-6, aux fix knobs at
+    extend3 levels."""
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import MOPDConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    cfg = MOPDConfig()
+    cfg.phases["extend"]["end"] = cfg.total_steps
+    cfg.phases["extend"]["batch_size"] = 4
+    cfg.phases["extend"]["grad_accum_steps"] = 16
+    # Shorter seq_len for rollouts — most are under 1024 tokens, so
+    # 2048 is mostly wasted padding. Cuts compute ~50% per step.
+    cfg.phases["extend"]["seq_len"] = 1024
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+    )
+    print(
+        f"mopd: {cfg.total_steps} steps from {cfg.pretrained_checkpoint}, "
+        f"peak_lr={cfg.peak_lr}, rollout_path={cfg.rollout_dataset_path}, "
+        f"aux={cfg.aux_loop_loss_weight}, dropout={cfg.loop_dropout_prob}."
+    )
+    if not os.path.exists(cfg.rollout_dataset_path):
+        raise FileNotFoundError(
+            f"Rollout JSONL not found at {cfg.rollout_dataset_path}. "
+            "Upload via: "
+            "`modal volume put osrt-rollouts rollouts/mopd_v1.jsonl "
+            "mopd_v1.jsonl`"
+        )
+
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def mopd_sanity():
+    """30-step MOPD sanity validating the rollout loader path."""
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import MOPDConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    class SanityCfg(MOPDConfig):
+        total_steps = 30
+        lr_anchor_step = 0
+        warmup_steps = 5
+        log_interval = 5
+        ckpt_interval = 999_999
+        eval_interval = 999_999
+        wandb_log = False
+        compile_enabled = False
+        aux_loop_curriculum_steps = 10
+        # Resume from extend3 step ckpt (or loopfixv2_merged) — sanity
+        # is to validate the rollout pipeline end-to-end, not to
+        # depend on a specific final ckpt that may not exist yet.
+        pretrained_checkpoint = "/vol/checkpoints/v5/osrt_v5_loopfixv2_merged.pt"
+
+    cfg = SanityCfg()
+    cfg.phases["extend"]["end"] = 30
+    cfg.phases["extend"]["batch_size"] = 4
+    cfg.phases["extend"]["grad_accum_steps"] = 16
+    cfg.phases["extend"]["seq_len"] = 1024
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+    )
+    print(
+        f"mopd SANITY: 30 steps, peak_lr={cfg.peak_lr}, "
+        f"rollouts={cfg.rollout_dataset_path}."
+    )
+    if not os.path.exists(cfg.rollout_dataset_path):
+        raise FileNotFoundError(
+            f"Rollout JSONL not found at {cfg.rollout_dataset_path}. "
+            "Upload via: "
+            "`modal volume put osrt-rollouts rollouts/mopd_v1.jsonl "
+            "mopd_v1.jsonl`"
+        )
+
     run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
 
 
@@ -2139,6 +2295,12 @@ def main(stage: str = "pretrain"):
     elif stage == "pretrain_extend3_sanity":
         call = pretrain_extend3_sanity.spawn()
         print(f"Spawned pretrain_extend3_sanity as call: {call.object_id}")
+    elif stage == "mopd":
+        call = mopd.spawn()
+        print(f"Spawned mopd as call: {call.object_id}")
+    elif stage == "mopd_sanity":
+        call = mopd_sanity.spawn()
+        print(f"Spawned mopd_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

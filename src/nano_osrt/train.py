@@ -1515,15 +1515,34 @@ def run_pretrain_extend(
     print(f"    Datasets: {[d['name'] for d in extend_phase['datasets']]}")
 
     load_t = time.time()
-    loader = make_loader(
-        extend_phase["datasets"],
-        seq_len,
-        tokenizer_name,
-        batch_size,
-        step,
-        num_workers=getattr(extend_cfg, "dataloader_num_workers", 4),
-        prefetch_factor=getattr(extend_cfg, "dataloader_prefetch_factor", 4),
-    )
+    # MOPD-style override: when extend_cfg has a rollout_dataset_path,
+    # train on local Gemini-rollout JSONL instead of streaming HF
+    # datasets. Same (input_ids, labels) interface — every other path
+    # in run_pretrain_extend stays the same (LR schedule, MoE balance,
+    # aux loop loss, telemetry, ckpts).
+    rollout_path = getattr(extend_cfg, "rollout_dataset_path", None)
+    if rollout_path:
+        from nano_osrt.data import make_rollout_loader
+        print(f"    [MOPD] using rollout dataset: {rollout_path}")
+        loader = make_rollout_loader(
+            jsonl_path=rollout_path,
+            seq_len=seq_len,
+            tokenizer_name=tokenizer_name,
+            batch_size=batch_size,
+            step_num=step,
+            num_workers=getattr(extend_cfg, "dataloader_num_workers", 2),
+            prefetch_factor=getattr(extend_cfg, "dataloader_prefetch_factor", 2),
+        )
+    else:
+        loader = make_loader(
+            extend_phase["datasets"],
+            seq_len,
+            tokenizer_name,
+            batch_size,
+            step,
+            num_workers=getattr(extend_cfg, "dataloader_num_workers", 4),
+            prefetch_factor=getattr(extend_cfg, "dataloader_prefetch_factor", 4),
+        )
     loader_iter = iter(loader)
     print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
 
@@ -1583,17 +1602,32 @@ def run_pretrain_extend(
                 input_ids, labels = next(loader_iter)
             except StopIteration:
                 # Loader exhausted — rebuild with a different seed.
+                # Honour the MOPD rollout-path override here too.
                 import gc
                 loader_iter = None
                 del loader
                 gc.collect()
-                loader = make_loader(
-                    extend_phase["datasets"],
-                    seq_len,
-                    tokenizer_name,
-                    batch_size,
-                    step,
-                )
+                if rollout_path:
+                    from nano_osrt.data import make_rollout_loader
+                    loader = make_rollout_loader(
+                        jsonl_path=rollout_path,
+                        seq_len=seq_len,
+                        tokenizer_name=tokenizer_name,
+                        batch_size=batch_size,
+                        step_num=step,
+                        num_workers=getattr(
+                            extend_cfg, "dataloader_num_workers", 2),
+                        prefetch_factor=getattr(
+                            extend_cfg, "dataloader_prefetch_factor", 2),
+                    )
+                else:
+                    loader = make_loader(
+                        extend_phase["datasets"],
+                        seq_len,
+                        tokenizer_name,
+                        batch_size,
+                        step,
+                    )
                 loader_iter = iter(loader)
                 input_ids, labels = next(loader_iter)
 
