@@ -1,6 +1,6 @@
 # nano-osrt — Post-extend3 Plan
 
-**Owner:** Daniel · **Last update:** 2026-06-06 · **Current state:** extend3 in progress (step 2500/3000)
+**Owner:** Daniel · **Last update:** 2026-06-06 · **Current state:** MOPD step 200/1000 (in progress)
 
 Living document — update inline as we progress. Per-stage cost reconciliation
 and probe results captured at the bottom of each stage block.
@@ -12,11 +12,22 @@ and probe results captured at the bottom of each stage block.
 | asset | status |
 |---|---|
 | Architecture | ✅ Fixed (loopfixv2 + extend3 with aux_loop_loss_weight + loop dropout) |
-| Best ckpt | extend3 step 2400 (task CE 1.48, best of run); final pending at step 3000 |
-| Rollouts | 4,406 done, ~12K more in flight via Gemini 3.5 Flash; target ~16K total |
-| Budget — Modal | $12 codhe-hugging-mcp + $15 danielhalwell = $27 (top-up needed before GRPO) |
-| Budget — Gemini API | ~$270 remaining of £300 grant |
-| Plus | Claude Max + ChatGPT Pro subs (not currently used in pipeline) |
+| Best ckpt | `extend3_merged.pt` (Test 3 + inference verified, no `<\|answer\|>` yet) |
+| Rollouts | ✅ 13,368 done (Gemini 5,440 + DeepSeek 7,924 + ~10 unknown) |
+| MOPD | 🟢 in progress on codhe-hugging-mcp (step 200/1000) |
+| Budget — Modal | ~$19 codhe-hugging-mcp + $15 danielhalwell = $34 |
+| Budget — API | ~$210 Gemini + DeepSeek used ~$5 = plenty left |
+
+### Teacher provider catalog (in scripts/collect_rollouts.py)
+
+| key | provider | $/1M in | $/1M out | notes |
+|---|---|---|---|---|
+| `gemini-3.5-flash` | Gemini API | $1.50 | $9.00 | expensive, used for initial 5440 |
+| `gemini-2.5-flash` | Gemini API | $0.075 | $0.30 | cheap fallback |
+| `nemotron-3-ultra-free` | OpenRouter | $0 | $0 | top quality, ~100s/rollout (too slow) |
+| `deepseek-or-v3.1` | OpenRouter | $0.27 | $1.10 | OpenRouter routed |
+| `deepseek-v4-flash` | DeepSeek direct | $0.14 | $0.28 | **winner** — 13-15s/rollout, 2500 concurrent |
+| `deepseek-v4-pro` | DeepSeek direct | $0.435 | $0.87 | reasoning-heavy variant |
 
 ---
 
@@ -84,15 +95,19 @@ Total Modal: $165-225 (Gemini API: $30-50).
 
 ## Stage 2 — MOPD distillation
 
-**Status:** ⏳ pending (waiting for stage 1 + rollouts)
-**Cost estimate:** ~$5-7 Modal
+**Status:** 🟢 in progress (step 200/1000 at time of last update)
+**Cost estimate:** ~$5-7 Modal · spent so far: ~$1 + $108 API
 **Duration:** ~2.5 hr
 
 ### Actions
-- [ ] Resume `collect_rollouts.py` if still in progress (target ~16K final)
-- [ ] Upload rollouts: `modal volume put osrt-rollouts rollouts/mopd_v1.jsonl mopd_v1.jsonl`
-- [ ] Launch `mopd_sanity` (30 steps, no compile/wandb) → validate end-to-end
-- [ ] Launch `mopd` full (1000 steps from `extend3_merged.pt`)
+- [x] Build pipeline (RolloutDataset + MOPDConfig + mopd Modal stage + dispatcher)
+- [x] Collect Gemini 3.5 Flash math (4000) + reasoning (~1440) — $49
+- [x] Add OpenRouter + DeepSeek direct teachers to collector
+- [x] Collect DeepSeek v4-flash diverse (reasoning 1560 + chat 3000 + science 3000 + code 374) — $4.29 in 15.5 min at concurrency 2000
+- [x] Verify local RolloutDataset loads 13,368 (filtered 6 empty responses)
+- [x] Upload to codhe-hugging-mcp `osrt-rollouts` volume
+- [x] Launch `mopd_sanity` (30 steps) → task 2.21 → 1.37, format pipeline OK
+- [x] Launch `mopd` full (1000 steps from `extend3_merged.pt`)
 - [ ] Re-run probe + inference test on `mopd_final.pt`
 
 ### Config (already built — `MOPDConfig` in train_config.py)
@@ -108,7 +123,26 @@ Total Modal: $165-225 (Gemini API: $30-50).
 - Loop utilization preserved (probe Test 3 still flat)
 
 ### Results
-_TBD_
+
+**Rollout dataset (`rollouts/mopd_v1.jsonl`, 13,368 valid records):**
+
+| source | count | teachers |
+|---|---|---|
+| math | 4,000 | Gemini 3.5 Flash |
+| reasoning | 3,000 | Gemini (~1440) + DeepSeek v4-flash (~1560) |
+| chat | 3,000 | DeepSeek v4-flash |
+| science | 3,000 | DeepSeek v4-flash |
+| code | 374 | DeepSeek v4-flash (all of MBPP train) |
+
+Total API spend: ~$108 (Gemini $103 + DeepSeek $4.29).
+
+**Sanity (30 steps):** task 2.21 → 1.37 in 30 steps, rollout loader confirmed, format alignment trajectory established.
+
+**Full run trajectory (in progress):**
+- Step 0: task 2.38 (model first sees diverse rollouts)
+- Step 100: task 1.79 (-0.59)
+- Step 200: task 1.79 (steady)
+- _Full results when complete_
 
 ---
 
