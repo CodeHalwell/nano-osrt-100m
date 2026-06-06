@@ -948,7 +948,7 @@ class MOPDConfig(PretrainExtend3Config):
     log_interval: int = 25
     ckpt_interval: int = 200
 
-    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend3_final.pt"
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend3_merged.pt"
     stage_prefix: str = "mopd"
     wandb_run_name: str = "osrt-mopd"
     wandb_run_id: str = ""
