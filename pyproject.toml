@@ -27,6 +27,8 @@ dependencies = [
     "pandas>=3.0.1",
     "lion-pytorch>=0.2.0",
     "python-dotenv>=1.0.0",
+    "google-genai>=2.8.0",
+    "openrouter>=0.9.1",
 ]
 
 [build-system]

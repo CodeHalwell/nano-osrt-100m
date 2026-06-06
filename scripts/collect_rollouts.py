@@ -51,14 +51,19 @@ if _env_path.exists():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-# Soft dependency check
+# Soft dependency checks (only fail when actually used)
 try:
     from google import genai
-    from google.genai import types
+    from google.genai import types as gemini_types  # noqa: N812
+    _HAS_GEMINI = True
 except ImportError:
-    print("ERROR: google-genai not installed. Run: uv add google-genai",
-          file=sys.stderr)
-    sys.exit(1)
+    _HAS_GEMINI = False
+
+try:
+    from openrouter import OpenRouter
+    _HAS_OPENROUTER = True
+except ImportError:
+    _HAS_OPENROUTER = False
 
 try:
     from datasets import load_dataset
@@ -67,17 +72,24 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
-GEMINI_MODEL = "gemini-3.5-flash"
-THINKING_LEVEL = "MEDIUM"
 DEFAULT_OUTPUT = Path(__file__).parent.parent / "rollouts" / "mopd_v1.jsonl"
 
-# Pricing (per 1M tokens) — Gemini 3.5 Flash with thinking. THINKING
-# tokens are billed as output, which dominates cost: a math problem
-# with MEDIUM thinking generates 3K-5K thinking + 500-1K response
-# tokens, so output token cost is the binding constraint. £300 budget
-# ≈ $370 → ~10-15K rollouts (not 100K).
-PRICE_INPUT_PER_M = 1.50
-PRICE_OUTPUT_PER_M = 9.00
+# Teacher catalogue: each entry is (provider, model_id, price_in, price_out).
+# `:free` models on OpenRouter are $0 but rate-limited.
+TEACHERS = {
+    "gemini-3.5-flash": ("gemini", "gemini-3.5-flash", 1.50, 9.00),
+    "gemini-2.5-flash": ("gemini", "gemini-2.5-flash", 0.075, 0.30),
+    "nemotron-3-ultra-free": (
+        "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", 0.0, 0.0,
+    ),
+    "deepseek-v3.1": (
+        "openrouter", "deepseek/deepseek-chat-v3.1", 0.27, 1.10,
+    ),
+}
+
+# Default teacher — Nemotron 3 Ultra (free, reasoning-strong, separates
+# reasoning+content cleanly for our chat template).
+DEFAULT_TEACHER = "nemotron-3-ultra-free"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -223,13 +235,13 @@ def load_done_ids(output_path: Path) -> set[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Gemini call (sync — wrap in to_thread for asyncio concurrency)
+# Teacher dispatch — Gemini (thinking-streaming) + OpenRouter (chat)
 # ─────────────────────────────────────────────────────────────────────
-def call_gemini(client: "genai.Client", prompt: str) -> dict:
+def call_gemini(client, prompt: str, model_id: str) -> dict:
     """Single Gemini call. Returns dict with thinking/response/tokens."""
-    cfg = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(
-            thinking_level=THINKING_LEVEL,
+    cfg = gemini_types.GenerateContentConfig(
+        thinking_config=gemini_types.ThinkingConfig(
+            thinking_level="MEDIUM",
             include_thoughts=True,
         ),
         # NOTE: Google Search is intentionally DISABLED. Our student model
@@ -237,9 +249,9 @@ def call_gemini(client: "genai.Client", prompt: str) -> dict:
         # the student will hallucinate facts at inference time.
     )
     contents = [
-        types.Content(
+        gemini_types.Content(
             role="user",
-            parts=[types.Part.from_text(text=prompt)],
+            parts=[gemini_types.Part.from_text(text=prompt)],
         ),
     ]
 
@@ -248,7 +260,7 @@ def call_gemini(client: "genai.Client", prompt: str) -> dict:
     last_usage = None
 
     for chunk in client.models.generate_content_stream(
-        model=GEMINI_MODEL,
+        model=model_id,
         contents=contents,
         config=cfg,
     ):
@@ -281,17 +293,42 @@ def call_gemini(client: "genai.Client", prompt: str) -> dict:
     }
 
 
-async def call_gemini_async(client: "genai.Client", prompt: str,
-                            max_retries: int = 5) -> dict:
-    """Async wrapper with exponential backoff on transient errors."""
+def call_openrouter(client, prompt: str, model_id: str) -> dict:
+    """Single OpenRouter call. Reasoning models (Nemotron, DeepSeek-R1)
+    return separate `reasoning` + `content` fields on the message, which
+    map cleanly to nano-osrt's <|think|> / <|answer|> template."""
+    response = client.chat.send(
+        model=model_id,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    msg = response.choices[0].message
+    reasoning = getattr(msg, "reasoning", None) or ""
+    content = msg.content or ""
+    usage = response.usage
+    input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+    return {
+        "thinking": reasoning.strip(),
+        "response": content.strip(),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+async def call_teacher_async(
+    client, prompt: str, provider: str, model_id: str,
+    max_retries: int = 5,
+) -> dict:
+    """Provider-dispatching async wrapper with exponential backoff."""
+    fn = call_gemini if provider == "gemini" else call_openrouter
     for attempt in range(max_retries):
         try:
-            return await asyncio.to_thread(call_gemini, client, prompt)
+            return await asyncio.to_thread(fn, client, prompt, model_id)
         except Exception as e:
             msg = str(e).lower()
             # Retry on rate limits and 5xx; fail fast on auth / 4xx that
             # are not 429.
-            if "429" in msg or "rate" in msg or "503" in msg or "500" in msg:
+            if any(s in msg for s in ("429", "rate", "503", "500", "502", "timeout")):
                 wait = 2 ** attempt + random.random()
                 print(f"  [retry {attempt+1}/{max_retries} in {wait:.1f}s]: {e}",
                       flush=True)
@@ -304,20 +341,54 @@ async def call_gemini_async(client: "genai.Client", prompt: str,
 # ─────────────────────────────────────────────────────────────────────
 # Main collection loop
 # ─────────────────────────────────────────────────────────────────────
+def _build_client(teacher_key: str):
+    """Construct the per-provider client + return (client, provider,
+    model_id, price_in, price_out)."""
+    if teacher_key not in TEACHERS:
+        raise ValueError(
+            f"Unknown teacher '{teacher_key}'. "
+            f"Available: {list(TEACHERS.keys())}"
+        )
+    provider, model_id, price_in, price_out = TEACHERS[teacher_key]
+    if provider == "gemini":
+        if not _HAS_GEMINI:
+            raise ImportError("google-genai not installed. uv add google-genai")
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set in env / .env")
+        client = genai.Client(api_key=api_key)
+    elif provider == "openrouter":
+        if not _HAS_OPENROUTER:
+            raise ImportError("openrouter not installed. uv add openrouter")
+        api_key = (os.environ.get("OPEN_ROUTER_API_KEY")
+                   or os.environ.get("OPENROUTER_API_KEY"))
+        if not api_key:
+            raise RuntimeError(
+                "OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set"
+            )
+        client = OpenRouter(api_key=api_key)
+    else:
+        raise ValueError(f"Unknown provider '{provider}'")
+    return client, provider, model_id, price_in, price_out
+
+
 async def collect(args: argparse.Namespace) -> None:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("ERROR: GEMINI_API_KEY not set (check .env or env)",
-              file=sys.stderr)
+    try:
+        client, provider, model_id, price_in, price_out = _build_client(
+            args.teacher,
+        )
+    except (RuntimeError, ImportError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     done_ids = load_done_ids(output)
+    print(f"Teacher: {args.teacher} → {provider}:{model_id}")
+    print(f"Pricing (per 1M tok): input=${price_in}, output=${price_out}"
+          f"{' (FREE TIER — rate limited)' if price_in == 0 else ''}")
     print(f"Output: {output}")
     print(f"Resume: {len(done_ids)} rollouts already on disk\n", flush=True)
-
-    client = genai.Client(api_key=api_key)
 
     # Build the (rid, prompt) work queue, filtering already-done.
     queue: list[tuple[str, str, str]] = []  # (rid, source_key, prompt)
@@ -370,7 +441,9 @@ async def collect(args: argparse.Namespace) -> None:
                 return
             try:
                 t0 = time.time()
-                result = await call_gemini_async(client, prompt)
+                result = await call_teacher_async(
+                    client, prompt, provider, model_id,
+                )
                 rec = {
                     "id": rid,
                     "source": src_key,
@@ -381,14 +454,15 @@ async def collect(args: argparse.Namespace) -> None:
                     "elapsed_s": round(time.time() - t0, 2),
                     "input_tokens": result["input_tokens"],
                     "output_tokens": result["output_tokens"],
+                    "teacher": args.teacher,
                 }
                 await write_q.put(rec)
                 stats["done"] += 1
                 stats["input_toks"] += result["input_tokens"]
                 stats["output_toks"] += result["output_tokens"]
                 stats["cost_usd"] += (
-                    result["input_tokens"] * PRICE_INPUT_PER_M / 1e6
-                    + result["output_tokens"] * PRICE_OUTPUT_PER_M / 1e6
+                    result["input_tokens"] * price_in / 1e6
+                    + result["output_tokens"] * price_out / 1e6
                 )
                 # Hard stop on budget breach
                 if stats["cost_usd"] >= args.budget_usd:
@@ -432,15 +506,19 @@ async def collect(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT))
+    p.add_argument("--teacher", type=str, default=DEFAULT_TEACHER,
+                   choices=list(TEACHERS.keys()),
+                   help=f"Teacher model. Default: {DEFAULT_TEACHER} (free).")
     p.add_argument("--sources", nargs="+",
                    default=["math", "reasoning", "code", "chat", "science"],
                    help="Subset of: math, reasoning, code, chat, science")
     p.add_argument("--max-per-source", type=int, default=2_000,
                    help="Per-source rollout cap (default 2K = ~10K total)")
     p.add_argument("--concurrency", type=int, default=5,
-                   help="Max in-flight Gemini calls")
+                   help="Max in-flight teacher calls. Free OpenRouter "
+                        "models are heavily rate-limited — use 1-2.")
     p.add_argument("--budget-usd", type=float, default=300.0,
-                   help="Hard stop when accumulated cost reaches this many USD")
+                   help="Hard stop when accumulated cost reaches this USD")
     return p.parse_args()
 
 
