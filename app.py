@@ -2214,6 +2214,597 @@ def grpo():
         wandb.finish()
 
 
+# =============================================================================
+# GRPO_MULTI — multi-env GRPO from mopd_final.pt
+# =============================================================================
+# Same PPO-style loop as grpo() but with:
+#   - per micro-batch env sampling (math 60% / ifeval 30% / mbpp 10%)
+#   - env-aware prompt fetcher + ground-truth extractor
+#   - env-aware reward dispatcher (compose_template_rewards + per-env scorer)
+#   - per-env wandb keys (math_acc, ifeval_constraints_hit_rate, mbpp_pass_rate)
+#   - stop_token_ids during rollout for clean <|/answer|> halt
+#   - RewardEMA logging
+# Resumes from mopd_final.pt. See train_config.py::MultiEnvGRPOConfig.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def grpo_multi():
+    """Run multi-env GRPO from mopd_final.pt."""
+    _run_grpo_multi(sanity=False)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def grpo_multi_sanity():
+    """30-step multi-env GRPO sanity: validate env dispatch, rollout,
+    reward computation, KV-cached generation with stop tokens."""
+    _run_grpo_multi(sanity=True)
+
+
+def _run_grpo_multi(sanity: bool = False) -> None:
+    """Multi-env GRPO training loop.
+
+    Shared by grpo_multi (full) and grpo_multi_sanity (30-step smoke).
+    """
+    import copy
+    import math
+    import os
+    import random as _random
+    import time
+
+    import torch
+    import torch.nn.functional as F
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
+
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.hra import get_param_groups, inject_hra
+    from nano_osrt.model import NanoOSRTForCausalLM
+    from nano_osrt.rewards import (
+        RewardEMA,
+        compose_template_rewards,
+        compute_group_advantages,
+        ifeval_constraint_reward,
+        mbpp_test_reward,
+    )
+    from nano_osrt.train import apply_router_balance_updates, load_model_state_or_raise
+    from nano_osrt.train_config import MultiEnvGRPOConfig
+
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    cfg = MultiEnvGRPOConfig()
+    if sanity:
+        # Sanity overrides — small everything, no compile, no wandb
+        cfg.total_steps = 30
+        cfg.warmup_steps = 5
+        cfg.log_interval = 2
+        cfg.ckpt_interval = 999_999
+        cfg.wandb_log = False
+        cfg.grad_accum_steps = 2  # smaller for fast iteration
+        cfg.aux_loop_curriculum_steps = 0
+
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    print("=" * 60)
+    print(f"NanoOSRT — Multi-env GRPO {'(SANITY)' if sanity else ''}")
+    print("=" * 60)
+    print(f"  Envs: {dict(zip(cfg.env_names, cfg.env_weights))}")
+    print(f"  Resume: {cfg.pretrained_checkpoint}")
+    print(f"  Steps: {cfg.total_steps}, group_size: {cfg.group_size}, "
+          f"max_gen_len: {cfg.max_gen_len}, kl_coeff: {cfg.kl_coeff}")
+    print(f"  Stop token ids: {cfg.stop_token_ids}")
+
+    # Model with architecture-fix knobs
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok),
+        real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+    )
+    model = NanoOSRTForCausalLM(model_config).to(device)
+
+    hra_params = []
+    if cfg.hra_enabled:
+        print(f"Injecting HRA (rank={cfg.hra_rank})...")
+        hra_params = inject_hra(model, rank=cfg.hra_rank)
+
+    ckpt_path = cfg.pretrained_checkpoint
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"grpo_multi refuses to start: ckpt not found at {ckpt_path}. "
+            "Upload mopd_final.pt to the osrt-checkpoints volume first.",
+        )
+    print(f"Loading base weights from {ckpt_path}...")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    load_model_state_or_raise(
+        model, state_dict, context=f"grpo_multi load from {ckpt_path}",
+    )
+    print("  Clean load: all keys matched.")
+
+    # Frozen reference for KL anchor
+    print("Creating frozen reference model...")
+    ref_model = copy.deepcopy(model)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad = False
+
+    if not sanity:
+        print("Compiling policy model...")
+        model = torch.compile(model)
+    inner_for_gen = model._orig_mod if hasattr(model, "_orig_mod") else model
+    inner_for_gen.train(False)
+    ref_model.train(False)
+
+    # W&B
+    use_wandb = cfg.wandb_log and wandb is not None
+    if use_wandb:
+        wandb.init(
+            project=cfg.wandb_project,
+            name=cfg.wandb_run_name,
+            config={"stage": "grpo_multi"},
+        )
+
+    # Optimizer
+    if hra_params:
+        param_groups = get_param_groups(
+            model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay,
+        )
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=cfg.peak_lr,
+            weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # Per-env prompt streams. Each env yields (prompt_text, gt_blob).
+    # gt_blob is env-shaped: math = "#### N" string; ifeval = dict
+    # with instruction_id_list + kwargs; mbpp_code = list of asserts.
+    # We build one streaming iterator per env, then in the training
+    # loop we sample which env to draw from per micro-batch.
+    # ──────────────────────────────────────────────────────────────
+    print("Loading per-env prompt datasets...")
+    env_iters: dict[str, object] = {}
+    env_ds_factories: dict[str, callable] = {}
+
+    def _make_env_factory(env_name: str, ds_spec: dict):
+        load_kwargs = {"split": ds_spec["split"], "streaming": True}
+        if ds_spec.get("hf_config"):
+            load_kwargs["name"] = ds_spec["hf_config"]
+
+        def _build(seed: int):
+            ds = load_dataset(ds_spec["hf_id"], **load_kwargs)
+            try:
+                ds = ds.shuffle(buffer_size=1_000, seed=seed)
+            except Exception:
+                pass
+            return iter(ds)
+        return _build
+
+    for env_name in cfg.env_names:
+        ds_spec = cfg.env_datasets[env_name]
+        factory = _make_env_factory(env_name, ds_spec)
+        env_ds_factories[env_name] = factory
+        env_iters[env_name] = factory(seed=42)
+        print(f"  [{env_name}] loaded from {ds_spec['hf_id']} "
+              f"(split={ds_spec['split']})")
+
+    def _next_example(env_name: str):
+        """Get the next prompt + raw row from the env's iterator,
+        re-creating the iterator if exhausted."""
+        while True:
+            try:
+                return next(env_iters[env_name])
+            except StopIteration:
+                # Reshuffle with a different seed and continue
+                env_iters[env_name] = env_ds_factories[env_name](
+                    seed=42 + int(time.time()) % 100,
+                )
+
+    def _build_prompt_and_gt(env_name: str, ex: dict):
+        """Env-aware prompt construction + ground-truth extraction.
+        Returns (prompt_text, gt_blob) where gt_blob's shape depends
+        on the env (see reward dispatcher below)."""
+        ds_spec = cfg.env_datasets[env_name]
+        prompt_field = ds_spec["prompt_field"]
+        question = (ex.get(prompt_field) or "").strip()
+        prompt_text = f"{cfg.user_tag}{question}{cfg.assistant_tag}"
+
+        gt_format = ds_spec.get("ground_truth_format")
+        if gt_format == "gsm8k_hash":
+            gt = ex.get(ds_spec["gt_field"], "")
+        elif gt_format == "ifeval_constraints":
+            gt = {
+                "instruction_id_list": ex.get("instruction_id_list") or [],
+                "kwargs": ex.get("kwargs") or [],
+            }
+        elif gt_format == "mbpp_tests":
+            gt = ex.get(ds_spec["gt_field"]) or []
+        else:
+            gt = None
+        return prompt_text, gt
+
+    def _score_completion(
+        env_name: str, comp_text: str, gt: object,
+    ) -> tuple[float, dict]:
+        """Env-aware reward dispatcher. Returns (total_reward, breakdown).
+        All envs get compose_template_rewards (shared format signal);
+        ifeval/mbpp add their env-specific reward on top."""
+        if env_name == "math":
+            return compose_template_rewards(
+                comp_text, ground_truth_answer=gt,
+                think_open=cfg.think_open, think_close=cfg.think_close,
+                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                exact_format_reward=cfg.reward_exact_format,
+                approx_format_pos=cfg.reward_approx_format_pos,
+                approx_format_neg=cfg.reward_approx_format_neg,
+                answer_check=True,
+                number_check_reward=cfg.reward_number_match,
+                number_check_penalty=cfg.reward_number_miss,
+                strict_template_weight=cfg.reward_strict_template_weight,
+            )
+        if env_name == "ifeval":
+            total, bd = compose_template_rewards(
+                comp_text, ground_truth_answer=None,
+                think_open=cfg.think_open, think_close=cfg.think_close,
+                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                exact_format_reward=cfg.reward_exact_format,
+                approx_format_pos=cfg.reward_approx_format_pos,
+                approx_format_neg=cfg.reward_approx_format_neg,
+                answer_check=False,
+                strict_template_weight=cfg.reward_strict_template_weight,
+            )
+            ifeval_s, ifeval_bd = ifeval_constraint_reward(
+                comp_text,
+                instruction_id_list=gt["instruction_id_list"] if gt else None,
+                kwargs_list=gt["kwargs"] if gt else None,
+                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+            )
+            total += ifeval_s
+            bd["r_ifeval"] = ifeval_s
+            bd["ifeval_verdict"] = ifeval_bd.get("verdict", "")
+            bd["ifeval_hits"] = ifeval_bd.get("constraints_hit", 0)
+            bd["ifeval_misses"] = ifeval_bd.get("constraints_miss", 0)
+            bd["total_reward"] = total
+            return total, bd
+        if env_name == "mbpp_code":
+            total, bd = compose_template_rewards(
+                comp_text, ground_truth_answer=None,
+                think_open=cfg.think_open, think_close=cfg.think_close,
+                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                exact_format_reward=cfg.reward_exact_format,
+                approx_format_pos=cfg.reward_approx_format_pos,
+                approx_format_neg=cfg.reward_approx_format_neg,
+                answer_check=False,
+                strict_template_weight=cfg.reward_strict_template_weight,
+            )
+            # Sandboxed exec: minimal env (no secrets), tempdir cwd,
+            # process-group kill on timeout, absolute python path.
+            # Modal containers ARE the outer isolation layer; this
+            # in-process hardening is defence-in-depth. See
+            # rewards.py::mbpp_test_reward for the full safety model.
+            mbpp_s, mbpp_bd = mbpp_test_reward(
+                comp_text,
+                test_list=gt if isinstance(gt, list) else None,
+                answer_open=cfg.answer_open, answer_close=cfg.answer_close,
+                allow_unsafe_exec=True,  # explicit opt-in
+            )
+            total += mbpp_s
+            bd["r_mbpp"] = mbpp_s
+            bd["mbpp_verdict"] = mbpp_bd.get("verdict", "")
+            bd["total_reward"] = total
+            return total, bd
+        raise ValueError(f"Unknown env: {env_name}")
+
+    # Resume scan
+    ckpt_dir = "/vol/checkpoints/v5"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    import glob as _glob
+    best_step = -1
+    best_ckpt: str | None = None
+    for pattern in (
+        f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_step_*.pt",
+        f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_rescue_step_*.pt",
+    ):
+        for f in _glob.glob(pattern):
+            try:
+                s = int(f.rsplit("_", 1)[1].split(".")[0])
+            except (ValueError, IndexError):
+                continue
+            if s > best_step or (s == best_step and "rescue" in f):
+                best_step = s
+                best_ckpt = f
+    start_step = 0
+    if best_step > 0 and best_ckpt is not None:
+        print(f"Found {cfg.stage_prefix} checkpoint at step {best_step}: {best_ckpt}")
+        resume_ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+        load_model_state_or_raise(
+            inner, resume_ckpt["model_state_dict"],
+            context=f"grpo_multi resume from {best_ckpt}",
+        )
+        try:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        except Exception as e:
+            print(f"  Optimizer state mismatch, starting fresh: {e}")
+        start_step = resume_ckpt.get("step", best_step) + 1
+        print(f"  Resumed at step {start_step}")
+
+    # Reward EMA per env (signal-quality monitor)
+    ema_overall = RewardEMA(alpha=0.1, print_every_n_calls=cfg.log_interval)
+    ema_per_env = {n: RewardEMA(alpha=0.1) for n in cfg.env_names}
+
+    # Env sampler — weighted random, seeded so reruns are reproducible
+    env_rng = _random.Random(42 + start_step)
+
+    def _sample_env() -> str:
+        return env_rng.choices(cfg.env_names, weights=cfg.env_weights, k=1)[0]
+
+    start_time = time.time()
+    print(f"\nStarting training at step {start_step}...")
+
+    for step in range(start_step, cfg.total_steps):
+        # LR schedule (cosine with re-warm anchor)
+        anchor = getattr(cfg, "lr_anchor_step", 0)
+        eff_step = max(step - anchor, 0)
+        eff_total = max(cfg.total_steps - anchor, 1)
+        if eff_step < cfg.warmup_steps:
+            lr = cfg.peak_lr * eff_step / cfg.warmup_steps
+        else:
+            progress = (eff_step - cfg.warmup_steps) / max(
+                eff_total - cfg.warmup_steps, 1,
+            )
+            lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
+                1 + math.cos(math.pi * progress)
+            )
+        for pg in optimizer.param_groups:
+            if pg.get("group_name") == "hra":
+                pg["lr"] = lr * (cfg.hra_lr / cfg.peak_lr)
+            else:
+                pg["lr"] = lr
+
+        optimizer.zero_grad(set_to_none=True)
+        step_loss = 0.0
+        step_kl = 0.0
+        step_rewards: list[float] = []
+        step_env_rewards: dict[str, list[float]] = {n: [] for n in cfg.env_names}
+        step_env_counts: dict[str, int] = {n: 0 for n in cfg.env_names}
+
+        for _accum in range(cfg.grad_accum_steps):
+            env_name = _sample_env()
+            step_env_counts[env_name] += 1
+            ex = _next_example(env_name)
+            prompt_text, gt = _build_prompt_and_gt(env_name, ex)
+            prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
+            prompt_tensor = torch.tensor(
+                [prompt_ids], dtype=torch.long, device=device,
+            )
+            prompt_len = len(prompt_ids)
+
+            # Group rollout — KV-cached, batched, with stop tokens.
+            prompt_batch = prompt_tensor.expand(cfg.group_size, -1).contiguous()
+            with torch.no_grad():
+                generated_batch = inner_for_gen.generate(
+                    prompt_batch,
+                    max_new_tokens=cfg.max_gen_len,
+                    temperature=cfg.temperature,
+                    top_p=cfg.top_p,
+                    eos_token_id=tok.eos_token_id,
+                    stop_token_ids=list(cfg.stop_token_ids),
+                )
+
+            # Truncate at first EOS / stop token in completion region.
+            stop_set = {tok.eos_token_id, *cfg.stop_token_ids}
+            completions = []
+            for row in generated_batch:
+                comp_region = row[prompt_len:]
+                stop_hits = torch.tensor(
+                    [t.item() in stop_set for t in comp_region],
+                    device=row.device,
+                )
+                hit_pos = stop_hits.nonzero(as_tuple=False)
+                if hit_pos.numel() > 0:
+                    first = int(hit_pos[0].item())
+                    completions.append(row[: prompt_len + first + 1])
+                else:
+                    completions.append(row)
+
+            # Score each completion using env-aware reward dispatcher.
+            rewards: list[float] = []
+            for comp_ids in completions:
+                comp_text = tok.decode(
+                    comp_ids[prompt_len:].tolist(),
+                    skip_special_tokens=False,
+                )
+                r, bd = _score_completion(env_name, comp_text, gt)
+                rewards.append(r)
+                step_env_rewards[env_name].append(r)
+            step_rewards.extend(rewards)
+
+            advantages = compute_group_advantages(rewards)
+            for comp_ids, adv in zip(completions, advantages):
+                if abs(adv) < 1e-8:
+                    continue
+                comp_ids = comp_ids[:cfg.seq_len].to(device)
+                comp_len = len(comp_ids) - prompt_len
+                if comp_len <= 0:
+                    continue
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out = model(comp_ids.unsqueeze(0))
+                    logits = out.logits[
+                        0, :, :model_config.real_vocab_size,
+                    ].float()
+                shift_logits = logits[prompt_len - 1:-1]
+                shift_labels = comp_ids[prompt_len:]
+                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(
+                    1, shift_labels.unsqueeze(1),
+                ).squeeze(1)
+
+                with torch.no_grad():
+                    ref_out = ref_model(comp_ids.unsqueeze(0))
+                    ref_logits = ref_out.logits[
+                        0, :, :model_config.real_vocab_size,
+                    ].float()
+                ref_shift = ref_logits[prompt_len - 1:-1]
+                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(
+                    1, shift_labels.unsqueeze(1),
+                ).squeeze(1)
+
+                adv_t = torch.tensor(adv, device=device, dtype=torch.float32)
+                policy_loss = -(policy_lp * adv_t).mean()
+                log_ratio = ref_lp - policy_lp
+                approx_kl = (torch.exp(log_ratio) - log_ratio - 1).mean()
+                loss = (
+                    policy_loss + cfg.kl_coeff * approx_kl
+                ) / cfg.grad_accum_steps
+                loss.backward()
+                step_loss += loss.item()
+                step_kl += approx_kl.item()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        optimizer.step()
+        apply_router_balance_updates(model)
+
+        # Per-env EMA updates
+        for n, rs in step_env_rewards.items():
+            if rs:
+                ema_per_env[n].update(sum(rs) / len(rs))
+        mean_reward_step = (
+            sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
+        )
+        ema_overall.update(
+            mean_reward_step,
+            **{
+                f"env_{n}": step_env_counts[n] for n in cfg.env_names
+            },
+        )
+
+        # Logging
+        if step % cfg.log_interval == 0 or step == 0:
+            elapsed = time.time() - start_time
+            vram = torch.cuda.max_memory_allocated() / 1e9
+            torch.cuda.reset_peak_memory_stats()
+            n_rollouts = max(len(step_rewards), 1)
+            env_breakdown = "  ".join(
+                f"{n}={step_env_counts[n]}" for n in cfg.env_names
+            )
+            print(
+                f"step {step:>5d}/{cfg.total_steps} | "
+                f"loss {step_loss:.4f} | reward {mean_reward_step:+.3f} "
+                f"(ema {ema_overall.value:+.3f}) | "
+                f"kl {step_kl/n_rollouts:.4f} | lr {lr:.2e} | "
+                f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s",
+                flush=True,
+            )
+            print(
+                f"           envs: {env_breakdown}",
+                flush=True,
+            )
+            per_env_str = "  ".join(
+                f"{n}={ema_per_env[n].value:+.3f}"
+                if ema_per_env[n].value is not None else f"{n}=—"
+                for n in cfg.env_names
+            )
+            print(f"           ema_reward_per_env: {per_env_str}", flush=True)
+
+            if use_wandb:
+                log_dict = {
+                    "grpo_multi/loss": step_loss,
+                    "grpo_multi/mean_reward": mean_reward_step,
+                    "grpo_multi/ema_reward": ema_overall.value or 0.0,
+                    "grpo_multi/approx_kl": step_kl / n_rollouts,
+                    "grpo_multi/lr": lr,
+                    "grpo_multi/vram_gb": vram,
+                }
+                for n in cfg.env_names:
+                    log_dict[f"grpo_multi/env_{n}_count"] = step_env_counts[n]
+                    if ema_per_env[n].value is not None:
+                        log_dict[f"grpo_multi/env_{n}_ema_reward"] = (
+                            ema_per_env[n].value
+                        )
+                wandb.log(log_dict, step=step)
+
+        # Checkpoints
+        if step > 0 and step % cfg.ckpt_interval == 0:
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            ckpt_out = f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_step_{step}.pt"
+            torch.save({
+                "step": step,
+                "model_state_dict": inner.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            }, ckpt_out)
+            vol.commit()
+            print(f"  -> Checkpoint saved: {ckpt_out}", flush=True)
+
+        # 23h safety
+        if time.time() - start_time > 82_800:
+            inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+            rescue_path = (
+                f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_rescue_step_{step}.pt"
+            )
+            torch.save({
+                "step": step,
+                "model_state_dict": inner.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            }, rescue_path)
+            vol.commit()
+            print(f"\n23h boundary at step {step}. Rescue: {rescue_path}")
+            if use_wandb:
+                wandb.finish()
+            return
+
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    final_out = f"{ckpt_dir}/osrt_v5_{cfg.stage_prefix}_final.pt"
+    torch.save({
+        "model_state_dict": inner.state_dict(),
+        "training_stage": cfg.stage_prefix,
+    }, final_out)
+    vol.commit()
+    elapsed_h = (time.time() - start_time) / 3600
+    print(f"\n{cfg.stage_prefix} complete. {cfg.total_steps} steps in "
+          f"{elapsed_h:.1f}h. Final ckpt: {final_out}")
+    if use_wandb:
+        wandb.finish()
+
 
 # =============================================================================
 # ENTRYPOINT
@@ -2301,6 +2892,12 @@ def main(stage: str = "pretrain"):
     elif stage == "mopd_sanity":
         call = mopd_sanity.spawn()
         print(f"Spawned mopd_sanity as call: {call.object_id}")
+    elif stage == "grpo_multi":
+        call = grpo_multi.spawn()
+        print(f"Spawned grpo_multi as call: {call.object_id}")
+    elif stage == "grpo_multi_sanity":
+        call = grpo_multi_sanity.spawn()
+        print(f"Spawned grpo_multi_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

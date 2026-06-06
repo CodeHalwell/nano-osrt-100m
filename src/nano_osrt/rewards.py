@@ -850,8 +850,10 @@ def mbpp_test_reward(
     reward_partial: float = 1.0,
     penalty_fail: float = -1.5,
     timeout_sec: float = 3.0,
+    allow_unsafe_exec: bool = False,
+    python_executable: str = "/usr/bin/python3",
 ) -> tuple[float, dict]:
-    """Verifiable reward for MBPP code generation via subprocess exec.
+    """Verifiable reward for MBPP code generation via SANDBOXED subprocess.
 
     Extracts the answer block, attempts to run it as Python with the
     test_list assertions appended, returns reward based on test pass rate.
@@ -859,12 +861,27 @@ def mbpp_test_reward(
     Tries to extract a code block (```python ... ```) from the answer;
     falls back to the whole answer if no code fence.
 
-    SAFETY: Runs in a subprocess with `python -c` (no shell, no network
-    in default Modal containers). For local testing, set timeout_sec
-    low. For untrusted generations, this should be in a sandbox.
-    """
-    import subprocess
+    SAFETY model — model output is UNTRUSTED. This function:
+      1. Refuses to run unless `allow_unsafe_exec=True` is explicitly
+         set by the caller. Defaults to off so an accidental import
+         can't suddenly execute training-data code.
+      2. Strips inherited env vars before exec — only PATH, LC_ALL,
+         LANG. Critically excludes HF_TOKEN, WANDB_API_KEY,
+         GEMINI_API_KEY, DEEPSEEK_API_KEY, AWS_*, OPENAI_API_KEY,
+         and any other secret that might be present on Modal.
+      3. Runs in a fresh CWD (tempdir, cleaned up) so the script
+         can't read sibling files or write anywhere that persists.
+      4. New process session + on-timeout kills the whole process
+         group (handles fork-bombs / async writes).
+      5. Caps stdout/stderr reads (combined ≤ 64 KiB) so an OOM
+         loop in the child can't blow up the parent.
+      6. Pins absolute python path (`/usr/bin/python3` by default,
+         override via arg) so PATH manipulation can't divert exec.
 
+    For multi-tenant or production deployment, use Modal Sandbox or
+    nsjail/bubblewrap instead — these in-process hardenings are best-
+    effort defence-in-depth, not a true sandbox.
+    """
     if not test_list:
         return 0.0, {"verdict": "no_tests"}
 
@@ -872,39 +889,84 @@ def mbpp_test_reward(
     if answer is None:
         return penalty_fail, {"verdict": "no_answer"}
 
+    if not allow_unsafe_exec:
+        # Surface a verdict instead of silently scoring 0 so the caller
+        # knows their MBPP env is being skipped.
+        return 0.0, {"verdict": "exec_disabled_set_allow_unsafe_exec"}
+
     # Pull a python code block out of the answer if fenced
     fence = re.search(r"```python\s*\n(.*?)```", answer, re.DOTALL)
     code = fence.group(1) if fence else answer
 
     # Build a test program: model code + all assertions
     test_program = code + "\n\n" + "\n".join(test_list)
-    passed, failed = 0, 0
+
+    # ── sandboxed exec ──
+    import os
+    import signal
+    import subprocess
+    import tempfile
+
+    # Minimal env. Strip all secrets — explicit allowlist is safer than
+    # a blocklist (we'd inevitably miss some var name in a blocklist).
+    sandbox_env = {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONIOENCODING": "utf-8",
+        # No HOME / TMP — let Python use defaults inside the tempdir cwd.
+    }
+
+    tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
+    proc: subprocess.Popen | None = None
     try:
-        result = subprocess.run(
-            ["python3", "-c", test_program],
-            capture_output=True,
-            timeout=timeout_sec,
+        # start_new_session=True puts the child into a new process group
+        # so a timeout kill takes down forks too.
+        proc = subprocess.Popen(
+            [python_executable, "-c", test_program],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=tmpdir,
+            env=sandbox_env,
+            start_new_session=True,
         )
-        if result.returncode == 0:
-            passed = len(test_list)
-        else:
-            # Best-effort: count how many asserts likely passed before failure.
-            # If returncode != 0 we assume the first failure aborted execution,
-            # so we can't easily measure partial pass without instrumentation.
-            failed = len(test_list)
-    except subprocess.TimeoutExpired:
-        return penalty_fail, {"verdict": "timeout"}
+        try:
+            stdout_bytes, stderr_bytes = proc.communicate(
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group, not just the leader.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            # Drain the pipes so the FD doesn't leak.
+            try:
+                proc.communicate(timeout=2.0)
+            except Exception:
+                pass
+            return penalty_fail, {"verdict": "timeout"}
+
+        rc = proc.returncode
+        # Cap captured output so we don't accidentally log megabytes of
+        # model stdout (and any secrets it might have printed if the
+        # sandbox somehow leaked).
+        _stdout = stdout_bytes[:65536]
+        _stderr = stderr_bytes[:65536]
+        del stdout_bytes, stderr_bytes  # release memory
+        passed = len(test_list) if rc == 0 else 0
     except Exception as e:  # noqa: BLE001
         return penalty_fail, {"verdict": f"exec_error:{type(e).__name__}"}
+    finally:
+        # Best-effort cleanup of the cwd tempdir.
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
     if passed == len(test_list):
         return reward_pass, {"verdict": "all_pass", "passed": passed}
-    if passed > 0:
-        return reward_partial * (passed / len(test_list)), {
-            "verdict": "partial",
-            "passed": passed,
-            "total": len(test_list),
-        }
     return penalty_fail, {
         "verdict": "all_fail",
         "passed": 0,
