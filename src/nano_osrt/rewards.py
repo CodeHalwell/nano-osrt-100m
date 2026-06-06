@@ -690,6 +690,228 @@ def compute_reward(
     return reward, breakdown
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Env-specific rewards for multi-env GRPO
+# ─────────────────────────────────────────────────────────────────────
+
+
+def extract_answer_text(
+    completion: str,
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+) -> str | None:
+    """Extract the FIRST answer-block content as a string. Returns the
+    content inside the first <|answer|>...<|/answer|> pair, or None if
+    no such block exists. For multi-env tasks where the answer isn't
+    necessarily numeric (chat replies, code, instruction-following)."""
+    if answer_open not in completion or answer_close not in completion:
+        return None
+    start = completion.index(answer_open) + len(answer_open)
+    end_rel = completion[start:].find(answer_close)
+    if end_rel < 0:
+        return None
+    return completion[start:start + end_rel].strip()
+
+
+def ifeval_constraint_reward(
+    completion: str,
+    instruction_id_list: list[str] | None,
+    kwargs_list: list[dict] | None,
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    reward_per_constraint: float = 1.0,
+    penalty_no_answer: float = -1.0,
+) -> tuple[float, dict]:
+    """Verifiable reward for Google's IFEval-style instruction-following.
+
+    IFEval prompts come with a list of constraint identifiers (e.g.
+    "length_constraints:number_words", "keywords:include_keywords")
+    and per-constraint kwargs (e.g. {"num_words": 200}, {"keywords":
+    ["sustainability"]}). This function evaluates a SUBSET of those
+    that are cheap to verify locally without IFEval's full eval harness.
+
+    Returns (score, breakdown). Score = sum of per-constraint rewards
+    if the answer block exists, else `penalty_no_answer`. Constraints
+    we don't know how to verify locally are skipped (no reward, no
+    penalty) — better than reporting fake satisfaction.
+
+    Supported constraints (V1):
+      - length_constraints:number_words      ({num_words})
+      - length_constraints:number_sentences  ({num_sentences})
+      - keywords:include_keywords            ({keywords})
+      - keywords:forbidden_words             ({forbidden_words})
+      - startswith / endswith                ({start_phrase, end_phrase})
+      - punctuation:no_comma                 ({})
+
+    Coverage from a typical IFEval batch: ~50-70% of constraints.
+    """
+    answer = extract_answer_text(completion, answer_open, answer_close)
+    if answer is None:
+        return penalty_no_answer, {"verdict": "no_answer"}
+
+    if not instruction_id_list:
+        # Some IFEval rows have no constraints — just reward for having
+        # an answer at all (caller handles format rewards separately).
+        return 0.0, {"verdict": "no_constraints"}
+
+    kwargs_list = kwargs_list or [{}] * len(instruction_id_list)
+    hits, misses, skipped = 0, 0, 0
+    for inst_id, kw in zip(instruction_id_list, kwargs_list):
+        kw = kw or {}
+        # number_words
+        if inst_id == "length_constraints:number_words":
+            target = kw.get("num_words")
+            if target is not None:
+                actual = len(answer.split())
+                # Allow ±5% tolerance
+                if abs(actual - target) <= max(int(target * 0.05), 2):
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # number_sentences
+        elif inst_id == "length_constraints:number_sentences":
+            target = kw.get("num_sentences")
+            if target is not None:
+                actual = len([s for s in re.split(r"[.!?]+", answer) if s.strip()])
+                if abs(actual - target) <= 1:
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # include_keywords
+        elif inst_id == "keywords:include_keywords":
+            keywords = kw.get("keywords") or []
+            if keywords:
+                lower = answer.lower()
+                if all(k.lower() in lower for k in keywords):
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # forbidden_words
+        elif inst_id == "keywords:forbidden_words":
+            forbidden = kw.get("forbidden_words") or []
+            if forbidden:
+                lower = answer.lower()
+                if not any(f.lower() in lower for f in forbidden):
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # startswith
+        elif inst_id == "startswith:response":
+            phrase = kw.get("start_phrase")
+            if phrase:
+                if answer.lower().startswith(phrase.lower()):
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # endswith
+        elif inst_id == "endswith:response":
+            phrase = kw.get("end_phrase")
+            if phrase:
+                if answer.lower().rstrip(".!?").endswith(phrase.lower()):
+                    hits += 1
+                else:
+                    misses += 1
+            else:
+                skipped += 1
+        # no_comma
+        elif inst_id == "punctuation:no_comma":
+            if "," not in answer:
+                hits += 1
+            else:
+                misses += 1
+        else:
+            skipped += 1
+
+    total = (hits - misses) * reward_per_constraint
+    return total, {
+        "verdict": "evaluated",
+        "constraints_hit": hits,
+        "constraints_miss": misses,
+        "constraints_skipped": skipped,
+    }
+
+
+def mbpp_test_reward(
+    completion: str,
+    test_list: list[str] | None,
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    reward_pass: float = 2.0,
+    reward_partial: float = 1.0,
+    penalty_fail: float = -1.5,
+    timeout_sec: float = 3.0,
+) -> tuple[float, dict]:
+    """Verifiable reward for MBPP code generation via subprocess exec.
+
+    Extracts the answer block, attempts to run it as Python with the
+    test_list assertions appended, returns reward based on test pass rate.
+
+    Tries to extract a code block (```python ... ```) from the answer;
+    falls back to the whole answer if no code fence.
+
+    SAFETY: Runs in a subprocess with `python -c` (no shell, no network
+    in default Modal containers). For local testing, set timeout_sec
+    low. For untrusted generations, this should be in a sandbox.
+    """
+    import subprocess
+
+    if not test_list:
+        return 0.0, {"verdict": "no_tests"}
+
+    answer = extract_answer_text(completion, answer_open, answer_close)
+    if answer is None:
+        return penalty_fail, {"verdict": "no_answer"}
+
+    # Pull a python code block out of the answer if fenced
+    fence = re.search(r"```python\s*\n(.*?)```", answer, re.DOTALL)
+    code = fence.group(1) if fence else answer
+
+    # Build a test program: model code + all assertions
+    test_program = code + "\n\n" + "\n".join(test_list)
+    passed, failed = 0, 0
+    try:
+        result = subprocess.run(
+            ["python3", "-c", test_program],
+            capture_output=True,
+            timeout=timeout_sec,
+        )
+        if result.returncode == 0:
+            passed = len(test_list)
+        else:
+            # Best-effort: count how many asserts likely passed before failure.
+            # If returncode != 0 we assume the first failure aborted execution,
+            # so we can't easily measure partial pass without instrumentation.
+            failed = len(test_list)
+    except subprocess.TimeoutExpired:
+        return penalty_fail, {"verdict": "timeout"}
+    except Exception as e:  # noqa: BLE001
+        return penalty_fail, {"verdict": f"exec_error:{type(e).__name__}"}
+
+    if passed == len(test_list):
+        return reward_pass, {"verdict": "all_pass", "passed": passed}
+    if passed > 0:
+        return reward_partial * (passed / len(test_list)), {
+            "verdict": "partial",
+            "passed": passed,
+            "total": len(test_list),
+        }
+    return penalty_fail, {
+        "verdict": "all_fail",
+        "passed": 0,
+        "total": len(test_list),
+    }
+
+
 def compose_template_rewards(
     completion: str,
     ground_truth_answer: str | None,

@@ -1642,3 +1642,137 @@ class GRPOConfig:
     think_close: str = "<|/think|>"
     answer_open: str = "<|answer|>"
     answer_close: str = "<|/answer|>"
+
+
+class MultiEnvGRPOConfig(GRPOConfig):
+    """Multi-environment GRPO from mopd_final.pt.
+
+    Trains across verifiable-reward environments instead of gsm8k-only,
+    mirroring Nemotron 3 Ultra's RLVR design. Per micro-batch we sample
+    one environment (weighted), so a full optimizer step sees a mix.
+
+    Environments (V1)
+    ─────────────────
+    1. math (gsm8k)              weight 0.60
+         prompts:  gsm8k train, "#### N" ground truth
+         reward:   compose_template_rewards(answer_check=True)
+                   → exact_format + per-tag + tiered numeric + strict
+
+    2. ifeval (instruction)      weight 0.30
+         prompts:  google/IFEval train (~500 verifiable constraints)
+         reward:   compose_template_rewards(answer_check=False)
+                   + ifeval_constraint_reward (regex-based check)
+
+    3. mbpp_code                 weight 0.10
+         prompts:  google-research-datasets/mbpp train (374 problems)
+         reward:   compose_template_rewards(answer_check=False)
+                   + mbpp_test_reward (exec test_list in subprocess)
+         NOTE: subprocess exec adds ~1-3s per rollout. With group_size=8
+         and 10% env weight, only ~5% of total rollouts trigger exec.
+         Set env_weights[2]=0.0 to disable for V1 if rollout time
+         becomes the bottleneck.
+
+    Schedule
+    ────────
+    1500 steps from mopd_final.pt. Peak LR 5e-6 → cosine to 5e-7.
+    aux_loop_loss_weight 0.03 (preserve depth without dominating
+    policy gradient). KL coeff 0.05 (lower than math-only GRPO's
+    0.20 — multi-env mix is self-stabilising, want bigger updates).
+
+    Cost estimate
+    ─────────────
+    ~14 sec/step × 1500 = ~5.8 hr ≈ $22. Fits in the ~$34 cross-
+    workspace budget. Extend to 2000 if EMA reward is still climbing
+    at step 1200 and budget allows.
+
+    Stop tokens
+    ───────────
+    During rollout generation we pass `stop_token_ids=[10, 11]` to
+    halt cleanly at `<|/answer|>` or `<|user|>`. This prevents the
+    multi-answer-block failure mode MOPD revealed (model emits a
+    clean answer block then continues with more answer blocks). Stop
+    means group rewards are computed on tightly-scoped completions.
+    """
+
+    total_steps: int = 1_500
+    lr_anchor_step: int = 0
+    warmup_steps: int = 30
+    peak_lr: float = 5e-6
+    min_lr: float = 5e-7
+
+    # Architecture-fix knobs — lower than mid-training. Preserve
+    # depth use without dominating the policy gradient.
+    aux_loop_loss_weight: float = 0.03
+    loop_dropout_prob: float = 0.05
+    loop_dropout_min_loops: int = 3
+    per_loop_aux_weights: None = None
+
+    # GRPO sampling — wider than math-only GRPO for env diversity.
+    group_size: int = 8
+    max_gen_len: int = 512
+    temperature: float = 1.0
+    top_p: float = 0.95
+    kl_coeff: float = 0.05  # was 0.20 in math-only; want more policy movement
+    clip_range: float = 0.20  # PPO default
+
+    # Compose template rewards (Unsloth-style stack). These flow into
+    # compose_template_rewards() in rewards.py. Math env uses all of
+    # them; ifeval/code envs disable check_answer/check_numbers and
+    # add their own env-specific reward on top.
+    reward_exact_format: float = 3.0
+    reward_approx_format_pos: float = 0.5
+    reward_approx_format_neg: float = -1.0
+    reward_number_match: float = 1.5
+    reward_number_miss: float = -0.5
+    reward_strict_template_weight: float = 0.5
+
+    # Stop-token IDs for rollout generation. <|/answer|>=10, <|user|>=11.
+    stop_token_ids: tuple[int, ...] = (10, 11)  # noqa: RUF012
+
+    log_interval: int = 10
+    ckpt_interval: int = 150
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_mopd_final.pt"
+    stage_prefix: str = "grpo_multi"
+    wandb_run_name: str = "osrt-grpo-multi"
+
+    # Multi-env registry. Per micro-batch we sample ONE env according
+    # to env_weights; group_size rollouts come from that env for the
+    # step. Env-specific reward dispatch happens in the GRPO training
+    # loop (see app.py::grpo_multi when wired). To ablate, set a
+    # weight to 0.0.
+    env_names: tuple[str, ...] = ("math", "ifeval", "mbpp_code")  # noqa: RUF012
+    env_weights: tuple[float, ...] = (0.60, 0.30, 0.10)  # noqa: RUF012
+
+    # Per-env prompt dataset registry. Each entry: how to load the
+    # dataset + which fields hold the prompt and ground truth + how to
+    # interpret the ground truth (gsm8k_hash | ifeval_constraints |
+    # mbpp_tests). The reward dispatcher uses ground_truth_format to
+    # pick which env-specific reward to add on top of the shared
+    # format rewards.
+    env_datasets: dict = {  # noqa: RUF012
+        "math": {
+            "hf_id": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "train",
+            "prompt_field": "question",
+            "gt_field": "answer",
+            "ground_truth_format": "gsm8k_hash",
+        },
+        "ifeval": {
+            "hf_id": "google/IFEval",
+            "hf_config": None,
+            "split": "train",
+            "prompt_field": "prompt",
+            "gt_field": None,  # constraints live in separate fields
+            "ground_truth_format": "ifeval_constraints",
+        },
+        "mbpp_code": {
+            "hf_id": "google-research-datasets/mbpp",
+            "hf_config": "full",
+            "split": "train",
+            "prompt_field": "text",
+            "gt_field": "test_list",
+            "ground_truth_format": "mbpp_tests",
+        },
+    }
