@@ -579,6 +579,135 @@ def loop_fix_v2_sanity():
     run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
 
 
+# =============================================================================
+# PRETRAIN_EXTEND3 — first mid-training round with WORKING recursive depth
+# =============================================================================
+# All prior training (~30k+ steps) happened with the loop-collapsed
+# architecture. extend2's 9-stream mix was absorbed at only ~6 effective
+# layers of depth. With loop_fix + v2 done, the model can now actually use
+# all 18 effective layers — so re-running on the same data mix lets it
+# encode information it couldn't before. v2 already showed this happening
+# (task CE dropped 1.80 → 1.54 in 300 steps with fix on, on data the model
+# had seen 8100 steps of before).
+# See train_config.py::PretrainExtend3Config for the full design.
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def pretrain_extend3():
+    """Third mid-training pass — first run with the architecture fix
+    permanently in the loss path. Same 9-stream extend2 mix, softer
+    fix knobs (aux=0.05, dropout=0.10), lower LR (peak 3e-6), 3000
+    steps from loopfixv2_merged.pt."""
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import PretrainExtend3Config
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    cfg = PretrainExtend3Config()
+    cfg.phases["extend"]["end"] = cfg.total_steps
+    cfg.phases["extend"]["batch_size"] = 4
+    cfg.phases["extend"]["grad_accum_steps"] = 16
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+    )
+    print(
+        f"pretrain_extend3: {cfg.total_steps} steps, peak_lr={cfg.peak_lr}, "
+        f"aux_loop_loss_weight={cfg.aux_loop_loss_weight} "
+        f"(curriculum {cfg.aux_loop_weight_start}→{cfg.aux_loop_loss_weight} "
+        f"over {cfg.aux_loop_curriculum_steps} steps), "
+        f"loop_dropout_prob={cfg.loop_dropout_prob}, "
+        f"per_loop_weights=uniform."
+    )
+    print(f"Resume base: {cfg.pretrained_checkpoint}")
+
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def pretrain_extend3_sanity():
+    """50-step sanity for pretrain_extend3."""
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import PretrainExtend3Config
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    class SanityCfg(PretrainExtend3Config):
+        total_steps = 50
+        lr_anchor_step = 0
+        warmup_steps = 10
+        log_interval = 5
+        ckpt_interval = 999_999
+        eval_interval = 999_999
+        wandb_log = False
+        compile_enabled = False
+        # Shorter curriculum to exercise the ramp within 50 steps.
+        aux_loop_curriculum_steps = 30
+
+    cfg = SanityCfg()
+    cfg.phases["extend"]["end"] = 50
+    cfg.phases["extend"]["batch_size"] = 4
+    cfg.phases["extend"]["grad_accum_steps"] = 16
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+    )
+    print(
+        f"pretrain_extend3 SANITY: 50 steps, peak_lr={cfg.peak_lr}, "
+        f"aux={cfg.aux_loop_loss_weight}, dropout={cfg.loop_dropout_prob}."
+    )
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
 @app.function(
     gpu="H100",
     image=image,
@@ -2004,6 +2133,12 @@ def main(stage: str = "pretrain"):
     elif stage == "loop_fix_v2_sanity":
         call = loop_fix_v2_sanity.spawn()
         print(f"Spawned loop_fix_v2_sanity as call: {call.object_id}")
+    elif stage == "pretrain_extend3":
+        call = pretrain_extend3.spawn()
+        print(f"Spawned pretrain_extend3 as call: {call.object_id}")
+    elif stage == "pretrain_extend3_sanity":
+        call = pretrain_extend3_sanity.spawn()
+        print(f"Spawned pretrain_extend3_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

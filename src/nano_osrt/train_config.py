@@ -828,6 +828,71 @@ class LoopFixV2Config(LoopFixConfig):
     wandb_run_name: str = "osrt-loopfixv2"
 
 
+class PretrainExtend3Config(PretrainExtend2Config):
+    """Third mid-training pass — first run with WORKING recursive depth.
+
+    Motivation
+    ──────────
+    All prior pretrain/SFT/GRPO/extend1/extend2 (~30k+ steps) ran with
+    a depth-collapsed model effectively using ~6 layers instead of 18
+    (probe_recursion 2026-06-05). loop_fix + loop_fix_v2 fixed the
+    architecture. The first 300 steps of v2 already showed the
+    capability ceiling rising — task CE dropped 1.80 → 1.54 in 300
+    steps with the fix on, on the same extend2 data the model had
+    seen 8100 steps of. That's not polishing, that's the model
+    finally absorbing data it couldn't encode at shallow effective
+    depth.
+
+    This stage exploits that: more mid-training on the proven 9-stream
+    mix, with the architectural fix permanently in the loss path, so
+    the model can actually use all 18 effective layers to absorb the
+    data. Expected: another 0.2-0.5 CE drop + meaningful capability
+    gain on multi-step tasks (where depth matters most).
+
+    Schedule
+    ────────
+    Fresh stage_prefix → fresh step counter. 3000 steps at peak_lr
+    3e-6 (lower than v2's 5e-6 because we're past the rewiring
+    phase and refining capacity). Cosine warmup 60 → 3e-6 → cool to
+    3e-7 by step 3000. Cost ~$18.
+
+    Fix knobs
+    ─────────
+    - aux_loop_loss_weight = 0.05 (half of v2's 0.10 — model has
+      already learned to use depth, we just need to keep the signal)
+    - loop_dropout_prob = 0.10 (half of v2's 0.20 — same reasoning)
+    - per_loop_aux_weights uniform (None — the bias toward early loops
+      was a one-time correction; loops are now balanced)
+    - aux_loop_curriculum_steps = 100 (short ramp to avoid initial
+      shock from changing aux weight)
+    - aux_loop_weight_start = 0.02
+    """
+
+    total_steps: int = 3_000
+    lr_anchor_step: int = 0
+    warmup_steps: int = 60
+    peak_lr: float = 3e-6
+    min_lr: float = 3e-7
+
+    # Fix knobs — softer than v2 since the architecture is already
+    # rewired. We're keeping the gradient signal flowing to prevent
+    # regression to the collapsed state, not driving major change.
+    aux_loop_loss_weight: float = 0.05
+    loop_dropout_prob: float = 0.10
+    loop_dropout_min_loops: int = 3
+    per_loop_aux_weights: None = None  # uniform
+    aux_loop_curriculum_steps: int = 100
+    aux_loop_weight_start: float = 0.02
+
+    log_interval: int = 50
+    ckpt_interval: int = 300
+
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_loopfixv2_merged.pt"
+    stage_prefix: str = "extend3"
+    wandb_run_name: str = "osrt-extend3"
+    wandb_run_id: str = ""
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 
