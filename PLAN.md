@@ -37,18 +37,20 @@ and probe results captured at the bottom of each stage block.
 extend3_final.pt
    ↓ stage 1: probe + merge        (free)
 extend3_merged.pt
-   ↓ stage 2: MOPD distillation   ($5-7 Modal)
+   ↓ stage 2: MOPD distillation   (~$5-7 Modal)
 mopd_final.pt
-   ↓ stage 3: multi-env GRPO      ($25 Modal — needs top-up)
-grpo_final.pt
-   ↓ stage 4: rejection-sample SFT polish  (optional, $5-10)
+   ↓ stage 3: multi-env GRPO      (~$30 Modal, 300 steps)
+grpo_multi_final.pt
+   ↓ stage 4: rejection-sample SFT polish  (optional, ~$5-10)
 polished_final.pt
-   ↓ stage 5: vision retrofit + multimodal SFT  ($120-160 Modal)
+   ↓ stage 5: vision retrofit + multimodal SFT  (~$120-160 Modal)
 multimodal_final.pt
-   ↓ stage 6: full eval suite     ($10-20 Modal)
+   ↓ stage 6: tool_use GRPO       (optional, ~$10-20 Modal)
+tool_use_final.pt
+   ↓ stage 7: full eval suite     (~$10-20 Modal)
 ```
 
-Total Modal: $165-225 (Gemini API: $30-50).
+Total Modal: $180-247 (API: ~$108 already spent on rollouts).
 
 ---
 
@@ -279,7 +281,68 @@ _TBD_
 
 ---
 
-## Stage 6 — Full eval suite
+## Stage 6 — Tool-use GRPO (optional)
+
+**Status:** ⏳ pending (post-vision optional)
+**Cost estimate:** ~$10-20 Modal · ~2 hr
+**Motivation**
+
+Multi-digit arithmetic (e.g. 17×23) is exactly the failure class a calculator tool removes. Rather than try to force a 363M model to memorise multiplication tables — which fights against its architectural strengths — give it tools.
+
+This also closes the gap on date math, large-number division, and any other "calculator-shaped" failures that would otherwise drag eval scores down.
+
+### Design
+
+New GRPO env added to `MultiEnvGRPOConfig` (or a fresh `ToolUseGRPOConfig`):
+
+**Format addition** — new chat tags:
+```
+<|tool_call|>calculator(expression)<|/tool_call|>
+<|tool_result|>result<|/tool_result|>
+<|answer|>final answer<|/answer|>
+```
+
+**Rollout flow:**
+1. Model generates up to first `<|tool_call|>` (stop token)
+2. Trainer parses the expression, executes via sandboxed eval (numexpr or our existing hardened subprocess pattern)
+3. Trainer appends `<|tool_result|>...<|/tool_result|>` to the prompt
+4. Model continues generation with the result available
+5. Final `<|answer|>` is what gets reward-scored
+
+**Reward components:**
+- `tool_call_format`: +1 if call is well-formed (parseable expression)
+- `tool_call_useful`: +1 if the tool's result actually appears in the final answer
+- `tool_call_unneeded`: -0.5 if model called tool on trivial arithmetic (e.g. 1+1)
+- All existing rewards (format, correctness, etc.) still apply
+- `check_answer_score`: the verified-correct reward, now ground-truth match expects the answer the model produced WITH tool help
+
+**Datasets:**
+- gsm8k subset where arithmetic dominates (~500 problems)
+- A small synthetic set of "multi-digit arithmetic in context" (cheap to generate via Gemini)
+- MATH-500 subset (harder arithmetic)
+
+### Actions
+- [ ] Add `<|tool_call|>` / `<|/tool_call|>` / `<|tool_result|>` / `<|/tool_result|>` token IDs to tokenizer (or repurpose unused IDs)
+- [ ] Build `tool_executor()` — sandboxed numexpr eval with float/int normalisation, blocks names/imports
+- [ ] Build `tool_use_grpo_env` — multi-turn rollout with tool injection
+- [ ] Add `tool_call_*` reward components in `rewards.py`
+- [ ] Train ~200-400 steps from previous final ckpt
+- [ ] Eval on gsm8k + MATH-500 with tool-call enabled
+
+### Success criteria
+- 17×23 / 23+14 / multi-step arithmetic correct ≥ 90% (tool-assisted)
+- Non-arithmetic capabilities don't regress
+- Model learns NOT to call tool unnecessarily (low false-positive tool calls on easy problems)
+
+### Results
+_TBD_
+
+### Defer rationale
+Worth doing AFTER eval if and only if eval shows arithmetic-shaped failures dominating the gsm8k miss rate. If post-GRPO/post-vision the model is already at ~50%+ gsm8k via reasoning alone, tool use is a polish. If it's stuck at ~20-30% on arithmetic-heavy problems, tool use unlocks a big jump.
+
+---
+
+## Stage 7 — Full eval suite
 
 **Status:** ⏳ pending (final stage)
 **Cost estimate:** ~$10-20 Modal · ~1-2 hr
@@ -327,6 +390,11 @@ _TBD_
 ### After stage 5 (vision)
 - If text regressed > 0.2 CE → reduce vision training, retry with smaller projector
 - If vision capability emerged → write up, demo
+
+### Should we do stage 6 (tool_use)?
+- If post-vision eval shows arithmetic-heavy gsm8k miss rate (e.g. multi-digit, large-number) → YES, tool_use unlocks the biggest jump
+- If miss rate is dominated by reasoning/instruction failures → SKIP, tool_use won't fix those
+- If eval is already at target (gsm8k ≥ 50%) → tool_use is gravy, do only if budget remains
 
 ---
 
