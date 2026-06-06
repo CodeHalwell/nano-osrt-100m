@@ -66,6 +66,12 @@ except ImportError:
     _HAS_OPENROUTER = False
 
 try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
+try:
     from datasets import load_dataset
 except ImportError:
     print("ERROR: datasets not installed. Run: uv add datasets",
@@ -82,8 +88,17 @@ TEACHERS = {
     "nemotron-3-ultra-free": (
         "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", 0.0, 0.0,
     ),
-    "deepseek-v3.1": (
+    "deepseek-or-v3.1": (
         "openrouter", "deepseek/deepseek-chat-v3.1", 0.27, 1.10,
+    ),
+    # Direct DeepSeek API (api.deepseek.com via openai-compat). Much
+    # higher concurrency limit than OpenRouter (2500 vs ~16). v4-flash
+    # is the cheapest reasoning teacher available — $0.14/$0.28 per 1M.
+    "deepseek-v4-flash": (
+        "deepseek", "deepseek-v4-flash", 0.14, 0.28,
+    ),
+    "deepseek-v4-pro": (
+        "deepseek", "deepseek-v4-pro", 0.435, 0.87,
     ),
 }
 
@@ -315,12 +330,43 @@ def call_openrouter(client, prompt: str, model_id: str) -> dict:
     }
 
 
+def call_deepseek(client, prompt: str, model_id: str) -> dict:
+    """Direct DeepSeek API call via openai-compat SDK with thinking
+    enabled. Returns reasoning_content + content separately, mapping
+    cleanly to nano-osrt's <|think|>/<|answer|> template."""
+    response = client.chat.completions.create(
+        model=model_id,
+        messages=[{"role": "user", "content": prompt}],
+        reasoning_effort="high",
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+    msg = response.choices[0].message
+    reasoning = getattr(msg, "reasoning_content", None) or ""
+    content = msg.content or ""
+    usage = response.usage
+    input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+    return {
+        "thinking": reasoning.strip(),
+        "response": content.strip(),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+_PROVIDER_FNS = {
+    "gemini": call_gemini,
+    "openrouter": call_openrouter,
+    "deepseek": call_deepseek,
+}
+
+
 async def call_teacher_async(
     client, prompt: str, provider: str, model_id: str,
     max_retries: int = 5,
 ) -> dict:
     """Provider-dispatching async wrapper with exponential backoff."""
-    fn = call_gemini if provider == "gemini" else call_openrouter
+    fn = _PROVIDER_FNS[provider]
     for attempt in range(max_retries):
         try:
             return await asyncio.to_thread(fn, client, prompt, model_id)
@@ -367,6 +413,13 @@ def _build_client(teacher_key: str):
                 "OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set"
             )
         client = OpenRouter(api_key=api_key)
+    elif provider == "deepseek":
+        if not _HAS_OPENAI:
+            raise ImportError("openai not installed. uv add openai")
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY not set in env / .env")
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     else:
         raise ValueError(f"Unknown provider '{provider}'")
     return client, provider, model_id, price_in, price_out
