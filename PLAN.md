@@ -138,11 +138,25 @@ Total API spend: ~$108 (Gemini $103 + DeepSeek $4.29).
 
 **Sanity (30 steps):** task 2.21 → 1.37 in 30 steps, rollout loader confirmed, format alignment trajectory established.
 
-**Full run trajectory (in progress):**
-- Step 0: task 2.38 (model first sees diverse rollouts)
-- Step 100: task 1.79 (-0.59)
-- Step 200: task 1.79 (steady)
-- _Full results when complete_
+**Full run trajectory (complete, 1.6 hr, 1000 steps):**
+- step 0: 2.38 → step 100: 1.79 → step 200: 1.79 → step 300: 1.35
+- step 400: 1.40 → step 500: 0.85 → step 600: 0.76 → step 700: 0.39
+- step 800: 0.37 → step 900: 0.15 → final saved
+
+**Post-MOPD probe (held-out CE, lower=better):**
+
+| n_loops | extend3_merged | mopd_final | Δ |
+|---|---|---|---|
+| 1 | 4.02 | 3.63 | -0.39 |
+| 2 | 3.69 | 3.32 | -0.37 |
+| 3 | 3.61 | 3.15 | -0.46 |
+| 4 | 3.61 | 3.09 | -0.52 |
+| 5 | 3.63 | 3.08 | -0.55 |
+| 6 | 3.56 | **3.00** | **-0.56** |
+
+**Post-MOPD inference test:** 3/6 (50%) — up from 2/6 (33%). FIRST `<|answer|>` tag appeared. Janet eggs word problem now correct. Multi-digit arithmetic (17×23) still failing — that's a GRPO target.
+
+**Verdict:** MOPD delivered without memorization collapse. Format alignment underway. Depth utilization preserved. Canonical: `mopd_final.pt`.
 
 ---
 
