@@ -1247,6 +1247,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         top_p: float = 1.0,
         top_k: int = 0,
         eos_token_id: int | None = None,
+        stop_token_ids: list[int] | None = None,
         repetition_penalty: float = 1.0,
         **kwargs,
     ) -> Tensor:
@@ -1385,13 +1386,24 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
 
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Per-row EOS termination. A row is finished once it has
-            # EVER emitted EOS — we track that in `finished` and break
-            # only when every row has finished at some point, not only
-            # when all rows happen to emit EOS on the same step.
+            # Per-row termination. A row is finished once it has EVER
+            # emitted EOS or any stop_token_id — we track that in
+            # `finished` and break only when every row has finished at
+            # some point, not only when all rows happen to emit a stop
+            # token on the same step.
+            #
+            # stop_token_ids lets callers stop on chat-template markers
+            # like <|/answer|> (token 10) or <|user|> (token 11). Useful
+            # because MOPD-distilled models often generate additional
+            # answer blocks after the first one or try to start a new
+            # user turn — stopping on those keeps inference output clean.
+            nt = next_token.squeeze(-1)
             if eos_token_id is not None:
-                finished = finished | (next_token.squeeze(-1) == eos_token_id)
-                if bool(finished.all()):
-                    break
+                finished = finished | (nt == eos_token_id)
+            if stop_token_ids:
+                for sid in stop_token_ids:
+                    finished = finished | (nt == sid)
+            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
+                break
 
         return generated

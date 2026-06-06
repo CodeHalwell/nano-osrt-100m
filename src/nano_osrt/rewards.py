@@ -90,6 +90,313 @@ def check_format(
     return think_open in text and think_close in text
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Composable reward functions (Unsloth-pattern)
+# Each takes a single completion string + optional ground truth and
+# returns a scalar score. Designed to be summed by a GRPO loop, mirror-
+# ing TRL's `reward_funcs=[fn1, fn2, ...]` pattern. Each function is
+# also exposed independently so we can ablate which signals help.
+# ─────────────────────────────────────────────────────────────────────
+
+def _format_regex(
+    think_open: str,
+    think_close: str,
+    answer_open: str,
+    answer_close: str,
+) -> "re.Pattern":
+    """Compile the exact-format regex for a chat template.
+
+    Matches: think_open ... think_close (...) answer_open (CAPTURE) answer_close
+    Returns the answer content in group(1).
+    """
+    return re.compile(
+        re.escape(think_open) + r".*?"
+        + re.escape(think_close) + r"\s*"
+        + re.escape(answer_open) + r"(.+?)"
+        + re.escape(answer_close) + r"\s*$",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def match_format_exactly_score(
+    text: str,
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    reward: float = 3.0,
+) -> float:
+    """Big binary reward (+`reward`) when the completion matches the
+    full expected template exactly (think then answer, answer-close at
+    end). Mirrors Unsloth's `match_format_exactly`."""
+    pat = _format_regex(think_open, think_close, answer_open, answer_close)
+    return reward if pat.search(text) is not None else 0.0
+
+
+def match_format_approximately_score(
+    text: str,
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    per_tag_pos: float = 0.5,
+    per_tag_neg: float = -1.0,
+) -> tuple[float, dict]:
+    """Per-tag count-based signal: +per_tag_pos if a tag appears EXACTLY
+    once, per_tag_neg otherwise. Sum across the 4 chat tags gives a
+    fine-grained gradient even when the strict regex doesn't match.
+    Mirrors Unsloth's `match_format_approximately`.
+
+    Note the asymmetric default: positive 0.5 vs negative 1.0 — the
+    penalty is intentionally stronger so the model can't game the
+    reward by emitting two of every tag.
+    """
+    score = 0.0
+    breakdown: dict[str, int] = {}
+    for tag_name, tag in [
+        ("think_open", think_open),
+        ("think_close", think_close),
+        ("answer_open", answer_open),
+        ("answer_close", answer_close),
+    ]:
+        count = text.count(tag)
+        breakdown[tag_name] = count
+        score += per_tag_pos if count == 1 else per_tag_neg
+    return score, breakdown
+
+
+def check_answer_score(
+    text: str,
+    ground_truth: str | None,
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+) -> tuple[float, str]:
+    """Tiered correctness reward using the format-aware extractor.
+    Matches Unsloth's `check_answer` tier schedule but adapted to our
+    tags. Returns (score, tier_label).
+
+        exact string             +3.0
+        whitespace-stripped      +1.5
+        within  5 % (ratio)      +1.0
+        within 20 % (ratio)      +0.5
+        wrong / unparseable      -1.5
+        no extract (no answer)   -0.0  (penalty handled by match_format)
+
+    Why a separate function from `correctness_partial_credit`?
+    The Unsloth schedule has TIGHTER positive rewards (max 3.0 vs 5.0)
+    which composes better with multi-component reward stacks — keeps
+    the math signal from drowning out the format signal.
+    """
+    # Use the format-aware numeric extractor regardless of regex match
+    # — it pulls the LAST number from inside the answer tag and handles
+    # both exact-format and looser cases (multi-answer block, missing
+    # think). The format-strictness signal is captured by the separate
+    # `match_format_*` rewards, so we don't double-penalise here.
+    guess = extract_numeric_answer(
+        text, think_close=think_close,
+        answer_open=answer_open, answer_close=answer_close,
+    )
+
+    if guess is None or guess == "":
+        return 0.0, "no_extract"
+    if ground_truth is None or ground_truth == "":
+        return 0.0, "no_ground_truth"
+
+    gt = ground_truth.strip()
+    if guess == gt:
+        return 3.0, "exact"
+    if guess.strip() == gt.strip():
+        return 1.5, "stripped"
+
+    try:
+        gv = float(gt.replace(",", ""))
+        pv = float(guess.replace(",", ""))
+    except (ValueError, TypeError):
+        return -1.5, "non_numeric_wrong"
+
+    if gv == 0:
+        return (3.0, "exact_numeric") if pv == 0 else (-1.5, "zero_gt_wrong")
+
+    ratio = pv / gv
+    if 0.95 <= ratio <= 1.05:
+        return 1.0, "within_5pct"
+    if 0.80 <= ratio <= 1.20:
+        return 0.5, "within_20pct"
+    return -1.5, "wrong"
+
+
+def check_numbers_score(
+    text: str,
+    ground_truth: str | None,
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    reward_match: float = 1.5,
+    penalty_wrong: float = -0.5,
+) -> tuple[float, str]:
+    """Strict float-equality double-check on the LAST number inside the
+    answer block. Mirrors Unsloth's `check_numbers` — a second,
+    smaller reward that fires only on exact numeric match. Useful
+    composed alongside `check_answer_score` so the model gets a clean
+    binary "you got the number right" gradient in addition to the
+    tiered match score."""
+    if ground_truth is None:
+        return 0.0, "no_ground_truth"
+    guess = extract_numeric_answer(
+        text, think_close="</think>",  # fallback, doesn't matter here
+        answer_open=answer_open, answer_close=answer_close,
+    )
+    if guess is None:
+        return 0.0, "no_number"
+    try:
+        gv = float(ground_truth.replace(",", "").strip())
+        pv = float(guess.replace(",", "").strip())
+    except (ValueError, TypeError):
+        return 0.0, "non_numeric"
+    return (reward_match, "match") if gv == pv else (penalty_wrong, "miss")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# EMA reward tracker — process-global, throttled diagnostic logging.
+# Mirrors Unsloth's `_EMA_REWARD` + PRINT_EVERY_STEPS pattern.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class RewardEMA:
+    """Track exponentially-smoothed mean reward across GRPO steps.
+
+    Cheap signal-quality metric — drift in the EMA tells you if GRPO
+    is actually learning vs single-batch noise. Updates per-batch with
+    `update(mean_reward)`, reports current state with `state()`.
+
+    Optionally throttles a `print_fn` call so the per-step log isn't
+    flooded — by default emits every PRINT_EVERY_N_CALLS update.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        print_every_n_calls: int = 0,
+        print_fn=print,
+    ) -> None:
+        self.alpha = alpha
+        self.value: float | None = None
+        self.n_calls: int = 0
+        self.print_every_n_calls = print_every_n_calls
+        self.print_fn = print_fn
+
+    def update(self, batch_mean: float, **extras) -> float:
+        """Update EMA with this batch's mean reward. Returns new EMA.
+        extras (e.g. `exact_hits=2, parse_fails=1`) get included in the
+        throttled diagnostic print."""
+        self.value = (
+            batch_mean if self.value is None
+            else self.alpha * batch_mean + (1.0 - self.alpha) * self.value
+        )
+        self.n_calls += 1
+        if (
+            self.print_every_n_calls > 0
+            and self.n_calls % self.print_every_n_calls == 0
+        ):
+            extras_str = "  ".join(f"{k}={v}" for k, v in extras.items())
+            self.print_fn(
+                f"  [reward_ema #{self.n_calls}] batch_mean={batch_mean:+.3f}  "
+                f"ema={self.value:+.3f}  {extras_str}",
+                flush=True,
+            )
+        return self.value
+
+    def state(self) -> dict:
+        return {"ema": self.value, "n_calls": self.n_calls}
+
+
+def strict_template_score(
+    text: str,
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    user_marker: str = "<|user|>",
+) -> tuple[float, dict]:
+    """Score how cleanly the completion follows the chat template.
+
+    Returns (score in [-1.0, 1.0], breakdown).
+
+    Designed against the failure modes observed in post-MOPD inference
+    (2026-06-06):
+      - model generates `<|answer|>...<|/answer|><|answer|>...<|/answer|>`
+        (multiple answer blocks in a single completion)
+      - model starts a new turn mid-completion with `<|user|>...`
+      - model emits answer without preceding think
+      - model emits think without following answer (no commitment)
+      - model wraps answer in extra structural fluff after `<|/answer|>`
+
+    Scoring:
+        +1.0   exactly one think+answer pair, ends at `<|/answer|>`
+        +0.6   exactly one think+answer pair (trailing content allowed)
+        +0.3   answer block present but no/extra think OR open-but-no-close
+        -0.3   multiple `<|answer|>` opens (most common bug)
+        -0.6   `<|user|>` appears in completion (trying to start new turn)
+        -1.0   no `<|answer|>` at all (no commitment to a final answer)
+
+    The +1.0 / +0.6 split is intentional: the model should learn to emit
+    `<|/answer|>` then stop, not keep going. With stop-token enforcement
+    at inference time the difference matters less, but during training
+    a positive gradient on stopping cleanly is still useful.
+    """
+    breakdown = {}
+
+    n_answer_open = text.count(answer_open)
+    n_answer_close = text.count(answer_close)
+    n_think_open = text.count(think_open)
+    n_think_close = text.count(think_close)
+    has_user = user_marker in text
+
+    breakdown.update({
+        "n_answer_open": n_answer_open,
+        "n_answer_close": n_answer_close,
+        "n_think_open": n_think_open,
+        "n_think_close": n_think_close,
+        "user_in_completion": has_user,
+    })
+
+    # Hardest failure: tried to start a new turn
+    if has_user:
+        return -0.6, {**breakdown, "verdict": "user_marker_in_completion"}
+
+    # Critical failure: no committed answer
+    if n_answer_open == 0 or n_answer_close == 0:
+        return -1.0, {**breakdown, "verdict": "no_answer"}
+
+    # Multiple answer blocks — the MOPD failure mode
+    if n_answer_open > 1 or n_answer_close > 1:
+        return -0.3, {**breakdown, "verdict": "multiple_answers"}
+
+    # Single answer pair from here. Check think structure.
+    has_one_think = (n_think_open == 1 and n_think_close == 1)
+    extra_think = (n_think_open > 1 or n_think_close > 1)
+    if extra_think:
+        return 0.3, {**breakdown, "verdict": "multiple_thinks"}
+
+    # Check ordering: think_open < think_close < answer_open < answer_close
+    if has_one_think:
+        to = text.index(think_open)
+        tc = text.index(think_close)
+        ao = text.index(answer_open)
+        ac = text.index(answer_close)
+        if not (to < tc < ao < ac):
+            return 0.3, {**breakdown, "verdict": "out_of_order"}
+
+    # Single clean answer. Check for trailing content after `<|/answer|>`.
+    trailing = text[text.index(answer_close) + len(answer_close):].strip()
+    breakdown["trailing_chars"] = len(trailing)
+    if trailing:
+        return 0.6, {**breakdown, "verdict": "clean_with_trailing"}
+
+    return 1.0, {**breakdown, "verdict": "clean"}
+
+
 def numeric_match(predicted: str | None, ground_truth: str | None) -> bool:
     """Check if two numeric answers match (handles float comparison)."""
     if predicted is None or ground_truth is None:
@@ -237,11 +544,13 @@ def compute_reward(
     ground_truth_answer: str,
     correctness_weight: float = 1.0,
     format_weight: float = 0.2,
+    strict_template_weight: float = 0.0,
     length_penalty: float = 0.0,
     think_open: str = "<think>",
     think_close: str = "</think>",
     answer_open: str = "<|answer|>",
     answer_close: str = "<|/answer|>",
+    user_marker: str = "<|user|>",
     max_tokens: int = 0,
     completion_tokens: int = 0,
     reasoning_bonus: float = 0.3,
@@ -294,12 +603,36 @@ def compute_reward(
     breakdown["correctness_tier"] = tier_label
     breakdown["correctness_reward"] = correctness_r
 
-    # 2. Format reward
+    # 2. Format reward (boolean: think tags present)
     has_format = check_format(completion, think_open, think_close)
     format_r = format_weight if has_format else 0.0
     reward += format_r
     breakdown["has_format"] = has_format
     breakdown["format_reward"] = format_r
+
+    # 2b. Strict template reward (graded: catches multi-answer, no-answer,
+    # user-marker-in-completion, out-of-order). When strict_template_weight
+    # is 0 (default) this is a no-op for backwards compat with the original
+    # math-only GRPO config — flip it on (e.g. 0.5) for the multi-env
+    # rewards where template adherence is a learnable target.
+    if strict_template_weight > 0.0:
+        strict_score, strict_breakdown = strict_template_score(
+            completion,
+            think_open=think_open,
+            think_close=think_close,
+            answer_open=answer_open,
+            answer_close=answer_close,
+            user_marker=user_marker,
+        )
+        strict_r = strict_template_weight * strict_score
+        reward += strict_r
+        breakdown["strict_template_score"] = strict_score
+        breakdown["strict_template_reward"] = strict_r
+        breakdown["strict_template_verdict"] = strict_breakdown.get(
+            "verdict", "")
+    else:
+        breakdown["strict_template_score"] = 0.0
+        breakdown["strict_template_reward"] = 0.0
 
     # 3. Reasoning quality bonus (only when correct — reward thinking that works)
     thinking = extract_thinking(completion, think_open, think_close)
@@ -355,6 +688,106 @@ def compute_reward(
 
     breakdown["total_reward"] = reward
     return reward, breakdown
+
+
+def compose_template_rewards(
+    completion: str,
+    ground_truth_answer: str | None,
+    think_open: str = "<|think|>",
+    think_close: str = "<|/think|>",
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+    # Per-component weights — tune per-stage. Defaults match the
+    # Unsloth tutorial values which compose to a max reward of about
+    # +7.5 (3.0 exact-format + 2.0 all-tags-once + 3.0 answer-exact +
+    # 1.5 number-strict-match) and a min of about -4.0 (no format,
+    # all tags wrong count, answer parse-fail, number miss).
+    exact_format_reward: float = 3.0,
+    approx_format_pos: float = 0.5,
+    approx_format_neg: float = -1.0,
+    answer_check: bool = True,
+    number_check_reward: float = 1.5,
+    number_check_penalty: float = -0.5,
+    user_marker: str = "<|user|>",
+    strict_template_weight: float = 0.0,
+) -> tuple[float, dict]:
+    """Run all template + correctness rewards as a list and sum.
+
+    Mirrors TRL's `reward_funcs=[fn1, fn2, ...]` pattern but as a
+    single call so the GRPO loop just stores one number per rollout +
+    a debug breakdown. Returns (total_reward, per_component_dict).
+
+    Components:
+        match_format_exactly         hard binary, big positive
+        match_format_approximately   smooth per-tag signal
+        check_answer (if gt given)   tiered correctness
+        check_numbers (if gt given)  strict numeric double-check
+        strict_template_score (opt)  multi-answer / user-marker penalties
+    """
+    total = 0.0
+    bd: dict[str, float | str] = {}
+
+    # 1. Exact format
+    exact = match_format_exactly_score(
+        completion,
+        think_open=think_open, think_close=think_close,
+        answer_open=answer_open, answer_close=answer_close,
+        reward=exact_format_reward,
+    )
+    total += exact
+    bd["r_exact_format"] = exact
+
+    # 2. Per-tag approximate format
+    approx, approx_bd = match_format_approximately_score(
+        completion,
+        think_open=think_open, think_close=think_close,
+        answer_open=answer_open, answer_close=answer_close,
+        per_tag_pos=approx_format_pos,
+        per_tag_neg=approx_format_neg,
+    )
+    total += approx
+    bd["r_approx_format"] = approx
+    bd["tag_counts"] = approx_bd
+
+    # 3. Tiered correctness check
+    if answer_check and ground_truth_answer is not None:
+        # Allow ground truth in gsm8k "#### N" format too.
+        gt = extract_gsm8k_answer(ground_truth_answer) or ground_truth_answer
+        ans_score, ans_tier = check_answer_score(
+            completion, gt,
+            think_open=think_open, think_close=think_close,
+            answer_open=answer_open, answer_close=answer_close,
+        )
+        total += ans_score
+        bd["r_check_answer"] = ans_score
+        bd["check_answer_tier"] = ans_tier
+
+        # 4. Strict number double-check (cheap independent signal)
+        num_score, num_tier = check_numbers_score(
+            completion, gt,
+            answer_open=answer_open, answer_close=answer_close,
+            reward_match=number_check_reward,
+            penalty_wrong=number_check_penalty,
+        )
+        total += num_score
+        bd["r_check_numbers"] = num_score
+        bd["check_numbers_tier"] = num_tier
+
+    # 5. Optional strict template (multi-answer / user-marker bleed)
+    if strict_template_weight > 0.0:
+        strict_s, strict_bd = strict_template_score(
+            completion,
+            think_open=think_open, think_close=think_close,
+            answer_open=answer_open, answer_close=answer_close,
+            user_marker=user_marker,
+        )
+        strict_r = strict_template_weight * strict_s
+        total += strict_r
+        bd["r_strict_template"] = strict_r
+        bd["strict_template_verdict"] = strict_bd["verdict"]
+
+    bd["total_reward"] = total
+    return total, bd
 
 
 def compute_group_advantages(rewards: list[float]) -> list[float]:
