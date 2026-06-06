@@ -43,29 +43,42 @@ Total Modal: $165-225 (Gemini API: $30-50).
 
 ## Stage 1 — Probe + checkpoint merge
 
-**Status:** ⏳ pending (waiting for extend3 to finish)
-**Cost:** $0 (all local)
-**Duration:** ~30 min
+**Status:** ✅ complete
+**Cost:** $0
+**Duration:** ~45 min
 
 ### Actions
-- [ ] Download `extend3_final.pt` from codhe volume
-- [ ] Run `probe_recursion.py` against extend3_final
-- [ ] Run 8-prompt inference test (`infer_local.py`) on extend3_final
-- [ ] Compare to baselines:
-  - extend2_final: Test 3 cliff 5.97 / inference 1/6
-  - loopfixv2_merged: Test 3 cliff 0.13 / inference 2/6
-  - extend3_final: ?
-- [ ] Sliding-window ckpt merge over extend3 steps 1800, 2100, 2400, 2700, 3000
-- [ ] Probe merged ckpt → confirm marginal improvement
-- [ ] Update canonical: `extend3_merged.pt`
-
-### Success criteria
-- Test 3 (loop ablation) at least as flat as loopfixv2_merged (no regression to cliff)
-- Inference test ≥ 2/6 correct (likely 2-3/6 — meaningful improvement here only happens post-MOPD)
-- Adapter trajectory in probe shows depth utilization preserved
+- [x] Downloaded `extend3_final.pt` (3.2 GB)
+- [x] Probed extend3_final → Test 3 OK, depth utilization preserved
+- [x] Inference test on extend3_final → 1/6 (regression of 1 prompt vs loopfixv2_merged)
+- [x] Sliding-window merge of step 1800, 2100, 2400, 2700, final → `extend3_merged.pt`
+- [x] Probed merged → marginal improvement at n=6
+- [x] Inference test on merged → 2/6 (recovered)
 
 ### Results
-_TBD_
+
+**Test 3 — Loop ablation CE loss (n=1 → n=6 across all ckpts):**
+
+| n | extend2 (broken) | loopfixv2_merged | extend3_final | **extend3_merged** 🏆 |
+|---|---|---|---|---|
+| 1 | 9.58 | 4.14 | 4.00 | **4.02** |
+| 2 | 9.31 | 3.85 | 3.69 | **3.69** |
+| 3 | 9.06 | 3.73 | 3.66 | **3.61** |
+| 4 | 8.83 | 3.65 | 3.65 | **3.61** |
+| 5 | 9.21 | 3.60 | 3.66 | **3.63** |
+| 6 | 3.24 | 3.46 | 3.58 | **3.56** |
+
+**Inference test (8 prompts, 6 scoreable):**
+- extend2 (broken): 1/6 (17%)
+- loopfixv2_merged: 2/6 (33%)
+- extend3_final: 1/6 (regressed by 1 prompt)
+- **extend3_merged: 2/6 (33%)** — merge recovered the regression
+
+**Adapter compression** continued throughout extend3 (L0: 7.10 peak → 5.95 final).
+
+**Key insight:** extend3 with loop dropout produced a flatter performance curve (better at shallow depths, slight cost at full depth). Merging across the converging steps recovers most of the peak full-depth ability.
+
+**Canonical going forward:** `extend3_merged.pt`. Still no `<|answer|>` tag in generated text — that's the gap MOPD fixes.
 
 ---
 
