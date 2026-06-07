@@ -1065,6 +1065,94 @@ def mbpp_test_reward(
     }
 
 
+def regurgitation_penalty(
+    system_prompt: str | None,
+    completion: str,
+    ngram_size: int = 5,
+    free_threshold: float = 0.10,
+    saturation_threshold: float = 0.40,
+    max_penalty: float = -5.0,
+) -> tuple[float, dict]:
+    """Heavy penalty when the model regurgitates the system prompt.
+
+    Common failure mode for newly system-prompt-trained models: they
+    quote chunks of the system prompt back at the user instead of
+    answering. We detect this with token n-gram overlap.
+
+    Algorithm:
+      1. Tokenize system prompt and completion to word-level n-grams
+         (n = ngram_size, default 5).
+      2. Compute fraction of system n-grams that appear in the
+         completion.
+      3. If overlap < free_threshold (10 %): no penalty (legitimate
+         echoing — "the answer the user asked for is X").
+      4. Linearly scale penalty from 0 at free_threshold to max_penalty
+         at saturation_threshold (40 %). Beyond 40 % overlap, full
+         max_penalty applies.
+
+    Why n=5? 5-grams are long enough to filter out incidental matches
+    on common phrases like "the answer is" but short enough that
+    paraphrased regurgitation still triggers.
+
+    Why max -5.0? With check_answer_score peaking at +3.0 and
+    format rewards at +5.0, a -5.0 regurgitation penalty makes
+    regurgitating strictly WORSE than producing a clean wrong answer
+    — exactly the gradient we want.
+
+    Returns (penalty, breakdown). Returns 0 if system prompt is None
+    or too short.
+    """
+    if system_prompt is None or not system_prompt.strip():
+        return 0.0, {"reason": "no_system_prompt"}
+
+    # Word-level tokenization (avoids re-tokenizing through the model
+    # tokenizer; n-grams of words are robust to whitespace differences).
+    sys_words = system_prompt.split()
+    if len(sys_words) < ngram_size:
+        return 0.0, {"reason": "system_too_short"}
+
+    comp_words = completion.split()
+    if len(comp_words) < ngram_size:
+        return 0.0, {"reason": "completion_too_short"}
+
+    # Build n-gram sets. Lowercase so capitalization differences don't
+    # hide regurgitation.
+    sys_ngrams = {
+        tuple(w.lower() for w in sys_words[i:i + ngram_size])
+        for i in range(len(sys_words) - ngram_size + 1)
+    }
+    comp_ngrams = {
+        tuple(w.lower() for w in comp_words[i:i + ngram_size])
+        for i in range(len(comp_words) - ngram_size + 1)
+    }
+    if not sys_ngrams:
+        return 0.0, {"reason": "no_sys_ngrams"}
+
+    overlap = sys_ngrams & comp_ngrams
+    overlap_frac = len(overlap) / len(sys_ngrams)
+
+    if overlap_frac < free_threshold:
+        return 0.0, {
+            "overlap_frac": overlap_frac,
+            "n_matches": len(overlap),
+            "n_sys_ngrams": len(sys_ngrams),
+            "verdict": "clean",
+        }
+
+    # Scale: penalty goes from 0 at free_threshold to max_penalty at
+    # saturation_threshold. Beyond saturation, full penalty.
+    span = max(saturation_threshold - free_threshold, 1e-6)
+    scaled = min(1.0, (overlap_frac - free_threshold) / span)
+    penalty = max_penalty * scaled
+
+    return penalty, {
+        "overlap_frac": overlap_frac,
+        "n_matches": len(overlap),
+        "n_sys_ngrams": len(sys_ngrams),
+        "verdict": "regurgitating",
+    }
+
+
 def compose_template_rewards(
     completion: str,
     ground_truth_answer: str | None,
@@ -1087,6 +1175,9 @@ def compose_template_rewards(
     strict_template_weight: float = 0.0,
     strict_extraction: bool = False,
     ambiguous_penalty: float = -0.5,
+    system_prompt: str | None = None,
+    regurgitation_weight: float = 1.0,
+    regurgitation_max_penalty: float = -5.0,
 ) -> tuple[float, dict]:
     """Run all template + correctness rewards as a list and sum.
 
@@ -1164,6 +1255,21 @@ def compose_template_rewards(
         total += strict_r
         bd["r_strict_template"] = strict_r
         bd["strict_template_verdict"] = strict_bd["verdict"]
+
+    # 6. Regurgitation penalty (only when a system prompt was provided)
+    # Heavy penalty for the common system-prompt-trained failure mode
+    # where the model quotes the system prompt back at the user.
+    if system_prompt and regurgitation_weight > 0.0:
+        regurg, regurg_bd = regurgitation_penalty(
+            system_prompt=system_prompt,
+            completion=completion,
+            max_penalty=regurgitation_max_penalty,
+        )
+        regurg_scaled = regurgitation_weight * regurg
+        total += regurg_scaled
+        bd["r_regurgitation"] = regurg_scaled
+        bd["regurgitation_overlap"] = regurg_bd.get("overlap_frac", 0.0)
+        bd["regurgitation_verdict"] = regurg_bd.get("verdict", "n/a")
 
     bd["total_reward"] = total
     return total, bd
