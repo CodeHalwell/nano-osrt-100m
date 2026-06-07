@@ -42,55 +42,60 @@ Every released frontier model uses one of (a) dense, (b) MoE, or (c)
 recurrent — none combine sparse MoE with depth recurrence. We keep
 this. The refinements below address the v5 pain points.
 
-### 1.1 Parameter budget — matched to LFM2-700M class
+### 1.1 Parameter budget — 600M class with LFM2-aligned ratios
 
-**Updated to align with LFM2-700M's parameter ratios** (Liquid AI Dec
-2025). LFM2-700M is 700M total with 14.4 % on the tied embedding —
-the canonical proof point that small models should put params into
-blocks, not vocabulary. We follow their accounting:
+**Tuned for ~600M total with LFM2-700M-style embedding-to-block
+accounting** (Liquid AI Dec 2025). LFM2-700M proved small models
+should put params into blocks (~85 %) not vocabulary (~14 %). We
+match that ratio at the 600M scale:
 
 ```
-Embedding (65,536 × 1536, tied with LM head)   : 100,663,296   (14.4 %)
-Attention × 3 blocks (qkv + out_proj)          :  28,311,552   (4.0 %)
-Shared experts × 3 (SwiGLU h=4608)             :  63,700,992   (9.1 %)
-Routed experts: 3 × 14 × SwiGLU h=2304         : 446,210,304   (top-2 active ≈ 9.1 %)
+Embedding (65,536 × 1536, tied with LM head)   : 100,663,296   (16.9 %)
+Attention × 3 blocks (qkv + out_proj)          :  28,311,552   (4.7 %)
+Shared experts × 3 (SwiGLU h=4608)             :  63,700,992   (10.7 %)
+Routed experts: 3 × 12 × SwiGLU h=1920         : 318,504,960   (top-2 active ≈ 8.9 %)
 HRA adapters (rank 256, injected day 1)        :  86,114,304   (always trained)
 Router + loop_emb + adapters + norms           :  ~1.5 M
 
-Total physical params                          : ~726 M ("700M class")
-Active per token                               : ~242 M (33.3 %)
-Effective compute per token (× 6 loops)        : ~2.9 B FLOPs-equivalent
+Total physical params                          : ~599 M (call it "600M")
+Active per token                               : ~206 M (34.4 %)
+Effective compute per token (× 6 loops)        : ~2.5 B FLOPs-equivalent
 ```
 
 **Direct comparison to LFM2-700M:**
 
-| metric | LFM2-700M | OSRT-700M |
+| metric | LFM2-700M | OSRT-600M |
 |---|---|---|
-| Total params | 700M | 726M |
-| Embedding (tied) | 100M (14.4 %) | 100M (14.4 %) ✓ |
+| Total params | 700M | ~600M |
+| Embedding (tied) | 100M (14.4 %) | 100M (16.9 %) |
 | Hidden dim | 1536 | **1536** ✓ |
 | Vocab | 65,536 | **65,536** ✓ |
-| Unique layers | 16 dense | 3 blocks × 6 loops (18 effective) |
-| FFN family | Dense SwiGLU h=6912 | 1 shared (h=4608) + 14 routed top-2 (h=2304) MoE |
+| Unique transformer layers | 16 dense | 3 blocks × 6 loops (18 effective) |
+| FFN family | Dense SwiGLU h=6912 | 1 shared (h=4608) + 12 routed top-2 (h=1920) MoE |
 | Attention | GQA 24q/8kv head=64 | GQA 24q/8kv head=64 ✓ |
-| FLOPs per token | ~1.4B | ~2.9B (6× loop multiplier) |
-| Active params per token | 700M | 242M (sparse MoE) |
+| FLOPs per token | ~1.4B | ~2.5B (6× loop multiplier) |
+| Active params per token | 700M | 206M (sparse MoE) |
 
-**Why this matters:** at 65K vocab we get LFM2-quality tokenization
-for English + 6 supported multilingual + code (FIM/structured data).
-At 1536 hidden we match their search-optimized dim. The recursive
-trick gives us ~2× their FLOPs per token from FEWER active params.
+**Why these specific choices:**
+- **65K vocab + 1536 hidden** matches LFM2-700M exactly. Gives us
+  LFM2-quality tokenization for English + 6 multilingual + code +
+  FIM, with the same 14-17 % embedding tax instead of Gemma-3-270M's
+  63 % embedding catastrophe
+- **12 routed experts per block** balances finer-grained
+  specialisation against per-expert capacity at this scale
+- **Recursive 6-loop trick** delivers ~1.8× LFM2-700M's FLOPs per
+  token from ~30 % of LFM2's active params
 
-### 1.2 What's different from v5 (363M → 726M, matched to LFM2-700M)
+### 1.2 What's different from v5 (363M → 600M)
 
-| change | v5 | OSRT-700M | rationale |
+| change | v5 | OSRT-600M | rationale |
 |---|---|---|---|
-| Hidden dim | 1536 | **1536** (matched to LFM2) | LFM2's hardware-in-the-loop search picked 1536 as optimal for 700M class |
-| Routed experts per block | 8 | **14** | Finer-grained specialisation (Qwen3 128, OLMoE 64, DeepSeek-V3 256) |
-| Routed expert hidden | 2048 | **2304** | Slightly wider than v5; matches budget |
+| Hidden dim | 1536 | **1536** (kept) | LFM2's hardware-in-the-loop search picked 1536 as optimal for ~700M class; same dim works at 600M |
+| Routed experts per block | 8 | **12** | Finer-grained specialisation, trend across Qwen3 / OLMoE / DeepSeek |
+| Routed expert hidden | 2048 | **1920** | Slightly leaner than v5 to fit 600M budget with more experts |
 | Shared expert hidden | 4096 | **4608** | Wider always-on path |
 | HRA adapter rank | 256 | **256** (kept) | Day-1 injection, not retrofit |
-| Vocab | 32K | **65,536** (matched to LFM2) | English + 6 multilingual + code (FIM/structured); same tax % as LFM2 |
+| Vocab | 32K | **65,536** (matched to LFM2) | English + 6 multilingual + code (FIM/structured); proven by LFM2 family |
 | Loops | 6 | **6** (kept) | Ouro found R4 sweet spot; v5 worked at R6; do NOT chase higher (Ouro reports instability at high recursion) |
 
 The 625M total / 210M active is in the **same compute class as Phi-3-mini
@@ -551,7 +556,7 @@ on a single H100, negligible against training cost.
 
 ## 10a. Frontier deployment-stack additions (Dec 2025 / 2026)
 
-Three recent papers add to the OSRT-700M deployment story:
+Three recent papers add to the OSRT-600M deployment story:
 
 1. **LFM2 architecture lessons** (Liquid AI, Dec 2025):
    - Gated short convolutions for most layers + minority GQA — ~2×
@@ -581,7 +586,7 @@ Three recent papers add to the OSRT-700M deployment story:
      unique expert, applies across all 6 loop reuses
    - ~1 day post-training engineering; pure inference optimization
 
-**Combined deployment stack for OSRT-700M:**
+**Combined deployment stack for OSRT-600M:**
 - Muon-trained base weights → AlphaQ int3.5-4 for routed experts
 - TurboQuant int4 KV cache
 - Speculative decoding via aux-loop-3 head
@@ -591,6 +596,198 @@ Three recent papers add to the OSRT-700M deployment story:
 
 For a 726M-total model, this deploys in **~250 MB RAM at usable
 speed on phones / Raspberry Pi 5**.
+
+## 10b. DeepSeek-V4 (Nov/Dec 2025) integrations
+
+The DeepSeek-V4 technical report (preview, 1.6T total / 49B active for
+Pro; 284B / 13B for Flash) shipped several architectural and training
+innovations that scale down well to our 600M class. The 7 we should
+integrate, ranked by impact:
+
+### 10b.1 Multi-teacher On-Policy Distillation (OPD) replaces our GRPO pipeline
+
+This is the **single biggest training-pipeline upgrade**. V4 replaced
+the "mixed RL stage" with cleaner two-step:
+
+1. **Train specialists separately** — one expert per domain (math, code,
+   IF, agent) via standard SFT + GRPO with domain-specific rewards
+2. **Distill into one unified model** via reverse-KL on STUDENT's
+   own-generated trajectories:
+
+```
+L_OPD(θ) = Σ_i w_i · D_KL(π_θ || π_E_i)
+```
+
+The student selectively learns from the relevant specialist for each
+task (math expert for math, code expert for code, etc.) via logit-level
+alignment.
+
+**Why this is better than our planned multi-env GRPO:**
+- Specialists are trained to convergence on their domain (better than
+  mixed-env GRPO that competes for gradient)
+- On-policy distillation gets full-vocabulary logits (vs token-level KL
+  estimates of standard distillation) → more stable gradients
+- Practically circumvents weight-merging degradation
+- Easier to debug — each specialist is a focused training run
+
+**For us:** swap our planned multi-env GRPO Stage 3 for:
+- Stage 3a: train math specialist (gsm8k GRPO from MOPD ckpt) — $15
+- Stage 3b: train IF specialist (IFEval GRPO from MOPD ckpt) — $10
+- Stage 3c: train code specialist (MBPP GRPO from MOPD ckpt) — $10
+  (or skip if we drop code env as in v5 lessons)
+- Stage 3d: OPD distillation — student learns from specialists' logits
+  on student's own outputs — $15
+
+Net: similar cost (~$50), much cleaner pipeline, expected better quality
+on each domain.
+
+### 10b.2 Manifold-Constrained Hyper-Connections (mHC)
+
+Replaces standard residual connections with a wider residual stream
+(factor n_hc = 4) constrained to the Birkhoff polytope (doubly
+stochastic matrices via Sinkhorn-Knopp iteration):
+
+```
+X_{l+1} = B_l · X_l + C_l · F_l(A_l · X_l)
+  where B_l ∈ M (doubly stochastic matrices, ||B_l||_2 ≤ 1)
+```
+
+The doubly-stochastic constraint guarantees non-expansive residual
+mapping → numerical stability through ALL forward passes and backprop.
+Closed under multiplication → stable in deep stacks (perfect for our
+18 effective layers via recursion).
+
+**Why this matters for us:** our recursive arch has the SAME residual
+applied 6× per forward. Standard residual + 6 iterations =
+compounding instability risk. mHC was DESIGNED to survive deep stacks.
+
+**Cost:** ~720K extra params (residual transformation matrices) for
+n_hc=4. Engineering: ~1 day. Total impact at our scale: modest
+quality + significant stability gains.
+
+### 10b.3 Hybrid Newton-Schulz for Muon (two-stage coefficients)
+
+Drop-in upgrade to our planned Muon Newton-Schulz. V4 uses 10
+iterations in two stages:
+- **First 8 steps**: (a, b, c) = (3.4445, −4.7750, 2.0315) → rapid
+  convergence toward orthogonal
+- **Last 2 steps**: (a, b, c) = (2, −1.5, 0.5) → stabilize singular
+  values precisely at 1
+
+vs our planned 5 standard iterations. Better numerical precision at
+similar wall-clock cost. **Zero engineering cost** (just config change).
+
+### 10b.4 Routing innovations: Sqrt(Softplus) + Hash routing for early layers
+
+Two free upgrades to our MoE routing:
+
+**A. Sqrt(Softplus) routing affinity** (replaces Sigmoid from V3):
+```
+r_{t,i} = sqrt(softplus(W_route_i · x_t))
+```
+Prevents saturation of routing affinity scores, ensures continuous
+non-vanishing gradient. Free swap of activation function.
+
+**B. Hash routing for first 2-3 MoE layers** (deterministic, not learned):
+```
+expert_id = hash(token_id) mod N_experts
+```
+Hash routing for the EARLIEST layers stabilizes training. Routed
+experts at depth >2 are still learned. Avoids the early-training
+collapse where all tokens funnel to a few experts before the router
+can learn distinctions.
+
+**For us:** replace the first 1-2 of our 3 physical blocks' routers
+with hash routing. (Since blocks are recursive, this affects only
+the first loop iteration's first 1-2 blocks.) Free quality + stability.
+
+### 10b.5 Training stability: SwiGLU Clamping + Anticipatory Routing
+
+Two empirically-validated tricks for trillion-parameter MoE training
+that also help at 600M:
+
+**A. SwiGLU Clamping** — one-liner:
+```
+linear = clamp(linear_proj, -10, 10)
+gate = min(gate_proj, 10)
+```
+Empirically eliminates training-time outliers. V4 paper says "without
+compromising performance". Engineering: trivial.
+
+**B. Anticipatory Routing** — decouple routing from current forward
+pass. Use historical parameters θ_{t-Δt} for routing decisions while
+using current θ_t for feature computation:
+```
+At step t:
+  features = forward(θ_t)
+  routing_indices = compute_routing(θ_{t-Δt})  # cached from earlier
+```
+~20% wall-clock overhead, eliminates loss-spike recurrence in MoE.
+Engineering: ~2 days (needs pre-compute pipeline + cache).
+
+For our $280 build: adopt SwiGLU Clamping immediately (trivial),
+defer Anticipatory Routing unless we hit instability.
+
+### 10b.6 Attention compression: HCA-style sequence-dim compression
+
+V4's key inference win: **compress KV cache along sequence dimension**.
+Most layers (HCA): every m'=128 tokens → 1 entry. Some layers (CSA):
+every m=4 tokens → 1 entry + sparse top-k attention.
+
+Result: at 1M context, V4-Pro uses 10% of V3.2's KV cache.
+
+**For our 600M at 4-8K context:** HCA-style sequence compression on
+top of GQA + AlphaQ + TurboQuant would give us essentially zero KV
+cache:
+
+- 18 effective layers
+- GQA: 8 KV heads
+- HCA m'=64 (compress 64 tokens → 1 entry along sequence)
+- TurboQuant int4 on cached entries
+
+At 8K context: 8K / 64 = 128 sequence positions cached × 18 layers
+× 8 KV heads × 64 head_dim × 1 byte (int4) ≈ **1.2 MB total KV cache**.
+
+This is the deployment story killer. Combined with our recursive arch,
+we'd have one of the most KV-efficient small models possible.
+
+**Engineering:** medium. HCA requires sequence-aware compression
+training (not retrofittable post-hoc). Bake into pretraining.
+
+### 10b.7 FP4 quantization-aware training (post-training)
+
+V4 applies FP4 (MXFP4) to MoE expert weights during post-training, via
+QAT. Lossless FP4→FP8 dequantization possible because FP8 has more
+exponent bits.
+
+For us: FP4 QAT on routed experts during the OPD distillation stage.
+Combined with AlphaQ post-OPD, gives us deployment-ready FP4
+expert weights with quality preserved.
+
+**Engineering:** ~1 day, reuses existing FP8 training framework with
+straight-through estimator.
+
+### 10b.8 Summary of recommended adoptions
+
+| innovation | engineering | cost | priority |
+|---|---|---|---|
+| Multi-teacher OPD (replaces planned multi-env GRPO) | ~2 days | $0 (replaces existing plan) | **HIGH** |
+| Sqrt(Softplus) routing | 1 line | $0 | **HIGH** |
+| Hash routing for first 1-2 layers | half day | $0 | **HIGH** |
+| SwiGLU Clamping | 1 line | $0 | **HIGH** |
+| Hybrid Newton-Schulz coefficients | 1 config change | $0 | **HIGH** |
+| mHC residual replacement | ~1 day | $0 | medium |
+| HCA sequence compression | ~1 week (bake into pretrain) | $0 | medium |
+| FP4 QAT post-training | ~1 day | $0 | medium |
+| Anticipatory Routing | ~2 days | $0 | low (only if instability hit) |
+| Attention Sink | half day | $0 | low |
+| Lightning Indexer (sparse top-k) | ~3 days | $0 | low (only at >32K context) |
+
+**Net for OSRT-600M $280 budget:** the 5 HIGH-priority items add ~3 days
+of engineering and $0 of training cost, and meaningfully improve
+stability + post-training quality. The medium items (mHC, HCA, FP4
+QAT) would shift us into a clearly stronger architecture but require
+more development time.
 
 ## 11. Research nuggets to apply
 
@@ -660,22 +857,79 @@ speed on phones / Raspberry Pi 5**.
 
 ---
 
-## 12. Cost estimate (single-pass, no reruns)
+## 12. Cost estimate — three budget tiers
+
+### Tier 1 — Ideal "ship-ready" build (~$16K)
+
+What the OSRT-600M plan looks like at full scale, no compromises.
+Numbers below assume H100 at ~$4/hr on Modal.
 
 | stage | tokens / steps | cost |
 |---|---|---|
-| Pretraining (3T tokens, 600M model) | 3T tokens, ~50K H100-hours | **~$15K** |
+| Pretraining (3T tokens, 600M) | 3T tokens, ~50K H100-hours | **~$15,000** |
 | MOPD-style SFT (5K rollouts × 500 steps) | 5K rollouts (~$10 API) + 1.5K H100-hours | **~$700** |
 | HRA-only GRPO (multi-env, 500 steps) | 500 steps × ~30 sec compiled | **~$15** |
 | Vision retrofit (LLaVA-style) | 2K steps SFT + 200K image-text pairs | **~$200** |
 | Tool-use GRPO (500 steps) | 500 × ~30 sec | **~$15** |
-| Eval suite (full sweep) | 1× through gsm8k + MMLU + IFEval + etc | **~$10** |
+| Eval suite (full sweep) | gsm8k + MMLU + IFEval + HumanEval + MMBench | **~$10** |
 | **Total** | | **~$15,940** |
 
 For comparison: SmolLM2 (Allal et al.) total cost was ~$250K at 11T
 tokens on a 1.7B dense model. OSRT-600M at 3T tokens / 600M MoE = ~6%
-of that. We'd ship a meaningfully more capable model for ~$16K because
+of that. We ship a meaningfully more capable model for ~$16K because
 of the recursive + sparse efficiency.
+
+### Tier 2 — $280 build-small workspace (ACTUAL CURRENT BUDGET)
+
+What fits in the $280 we have in build-small. Pretraining is the
+dominant cost; we have to under-train heavily but the rest of the
+pipeline still fits.
+
+| stage | tokens / steps | cost |
+|---|---|---|
+| Pretraining (12B tokens, 600M) | 12B tokens, ~50 H100-hours | **~$200** |
+| MOPD-style SFT (5K rollouts × 300 steps) | OpenHermes (free) + tiny DeepSeek top-up | **~$30** |
+| HRA-only GRPO (math+ifeval, 100 steps) | 100 steps × ~45 sec compiled | **~$20** |
+| Eval suite (1 final pass) | gsm8k + IFEval + MMLU-200 + HumanEval | **~$15** |
+| Buffer / one retry | | **~$15** |
+| **Total** | | **~$280** |
+
+**What we lose at $280:**
+- Vision retrofit (out of budget; revisit when topped up)
+- Tool-use SFT/GRPO (sketch the tokens in tokenizer but defer training)
+- Multi-stage Nemotron-CC data curation (use single-stage WSD)
+- μP HP search (use modded-nanoGPT Muon defaults directly)
+- 50-prompt OOD probe (use 12-prompt subset proven in v5)
+- Full SmolLM2-scale over-training (3T → 12B is 250× less)
+
+**What we KEEP at $280** (the lessons that are free):
+- Recursive MoE + HRA + Muon + all stability fixes (§1.3)
+- System prompts in pretraining mix from day 1 (§3.3)
+- Decoupled Top-K KD during MOPD (§10a, ~32× denser supervision/token)
+- HRA-only GRPO with strict extraction + OOD probe (§6)
+- AlphaQ post-training quantization (§10a, ~1 day engineering, zero training cost)
+- TurboQuant KV-cache compression for deployment
+
+**12B tokens at 600M = 20 tokens/param = Chinchilla-optimal.** Below
+the 1000-6500 t/p frontier overtraining ratio. Result: a working
+600M model that ships and works on-device, but plateaus earlier on
+knowledge-intensive benchmarks than a $16K-trained variant would.
+
+### Tier 3 — Mid-budget ($1.5K-3K, if we top up build-small)
+
+The natural in-between point if we ever expand the budget:
+
+| upgrade | extra cost | what it adds |
+|---|---|---|
+| Pretrain 12B → 100B tokens | +$1,300 | ~167 tokens/param; SmolLM-class for size |
+| KD-during-pretrain final 20B | +$300 | LFM2-style teacher distillation |
+| Vision retrofit | +$200 | LLaVA-style projector + SFT |
+| Tool-use SFT + GRPO | +$80 | Calculator + python_exec native |
+| Full multi-stage data curation | +$200 | Nemotron-CC ensemble + 3-stage WSD |
+| **Total upgrade** | **+$2,080** | "competitive at 600M-class" tier |
+
+Combined with Tier 2: ~**$2,360** for a model that genuinely competes
+with Gemma 3 270M / Qwen3-0.6B on the benchmarks they target.
 
 ---
 
