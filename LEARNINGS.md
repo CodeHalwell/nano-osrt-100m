@@ -8,7 +8,7 @@ discovery. Every failure, every fix, every metric that surprised us.
 repeat any of the v5 mistakes.
 
 **Companion docs:**
-- [`OSRT_600M.md`](OSRT_600M.md) — the v6 design that bakes in these lessons
+- [`README.md`](README.md) — the v6 design that bakes in these lessons
 - [`RESEARCH.md`](RESEARCH.md) — external research that shaped v6
 
 ---
@@ -635,7 +635,7 @@ isn't trained" followed by "oh no GRPO is hacking the rewards"
 followed by "oh wait some of this actually works."
 
 v6 (OSRT-600M) is "measure first, then build". Everything in 
-[`OSRT_600M.md`](OSRT_600M.md) is a direct response to a specific v5
+[`README.md`](README.md) is a direct response to a specific v5
 failure mode documented above.
 
 The biggest single takeaway: **for a small model, training-pipeline

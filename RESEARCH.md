@@ -5,7 +5,7 @@ shaped OSRT-600M's design. Each entry: what it is, the key findings,
 and what we adopted (vs deferred or rejected).
 
 **Companion docs:**
-- [`OSRT_600M.md`](OSRT_600M.md) — the v6 design that cites these
+- [`README.md`](README.md) — the v6 design that cites these
 - [`LEARNINGS.md`](LEARNINGS.md) — what v5 (363M) taught us
 
 ---
