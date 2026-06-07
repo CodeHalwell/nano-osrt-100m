@@ -636,7 +636,162 @@ The PIPELINE works. The MODEL is small. That's the budget trade.
 
 ---
 
+## 17. LFM2 integration (December 2025)
+
+The Liquid AI LFM2 technical report (arXiv 2511.23404) shipped a
+complete edge-first SLM family (350M-8.3B) on Dec 1, 2025. Several of
+their findings directly upgrade our plan; the most impactful five
+are integrated below.
+
+### 17.1 Gated short convolutions instead of most attention
+
+**LFM2's central architectural finding** — under realistic on-device
+budgets, a minimal hybrid of gated short convolutions for most layers
++ a small minority of GQA blocks beats SSM/linear-attention hybrids,
+beats attention-heavy stacks, and runs ~2× faster on CPUs. Their
+hardware-in-the-loop search converged on this repeatedly across scales.
+
+**The gated short conv block** (specific formula):
+```
+(B, C, h̃) = Linear(h)        # 3-way split along feature dim
+y = B ⊙ h̃                    # input-aware gate
+z = Conv_k(y)                 # depthwise 1D conv, kernel k=3
+o = Linear_out(C ⊙ z)         # output gate + projection
+```
+
+For OSRT-50M, this is a **major architectural change** we should test.
+Current plan: 3 attention blocks × 6 loops. LFM2 plan: most layers
+gated-short-conv, minority GQA.
+
+**Proposed OSRT-50M v2 layout:**
+- 12 effective layers (2 physical blocks × 6 loops)
+  - Block 0: gated short conv (kernel k=3)
+  - Block 1: GQA (8q/2kv, our existing config)
+- Pattern within each loop: GSC → GQA
+- 3rd "block" becomes a SwiGLU FFN as before (the MoE part stays)
+
+**Expected impact:** 1.5-2× faster CPU inference (LFM2's measured
+result vs attention-heavy baselines), at similar or better quality.
+**Engineering cost:** ~1-2 days; we already have the gated short
+conv primitive (similar to SiLU-based gating used in v5).
+
+**This is the single biggest update.** For an edge-deployed model
+(which is what tiny recursive MoE wants to be), gated conv > attention
+for most layers. Adopt.
+
+### 17.2 Decoupled Top-K Knowledge Distillation
+
+Our MOPD currently uses plain cross-entropy on the full teacher
+response. LFM2 uses a much better objective — **decoupled, tempered
+Top-K KL** that solves support mismatch:
+
+```
+L_DTK = KL(Bern(p_T(T)) || Bern(p_S(T)))           # binary mass term
+      + p_T(T) · KL_τ(p_T(·|T) || p_S(·|T))        # conditional Top-K
+```
+
+Where T is the teacher's Top-K=32 token set. Temperature applies
+only to the conditional term (avoids the OOD blow-up that naive
+truncated tempering causes).
+
+**Why it matters for us:** during MOPD we use ~5K rollouts. With
+plain CE, each rollout teaches just the chosen response token. With
+Top-K KD, each rollout teaches the **full teacher distribution** over
+the top 32 alternatives — ~32× denser supervision per token.
+
+**Cost:** ~$0 if teacher API returns logits (DeepSeek v4-flash does
+via `logprobs=true, top_logprobs=20`). Just collect richer rollouts
+during data collection. ~+10% data file size; negligible.
+
+**Engineering:** ~half day to implement the decoupled-KL loss; the
+math from §3.3 / Appendix A of the LFM2 paper is clean.
+
+### 17.3 Curriculum learning via ensemble difficulty scoring
+
+LFM2 uses **12 different LLMs** to score each SFT example's difficulty
+(easy if most models get it right, hard if few do), then trains in
+easy → hard order. Free quality gain.
+
+For us with OpenHermes + DeepSeek rollouts: score each prompt with
+e.g. 4-5 small open models (Qwen3-0.6B, SmolLM2-360M, Gemma 3 270M,
+Phi-3-mini, our own MOPD ckpt). Records empirical `p_i` (prob of
+success). Train sorted by `p_i` ascending.
+
+**Cost:** ~$5 in API/compute for one-time difficulty scoring of 5K
+examples. **Engineering:** ~half day.
+
+### 17.4 Length-normalized preference optimization (LNPO)
+
+When we eventually add preference data (Stage 5 in some future plan):
+use LFM2's length-normalized DPO instead of plain DPO. Avoids the
+"longer responses win because more tokens accumulate reward" pathology
+that small models are especially vulnerable to.
+
+```
+Δ(x, yw, yl) = r_θ(x, yw)/|yw| - r_θ(x, yl)/|yl|
+```
+
+With **CLAIR refinement** (Contrastive Learning from AI Revisions):
+take chosen responses from on-policy SFT outputs, refine through a
+larger model into stronger "chosen" responses. They use this for the
+preference dataset and report it's central to their IFEval gains
+(LFM2-2.6B hits 79.56%).
+
+For OSRT-50M: we're not budgeted for preference learning. Note for
+OSRT_600M plan.
+
+### 17.5 Model merging at end of post-training
+
+LFM2 trains **multiple SFT/alignment variants in parallel** (different
+data mixes, different curriculum schedules, different LR), evaluates
+each, then **merges the best 3-5 via parameter-space techniques**
+(model soup, task arithmetic, TIES, DARE, DELLA). The merged model
+inherits balanced strengths.
+
+For OSRT-50M: launch 3 SFT variants at different data weights, merge
+at end. Costs ~$10 extra Modal (each variant is short). Pure win.
+
+### 17.6 Other LFM2 findings worth noting (not integrated)
+
+- **65,536 vocab BPE** with FIM + tool-calling + ChatML tokens. Our
+  48K is fine; 65K would add ~16M params on the tied embedding — too
+  expensive at 50M, fine at 600M.
+- **10-12T token pretrain + 1T mid-training at 32K context** —
+  validates our OSRT_600M plan to overtrain. We do 30B at $280
+  because that's the budget; LFM2 confirms the direction.
+- **LFM2-2.6B numbers as targets**: 82.41% GSM8K, 79.56% IFEval at
+  2.6B / 11T tokens. **This is what to beat for OSRT_600M.** At our
+  50M / 30B scale, beating this is not the goal — beating 270M-class
+  baselines (Gemma 3 270M, ~35% GSM8K) is.
+- **Hardware-in-the-loop search methodology** — they profile EVERY
+  architecture candidate on real Snapdragon + Ryzen CPUs and discard
+  failures. We should do this for OSRT_600M; out of scope for $280.
+- **LFM2-Audio architecture** — separated continuous-in / discrete-out
+  with RQ-Transformer for code generation. Bookmark for if we ever
+  add audio.
+- **Multi-stage VLM training: connector-only → joint with 5:5:1 LR
+  ratio (text:connector:encoder) → multimodal SFT**. Use this exact
+  recipe when we do vision retrofit.
+
+### 17.7 Updated budget impact
+
+The 5 integrations cost:
+- Gated conv blocks: ~$0 (architectural; bake in to pretrain)
+- Decoupled Top-K KD: ~$0 (data collection format change)
+- Curriculum scoring: ~$5 (one-time API/compute)
+- Length-norm DPO: out of $280 scope
+- Model merging: ~$10 (parallel SFT variants)
+
+**Net added cost: ~$15.** Fits in the $8 buffer + a slight pretrain
+trim. Doable within $280.
+
+**Expected quality lift:** 5-15% on benchmarks based on LFM2's
+ablations (Top-K KD: dense supervision; curriculum: easier loss
+landscape; merging: ensemble effect; gated conv: same quality at
+higher throughput).
+
 ## Sources
 
-Identical to OSRT_600M.md — see that doc's source list. This doc
-introduces no new findings, only scales the same plan.
+Same as OSRT_600M.md plus:
+- Liquid AI (Dec 2025) "LFM2 Technical Report" arXiv:2511.23404 —
+  source for §17 integrations
