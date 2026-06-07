@@ -426,6 +426,27 @@ def _build_client(teacher_key: str):
 
 
 async def collect(args: argparse.Namespace) -> None:
+    # asyncio.to_thread uses the default ThreadPoolExecutor which caps at
+    # min(32, cpu_count()+4) workers. At high concurrency that becomes
+    # the real bottleneck (workers stack up waiting for a thread slot).
+    # Replace it with one sized to the configured concurrency.
+    import concurrent.futures as _cf
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        _cf.ThreadPoolExecutor(max_workers=args.concurrency + 50)
+    )
+    # Bump the OS file-descriptor soft limit so we can hold thousands of
+    # concurrent HTTPS connections without "too many open files".
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = max(soft, args.concurrency * 4 + 256)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(target, hard), hard))
+            print(f"Bumped RLIMIT_NOFILE: {soft} → {min(target, hard)}")
+    except (ImportError, ValueError, OSError) as _e:
+        print(f"Note: could not bump RLIMIT_NOFILE: {_e}")
+
     try:
         client, provider, model_id, price_in, price_out = _build_client(
             args.teacher,
@@ -464,7 +485,10 @@ async def collect(args: argparse.Namespace) -> None:
         return
 
     # Atomic-append: one writer task drains a queue that workers fill.
-    write_q: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=64)
+    # Queue large enough to never throttle even at high concurrency.
+    write_q: asyncio.Queue[dict | None] = asyncio.Queue(
+        maxsize=max(64, args.concurrency * 4)
+    )
 
     async def writer():
         with output.open("a", buffering=1) as f:
