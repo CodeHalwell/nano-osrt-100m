@@ -1081,7 +1081,170 @@ to function as designed. Violating any of these is a bug.
 
 ---
 
+## 17. Implementation notes (carried from v5 optimizations)
+
+Five performance + security patterns proven in v5 that should bake
+into v6 from the start. Full original commits preserved on the
+`archived/v5-optimizations` branch.
+
+### 17.1 Vectorized repetition penalty (`generate()`)
+
+**Pattern:** never loop over generated token IDs in Python — it forces
+CPU-GPU sync every step and hardcodes batch_size=1.
+
+```python
+# WRONG (v5 original — slow, batch-broken):
+if repetition_penalty != 1.0:
+    for token_id in set(generated[0].tolist()):
+        if next_logits[0, token_id] > 0:
+            next_logits[0, token_id] /= repetition_penalty
+        else:
+            next_logits[0, token_id] *= repetition_penalty
+
+# RIGHT (vectorized, ~12-45× faster, batch-safe):
+if repetition_penalty != 1.0:
+    vocab_size = next_logits.shape[-1]
+    mask = torch.zeros(
+        (generated.shape[0], vocab_size),
+        dtype=torch.bool, device=next_logits.device,
+    )
+    clamped = generated.clamp(max=vocab_size - 1)
+    mask.scatter_(1, clamped, True)
+    mask &= generated < vocab_size
+    next_logits = torch.where(
+        mask,
+        torch.where(
+            next_logits > 0,
+            next_logits / repetition_penalty,
+            next_logits * repetition_penalty,
+        ),
+        next_logits,
+    )
+```
+
+Origin: commit `e370ff5` (closes 7 v5 issues).
+
+### 17.2 RoPE direct concatenation (no intermediate full-size tensor)
+
+**Pattern:** for element-wise math on sliced tensors, compute the
+per-slice results and concatenate them directly. Avoid allocating an
+intermediate full-size tensor.
+
+```python
+# WRONG (v5 original — extra allocation):
+def apply_rope(x, cos, sin):
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    x_rot = torch.cat([-x2, x1], dim=-1)   # full-size intermediate
+    return x * cos + x_rot * sin
+
+# RIGHT (direct concatenation of rotated halves):
+def apply_rope(x, cos, sin):
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    cos1, cos2 = cos[..., :d], cos[..., d:]
+    sin1, sin2 = sin[..., :d], sin[..., d:]
+    return torch.cat([x1 * cos1 - x2 * sin1, x2 * cos2 + x1 * sin2], dim=-1)
+```
+
+Reduces memory bandwidth — especially impactful on GPU where RoPE is
+applied every layer × every loop. With 18 effective layers, this
+matters.
+
+Origin: commit `b71f2bd`.
+
+### 17.3 MoE router counting: `torch.bincount`, not `F.one_hot(...).sum()`
+
+**Pattern:** computing per-expert assignment fractions doesn't need a
+3D one-hot intermediate.
+
+```python
+# WRONG (v5 original — large 3D intermediate):
+dispatch_one_hot = F.one_hot(top_idx, num_classes=self.num_routed)
+f = dispatch_one_hot.float().sum(dim=(0, 1)) / (N * self.top_k)
+
+# RIGHT (direct integer count):
+f = torch.bincount(top_idx.view(-1), minlength=self.num_routed).float() / (
+    N * self.top_k
+)
+```
+
+Same pattern applies to `raw_balance_f`, `dispatch_f`, etc. across
+the MoE router code.
+
+Origin: commit `10f8274`.
+
+### 17.4 Sequence-balance loss: `scatter_add_` over `F.one_hot`
+
+**Pattern:** when you need per-batch grouping (2D aggregation), use
+`scatter_add_` into a pre-zeroed tensor instead of a 4D one-hot
+intermediate.
+
+```python
+# WRONG (v5 original — large 4D intermediate B×S×K×E):
+seq_one_hot = (
+    F.one_hot(raw_balance_top_idx, num_classes=self.num_routed)
+    .float()
+    .view(B, S, self.top_k, self.num_routed)
+)
+f_seq = seq_one_hot.sum(dim=(1, 2)) / (S * self.top_k)
+
+# RIGHT (direct scatter-add into B×E, ~20× faster):
+f_seq = torch.zeros(
+    B, self.num_routed, dtype=torch.float32,
+    device=raw_balance_top_idx.device,
+)
+ones = torch.ones_like(raw_balance_top_idx.view(B, -1), dtype=torch.float32)
+f_seq.scatter_add_(1, raw_balance_top_idx.view(B, -1), ones)
+f_seq = f_seq / (S * self.top_k)
+```
+
+Origin: commit `096bc7f`.
+
+### 17.5 Regex ReDoS prevention in reward functions
+
+**Pattern:** when matching whitespace adjacent to a newline boundary,
+use `[ \t]*` or `[^\S\n]*` instead of `\s*`. `\s*` includes `\n`,
+which creates overlapping backtracking paths and O(N²) ReDoS
+vulnerability.
+
+```python
+# WRONG (v5 original — HIGH severity ReDoS, catastrophic backtracking
+# on adversarial input with alternating spaces and newlines):
+numbered = re.findall(
+    r"(?:^|\n)\s*(?:\d+[\.\):]|step\s+\d+)",
+    thinking, re.IGNORECASE,
+)
+
+# RIGHT (horizontal whitespace only at newline boundary):
+numbered = re.findall(
+    r"(?:^|\n)[ \t]*(?:\d+[\.\):]|step\s+\d+)",
+    thinking, re.IGNORECASE,
+)
+```
+
+Apply to ALL regex in reward functions, parsers, and tokenizer-
+adjacent code where input is model-generated or user-supplied.
+
+Origin: commit `88074b5`.
+
+### 17.6 General lesson — the "v5 optimization patterns" branch
+
+The branch `archived/v5-optimizations` (on remote and reachable via
+`git checkout archived/v5-optimizations`) preserves the full original
+commits with their exact code patches and discussion. Reference it
+when implementing the equivalent v6 paths.
+
+The five patterns above plus the six Gradio UX improvements (Stop
+button, Accordion settings, multiline input, branded empty state,
+input length validation, payload size validation) are the engineering
+work worth not re-discovering.
+
+---
+
 ## Document changelog
 
 - **2026-06-07** — initial creation, captures complete OSRT-600M
   architecture spec as planned in README.md
+- **2026-06-07** — added §17 implementation notes ported from v5
+  optimization commits on `archived/v5-optimizations` branch
