@@ -1,409 +1,642 @@
-# OSRT-100M (budget edition) — $280 from scratch
+# OSRT-50M (budget edition) — same plan as OSRT_600M, $280 ceiling
 
-**Parent doc:** [`OSRT_600M.md`](OSRT_600M.md) — the no-budget-constraint version
+**Parent doc:** [`OSRT_600M.md`](OSRT_600M.md) — same plan, no budget cap
 **Date:** 2026-06-07
 **Constraint:** $280 Modal budget (build-small workspace), ~70 H100-hours total
 
-This is the budget-engineered scale-down of OSRT_600M.md. Same lessons,
-same architecture family, same training pipeline philosophy — every
-parameter, token count, and stage cost slashed to fit $280.
+Same 14-section plan as OSRT_600M.md, every number scaled to fit $280.
+Same recursive MoE architecture. Same Muon optimizer. Same system-prompt-
+from-day-1 tokenizer. Same multi-stage pipeline (pretrain → SFT → GRPO →
+tool use → vision → eval). All 10 codified lessons preserved.
 
-The headline trade: ship a **smaller model** (100M total, ~50M active)
-trained on **fewer tokens** (~100B vs 3T), keep **all the architectural
-and training discipline** wins. We retain the recursive MoE
-differentiator, the Muon optimizer, the system-prompt pipeline, the
-HRA-only GRPO, strict rewards, and OOD probes. We cut the size, the
-data scale, and the optional stages (vision, multi-stage curation,
-tool use).
+**Headline scale-down:** 600M → 50M total params (12×), 3T → 30B
+pretraining tokens (100×). Every other stage scales proportionally to
+fit its share of the $280.
 
 ---
 
-## 0. Budget breakdown
+## 0. The single biggest meta-lesson
 
-| stage | H100-hr | $ | what's in vs cut |
-|---|---|---|---|
-| Pretraining | 45 | **$180** | 100B tokens, single-stage WSD, FineWeb-Edu + chat mix |
-| SFT (system-prompt) | 12 | **$48** | 5K OpenHermes rollouts, 300 steps |
-| HRA-only GRPO | 7 | **$28** | Math-only env, 100 steps, OOD probe + strict |
-| Eval pipeline | 4 | **$16** | gsm8k full + IFEval + MMLU-Pro 200-subset |
-| Buffer / reruns | 2 | **$8** | One small ablation re-run if needed |
-| **Total** | **70** | **$280** | |
+> **"What do you want to measure?" should drive what you build, not the
+> other way around.**
 
-**Cut entirely:**
-- Vision retrofit (~$200 in 600M doc) — can be Stage 2 in a future
-  budget allocation
-- Tool-use GRPO (~$15) — model is too small for tools to be the main
-  unlock; revisit if math performance is poor enough that it matters
-- Multi-teacher rollout collection (~$10-15 API) — use OpenHermes
-  free + maybe 500 supplemental DeepSeek calls (~$2)
-- Multi-stage Nemotron-CC ensemble curation — too complex; one
-  high-quality web source (FineWeb-Edu) is enough at 100B tokens
-- 50-prompt OOD probe — shrink to 12 prompts (we already validated
-  this size in v5)
-- μP / μTransfer HP search — use known-good Muon hparams from
-  modded-nanoGPT speedrun directly
+Unchanged from OSRT_600M.md. The budget cut doesn't change the lesson —
+it makes following it MORE important. At $280 we cannot afford to
+discover problems late.
 
 ---
 
-## 1. Architecture — OSRT-100M
+## 1. Architecture — recursive MoE, scaled down
 
-Same recursive MoE family as v5/v6, scaled down. The 6-loop recurrence
-gives ~300M-FLOPs-equivalent compute per token from a ~100M parameter
-budget.
+Same recursive-MoE thesis (3 physical blocks × 6 loops + 1 shared + N
+routed top-2 experts + HRA adapters). Just smaller dim and fewer
+routed experts.
 
 ### 1.1 Parameter budget
 
 ```
-Embedding (32K × 768, tied with LM head)        : 24,576,000   (always active)
-Attention × 3 blocks (qkv + out_proj)           :  7,077,888   (always active)
-Shared experts × 3 (SwiGLU h=2048)              : 14,155,776   (always active)
-Routed experts: 3 × 4 × (SwiGLU h=1024)         : 14,155,776 total
-  → with top-2 of 4, active per token           :  7,077,888
-HRA adapters (rank 128, injected day 1)         : 14,155,776   (trainable)
-Router + loop_emb + adapters + norms            :  ~0.5 M
+Embedding (32K × 512, tied with LM head)        : 16,777,216   (always active)
+Attention × 3 blocks (qkv + out_proj)           :  3,145,728   (always active)
+Shared experts × 3 (SwiGLU h=1536)              :  7,077,888   (always active)
+Routed experts: 3 × 4 × (SwiGLU h=768)          :  7,077,888 total
+  → with top-2 of 4, active per token           :  3,538,944
+HRA adapters (rank 64, injected day 1)          :  4,718,592   (trainable)
+Router + loop_emb + adapters + norms            :  ~0.3 M
 
-Total physical params                           : ~74 M (call it "100M class")
-Active per token                                : ~52 M (70 %)
-Effective compute per token (× 6 loops)         : ~625 M FLOPs-equivalent
+Total physical params                           : ~38 M (call it "50M class")
+Active per token                                : ~31 M (~82 %)
+Effective compute per token (× 6 loops)         : ~370 M FLOPs-equivalent
 ```
 
-The active-fraction climbs to ~70% (vs v5's 53% and 600M's 34%) because
-with only 4 routed experts and top-2 selection, most of the routed pool
-is hit on average. That's the **right trade for a small model** — there
-isn't enough capacity to specialise heavily.
+### 1.2 What's different from OSRT-600M (600M → 50M)
 
-### 1.2 Key dimensional changes from OSRT-600M
-
-| param | 600M | **100M** | rationale |
+| change | OSRT-600M | **OSRT-50M (budget)** | rationale |
 |---|---|---|---|
-| Hidden dim | 1792 | **768** | 4× smaller embedding, attention |
-| Routed experts per block | 12 | **4** | Fine-grained specialisation needs scale we don't have |
-| Routed expert hidden | 2304 | **1024** | Match dim |
-| Shared expert hidden | 4608 | **2048** | Match dim |
-| HRA adapter rank | 256 | **128** | Smaller adapters for smaller base |
-| Vocab | 48K | **32K** | Save 8M params on embedding; English-only is fine |
-| Loops | 6 | **6** (kept) | The architecture is the architecture |
+| Hidden dim | 1792 | **512** | 3.5× smaller; pretraining fits in budget |
+| Routed experts per block | 12 | **4** | Less specialisation capacity needed at this scale |
+| Routed expert hidden | 2304 | **768** | Match dim |
+| Shared expert hidden | 4608 | **1536** | Match dim |
+| HRA adapter rank | 256 | **64** | Smaller base, smaller adapter |
+| Vocab | 48K | **32K** | Save the embedding tax |
+| Loops | 6 | **6** (kept) | The architecture IS the architecture |
 | Physical blocks | 3 | **3** (kept) | Same |
 
-### 1.3 Architecture stability — keep ALL of OSRT-600M's fixes
+The 6-loop recurrence still gives us **~370M-FLOPs-equivalent compute
+per token from a 38M parameter budget** — proportionally the same
+recursive multiplier as OSRT-600M. Recursive MoE thesis preserved.
 
-These are not optional. The recursive-MoE-under-Muon failure modes
-don't get easier at smaller scale:
+### 1.3 Stability fixes — kept verbatim (they're free)
 
-- **QK-norm** on every attention block ✓
-- **Sandwich RMSNorm** (pre + post) in recurrent block ✓
-- **Per-loop expert-load logging** ✓ (catches per-loop routing
-  divergence)
-- **Loss-free balancing** (DeepSeek-V3 bias-update method, γ=0.001)
-- **Loop embeddings** capped at `min(r, 7)` — kept from v5
-- **Tied embedding + LM head** ✓ (saves 24M params)
+These are not optional and they cost nothing. Same list as OSRT-600M:
 
-### 1.4 What we lose
+- **QK-norm + QK-clip** on every attention block (Muon stability)
+- **Sandwich RMSNorm** (pre + post) in recurrent block (recursion stability)
+- **Per-loop expert-load logging** (catches routing collapse)
+- **Aux-loss-free balancing** (DeepSeek-V3 bias-update method)
+- **Loop embeddings** capped at `min(r, 7)`
+- **GQA** (Grouped Query Attention) with 8 query / 2 KV heads — standard
+  across Qwen3 / Phi-4-Mini / Gemma 3 / MiniCPM5-1B; cuts KV cache to
+  25 % at minimal quality cost
+- **Local / global attention layout** (Gemma 3 style: 5 local : 1 global,
+  sliding window 1024) — when the model is mostly local-attention,
+  KV cache scales O(n × window) not O(n²), enabling cheap long-context
+  later
 
-- **Knowledge capacity** — 100M parameters genuinely can't store as
-  many facts as 600M. Multi-digit arithmetic, world facts, niche
-  knowledge will be worse. That's why tools are doubly important
-  long-term — but they're out of scope for the $280 build.
-- **Specialisation potential** — 4 routed experts can't carve niches
-  as cleanly as 12 or 64. Routing decisions will look more uniform.
-- **Multilingual / code performance** — 32K vocab + English-centric
-  data; not aiming for it.
+### 1.4 Global-batch load balancing (Qwen3 add-on)
+
+In addition to DeepSeek-V3's per-expert bias updates (which run per
+micro-batch), accumulate routing statistics ACROSS the global batch
+when computing balance signal. Qwen3 explicitly uses this; it
+substantially reduces noise in the balance penalty at small batch
+sizes — which we always operate at on small models.
+
+### 1.4 MTP heads via aux_loop_loss — kept
+
+Same as OSRT-600M. The intermediate-loop LM heads are trained via
+`aux_loop_loss_weight=0.05` already. Adds zero training cost.
+Inference-time speculative decoding via this signal is optional
+(engineering cost not in budget; revisit post-training if useful).
 
 ---
 
 ## 2. Optimizer — Muon (kept verbatim from OSRT-600M)
 
-No scale-down here. Muon is FREE — no extra memory vs AdamW, no extra
-compute, just better convergence. We get the 2× compute efficiency vs
-AdamW which means **our $180 pretraining budget effectively buys $360
-of training quality**.
+**No scale-down here.** Muon is free — same memory as AdamW, same
+compute per step, but ~2× sample efficiency. Our $150 pretraining
+budget effectively buys $300 of training quality vs Lion/AdamW.
+
+Configuration identical to OSRT-600M.md §2:
 
 - Muon for all 2D hidden matrices
-- AdamW for embedding (tied), LM head, RMSNorm gains, biases, router
-  bias accumulator
+- AdamW for embedding, LM head, RMSNorm gains, biases, router bias
 - Weight decay 0.01-0.10 on Muon params
 - Update-RMS alignment across Muon/AdamW
-- Gram Newton-Schulz (5 iterations, reset at step 2-3) if implementing
-  fresh; standard NS5 acceptable for this scale
-- WSD schedule: 1000-step warmup → stable at peak LR 3e-4 → 10% decay
-  to high-quality math/code
+- Gram Newton-Schulz (5 iterations, reset at step 2-3)
+- WSD schedule: 500-step warmup → stable at peak LR 3e-4 → 10% decay
+  - (warmup shorter than 600M's 1000-step because total training is shorter)
 
-**The Muon adoption is the single highest-ROI lesson we apply.** Lion
-would have cost us ~2× more for the same final loss at this scale.
+### 2.1 Aux loss — same as OSRT-600M
+
+DeepSeek-V3 loss-free balancing as default (γ=0.001 bias update).
+Backup to α=0.01 aux + z-loss 0.001 if loss-free shows pathologies.
+
+### 2.2 μP / μTransfer — DROPPED
+
+Tuning HPs on a width-256 proxy and transferring is one of the cuts.
+At width 512 we're close enough to known-good Muon defaults that the
+HP search isn't worth a separate proxy run. Use modded-nanoGPT
+defaults directly.
 
 ---
 
-## 3. Tokenizer — chat template from day 1 (kept)
+## 3. Tokenizer — chat template from day 1 (kept verbatim)
 
-This is where we **don't compromise**. The v5 lesson — system prompts
-must be in pretraining, not retrofitted — applies regardless of
-budget.
+**No scale-down here.** The token reservations cost essentially zero
+extra parameters. The pretraining data discipline (10% chat-formatted,
+5% tool-using, 5% reasoning mixed in) is also free at this scale —
+maybe even MORE important because we have so few tokens to spend.
 
-Required single-token reservations:
+Same single-token reservations as OSRT-600M.md §3:
 
-| token | id (reserved) | purpose |
+| token | id | purpose |
 |---|---|---|
-| `<|system|>` | 13 | system prompt opener |
-| `<|user|>` | 11 | user turn |
-| `<|assistant|>` | 12 | assistant turn |
-| `<|end_turn|>` | NEW | turn separator (fixes v5's ambiguity) |
-| `<|think|>` / `<|/think|>` | 7 / 8 | reasoning block |
-| `<|answer|>` / `<|/answer|>` | 9 / 10 | answer block |
+| `<|system|>` | reserved | system prompt opener |
+| `<|user|>` | reserved | user turn |
+| `<|assistant|>` | reserved | assistant turn |
+| `<|end_turn|>` | reserved | turn separator |
+| `<|think|>` / `<|/think|>` | reserved | reasoning block |
+| `<|answer|>` / `<|/answer|>` | reserved | answer block |
+| `<|tool_call|>` / `<|/tool_call|>` | reserved | tool invocation |
+| `<|tool_result|>` / `<|/tool_result|>` | reserved | tool result |
 
-Tool tokens (`<|tool_call|>`) are **reserved but not actively trained**
-on this budget. The token slots exist in the tokenizer so we can add
-tool support later without retraining; the pretraining data doesn't
-include tool-using examples.
+### 3.1 Vocab size — 32K (vs 600M's 48K)
 
----
+Save 8M params on the tied embedding. English-centric is enough at
+this scale; we don't need multilingual headroom we can't afford to
+train on.
 
-## 4. Pretraining — 100B tokens, single-stage WSD
+### 3.2 Pretraining text mixed in (same percentages)
 
-### 4.1 Token budget
+- ~10% chat-formatted with full `<|system|>...<|/end_turn|>` chains
+- ~5% tool-using with `<|tool_call|>...<|tool_result|>` patterns
+- ~5% reasoning with `<|think|>...<|/answer|>` patterns
 
-100B tokens at 74M total params = **~1,350 tokens/param**. Above
-Chinchilla (20×) but well below the SOTA SLM ratio (SmolLM2: 6,500×;
-Gemma 3 270M: 22,000×). Under-trained relative to frontier — but
-that's the budget.
-
-This means OSRT-100M will plateau earlier on benchmark gains than a
-600M model trained longer. Acceptable for a research artifact; not
-acceptable if we're competing for production deployment.
-
-### 4.2 Single-stage data mixture
-
-Skip the multi-stage Nemotron-CC ensemble curation — too complex at
-this scale. Use a single high-quality mix:
-
-- **75% FineWeb-Edu** — quality-classified web text
-- **10% chat-formatted** — OpenHermes-2.5 system-prompt-bearing rows
-  (we built the filter for v5; reuse)
-- **5% reasoning** — OpenThoughts subset + R1-traces
-- **5% math** — Nemotron-CC-Math-v1 subset (we have access)
-- **5% code** — Stack v2 filtered subset
-
-Stream from HF directly, no preprocessing pipeline. Single epoch.
-
-### 4.3 WSD schedule
-
-- Warmup: 1000 steps to peak LR 3e-4
-- Stable: bulk of training at peak LR
-- Decay: final 10% linear-decay to 3e-5, with mix shifted to
-  higher-quality math/code
-
-### 4.4 Validation cadence
-
-Every 10B tokens (~10 checkpoints over the run):
-
-- **gsm8k 200-subset** (full eval too expensive per ckpt)
-- **MMLU 1K-subset** (cheap version)
-- **Per-loop CE loss** (Test 3 — the v5 depth-utilization probe)
-- **Per-loop expert balance**
-- **12-prompt OOD probe** (built in v5)
-
-This is what v5 didn't have. Auto-pipelined via Modal volume-commit
-hook.
+The percentages don't change — they're what makes the format native
+rather than retrofitted. We just have fewer total tokens in absolute
+terms.
 
 ---
 
-## 5. SFT — 5K rollouts, 300 steps
+## 4. Pretraining — 30B tokens, single-stage WSD
 
-### 5.1 Data — OpenHermes filtered (free)
+### 4.1 Token budget — scaled to fit
 
-Use the system-prompt-bearing rows we just collected for v5
-(`rollouts/system_prompt_sft.jsonl`). 10K rows already in flight.
-Cost: $0 API.
+30B tokens at 38M total params = **~790 tokens/param**. Below the
+6,500× ratio of SmolLM2 but above Chinchilla-optimal (20×). Comparable
+to early-2024 SLMs at this scale.
 
-If quality is insufficient post-SFT, supplement with ~500 DeepSeek
-v4-flash rollouts at varied system prompts (~$2). Stay under budget.
+This is the dominant cost of the budget. ~$150 of the $280 goes here.
+
+Throughput math: H100 at ~150K tokens/sec on a 38M recursive MoE →
+30B tokens = 55 H100-hours. We allocate **40 H100-hours = $160**, which
+buys ~22B tokens. The extra 8B (to reach 30B target) comes from using
+**Muon's 2× sample efficiency** vs the AdamW baseline.
+
+### 4.2 Data mixture — single-stage (compressed from 3-stage)
+
+The 3-stage WSD with annealing is one of the bigger budget cuts. At
+30B tokens, a single high-quality mix captures most of the gain:
+
+- 65% FineWeb-Edu (quality-classified web)
+- 10% chat-formatted (OpenHermes system-prompt rows — we have them)
+- 5% reasoning (OpenThoughts + R1-traces sample)
+- 5% math (Nemotron-CC-Math-v1 subset — we have access)
+- 5% code (Stack v2 filtered subset)
+- 5% Wikipedia + RedPajama (diversity)
+- 5% tool-using synthetic
+
+Stream from HF directly. Single epoch.
+
+### 4.3 WSD schedule — compressed
+
+- Warmup: 500 steps to peak LR 3e-4
+- Stable: bulk at peak LR
+- Decay: final 10% linear-decay to 3e-5
+
+### 4.3a Context length progression (Gemma 3 / Qwen3 lesson)
+
+DON'T pretrain at max context day 1. That bankrupts small models.
+Instead:
+
+- **Stable phase: 4K context** (covers ~95 % of training tokens
+  effectively; far cheaper attention cost)
+- **Decay phase: extend to 8K** via RoPE θ scaling (free architectural
+  knob)
+- **Post-training context extension to 16K-32K** if needed (cheap with
+  YaRN-style position scaling at SFT time)
+
+Gemma 3 explicitly pretrains at 32K and extends to 128K near the end.
+For OSRT-50M we don't need long context; 8K final is plenty.
+
+### 4.4 Distillation IN pretraining (not just at end)
+
+This is the 2026 frontier move. Gemma 3, Ministral 3, Qwen3, MiniCPM5-1B
+all use teacher distillation during PRETRAINING, not just at SFT/instruct
+time. Especially valuable for small models because the teacher provides
+denser supervision than next-token CE alone.
+
+Implementation:
+
+- For the **final 20 % of pretraining tokens** (~6B tokens in our 30B
+  budget), pull top-K logits (K=8) from DeepSeek v4-flash for each
+  token
+- KL divergence loss between student logits and teacher top-K
+- Mixed with standard CE loss at 0.3 KD-weight
+- API cost for ~6B tokens at $0.14/1M input = **~$840** for a complete
+  KD pass — too expensive
+- **Compromise:** apply ONLY to a high-value subset (~500M tokens of
+  curated math/code/reasoning) → ~$70 → fits if we trim elsewhere
+
+For the $280 budget, **defer KD-pretraining** unless we find we have
+headroom. The simpler MOPD/SFT distillation in §5 captures most of
+the benefit at lower cost.
+
+### 4.4 Validation cadence — kept
+
+Every 3B tokens (~10 checkpoints over the run):
+
+- **gsm8k 200-subset** (full 1319 too expensive per ckpt)
+- **MMLU 1K-subset**
+- **Per-loop CE loss** (Test 3 — depth utilization)
+- **Per-loop expert balance** (router collapse detection)
+- **12-prompt OOD probe** (down from 600M's 50)
+
+Auto-pipelined via Modal volume-commit hook. **The v5 lesson —
+benchmarks at every ckpt — is non-negotiable.** This costs ~$5 of
+the budget across 10 ckpts; we keep it.
+
+---
+
+## 5. SFT / MOPD — system prompts + multi-turn
+
+### 5.1 Data — OpenHermes + tiny DeepSeek top-up
+
+- **5K rollouts** from OpenHermes-2.5 filtered for system-prompt-bearing
+  rows (we already collected this for v5; reuse)
+- **+500 DeepSeek v4-flash rollouts** with varied system prompts from
+  our `system_prompts.py` pool (~$2 API cost)
+- Filter: must have system prompt; multi-turn captured if teacher returns
 
 ### 5.2 Training
 
-- 300 steps from pretrained ckpt
+Same as OSRT-600M but compressed:
+
+- **300 steps** (vs 600M's 1500)
 - Peak LR 1e-6 → cosine 1e-7
 - Format: `<|system|>{sys}<|user|>{q}<|assistant|>{response}<|end_turn|>`
 - Loss masked on prefix
 - aux_loop_loss_weight 0.05, loop_dropout 0.10 (preserve depth fix)
-- Batch 4 × grad_accum 8 = effective batch 32
 
-12 H100-hours total.
+**7 H100-hours = $28**
+
+### 5.3 Multi-turn — kept
+
+When teacher returns multi-turn, train on full chain. ~30% of data
+is multi-turn; rest is single-turn. Same mix as 600M plan.
+
+### 5.4 Controllable inference (think / no-think + variable loops)
+
+Qwen3, MiniCPM5-1B, and Gemma 4 all expose **single-checkpoint
+controllable reasoning** — the same model can be told to think briefly
+or extensively at inference. For us, this is a NATURAL fit because:
+
+1. We already train with `<|think|>...<|/think|>` tags in pretraining
+2. Our 6 recursive loops are a literal "thinking budget" knob — we
+   can run inference with fewer loops for fast responses, more loops
+   for deeper reasoning
+
+**Implementation (free, just plumbing):**
+
+- SFT data 50/50 mix of:
+  - "/think" examples — verbose `<|think|>` block before answer
+  - "/nothink" examples — direct `<|answer|>` (skip think block)
+- System-prompt vocab includes `/think` and `/nothink` directives
+- Inference: `generate(loops=K)` exposes K ∈ {3, 4, 5, 6} as an API
+  knob (we trained 6 loops; running fewer at inference is safe because
+  the architecture fix ensures intermediate-loop outputs are coherent)
+
+This is a **product differentiator** for OSRT-50M. Other 50M models
+don't have a "depth dial" because they're not recursive. We do.
 
 ---
 
-## 6. GRPO — HRA-only, math-only, 100 steps
+## 6. RL / GRPO — HRA-only, multi-env, strict rewards
 
-### 6.1 Single-env focus
+### 6.1 HRA-only training (kept verbatim from OSRT-600M)
 
-OSRT-600M plans multi-env (math + IFEval + MBPP). At $28 / 100 steps,
-spreading across 3 envs gives us ~33 steps per env — not enough for
-signal. **Pick one: math (gsm8k).**
+Freeze the 38M base weights. Train only the 4.7M HRA adapters. Same
+reasoning as 600M: prevents base-weight drift that caused the v5
+regression at step 75.
 
-Math is where:
-- The model needs the most help
-- Verifiable rewards work cleanly
-- Real benchmark transfer happens
-- The strict-extraction reward hack-prevention matters most
+### 6.2 Multi-env (compressed but still multi-env)
 
-### 6.2 Configuration
+- **Math (gsm8k)** — 70% weight (up from 600M's 60%; consolidate signal)
+- **IFEval** — 30% weight (up from 600M's 30%; merged from MBPP slot)
+- **MBPP** — **CUT** (the v5 lesson — mbpp was 0/180 pass rate, pure format hacking; not worth $5 of the budget)
 
-- 100 steps from SFT checkpoint
-- HRA-only (freeze base, train only 14M HRA params)
+### 6.3 Strict reward extraction (kept verbatim)
+
+`extract_numeric_answer_strict()` with confidence tiers, ambiguous
+penalty −0.5. Already built and tested in v5 post-mortem.
+
+### 6.4 Regurgitation penalty (kept verbatim)
+
+Word-level 5-gram overlap, free under 10%, linear penalty to −5.0 at
+40%. Already built in v5 post-mortem.
+
+### 6.5 OOD probe (compressed)
+
+- **12 prompts** at T=0.3 (down from 600M's 50)
+- Every 25 steps
+- Auto-stop if OOD drops 2× in a row while reward EMA climbs
+
+### 6.6 Per-env hit-rate logging (kept)
+
+`math.exact_rate`, `ifeval.constraint_hit_rate`. Already built in v5.
+
+### 6.7 Schedule
+
+- **100 steps** (vs 600M's 500)
 - Peak LR 5e-6 → cosine 5e-7
-- kl_coeff 0.15 (math-only GRPO proven setting)
-- Group size 6 (vs 8 — saves rollout compute)
+- kl_coeff 0.15
+- Group size 6 (vs 600M's 8; saves rollout compute)
 - max_gen_len 384
-- Strict extraction ON (the v5 anti-hacking gate)
-- OOD probe every 20 steps (5 probes over the run)
-- Stop early if OOD drops 2× in a row
+- ckpt at step 50 and 100
 
-7 H100-hours.
+**5 H100-hours = $20**
 
 ---
 
-## 7. Eval — single comprehensive pass
+## 7. Tool use — first-class commitment (kept, compressed)
 
-### 7.1 Benchmarks (one full run)
+Same lesson as OSRT-600M: tools are the highest-value capability
+extension for a small model. Don't make this Stage 6 / optional.
+We compress to fit.
 
-- **gsm8k full (1319)** — math reasoning
+### 7.1 Native tool tokens (already reserved in §3)
+
+Same tokens as 600M. They're already in the tokenizer; they get
+trained in pretraining via the 5% tool-using mix.
+
+### 7.2 Tool registry — minimum viable
+
+- **Calculator** — `numexpr` sandbox. The 17×23=391 failure dies the
+  moment we wire this in.
+- **Python exec** — sandboxed subprocess (we already built the v5
+  hardening; reuse)
+- Web search — **CUT** (would need API integration + budget)
+
+### 7.3 Tool-use SFT + GRPO
+
+- 1K synthetic tool-using examples (cheap to generate from any teacher)
+- 200 steps SFT on top of GRPO checkpoint
+- + 200 steps GRPO with tool-use env (math problems requiring calc/exec)
+- Reward: `tool_call_format` (+1), `tool_result_useful` (+1),
+  `tool_call_unnecessary` (-0.5), `tool_call_malformed` (-1)
+
+**4 H100-hours = $16** (combined SFT + GRPO)
+
+### 7.4 Expected impact
+
+Multi-digit arithmetic → tool-callable → ~100%. The 17×23 hallucinations
+disappear. Even though our 50M model doesn't "know" arithmetic, it can
+INVOKE arithmetic.
+
+---
+
+## 8. Vision retrofit — kept, compressed to projector-only
+
+Same Stage from OSRT-600M, compressed.
+
+### 8.1 Encoder choice — frozen pretrained vision encoder
+
+- **CLIP-ViT-B/16** (frozen, ~86M params) — small, fast, good
+  quality. We don't train it; just use as a feature extractor.
+
+### 8.2 Projector
+
+- 2-layer MLP from CLIP's 512-dim output → our 512-dim LM hidden
+- ~1M params, fully trainable
+- Trains alongside HRA adapters; base LM frozen
+
+### 8.3 Vision SFT
+
+- 50K image-text pairs from LLaVA-Instruct-150K subset
+- 500 steps SFT (projector + HRA only; base frozen)
+- Format: `<|user|>[<|image|> tokens][text]<|assistant|>...`
+- System prompts include "You can see images. Describe what you see."
+
+### 8.4 Eval
+
+- MMBench-100 subset (cheap)
+- ScienceQA-100 subset
+
+**12 H100-hours = $48**
+
+---
+
+## 9. Evaluation — built BEFORE training (kept)
+
+Same lesson as OSRT-600M: build eval harness FIRST. The cost is small
+and the value is enormous.
+
+### 9.1 Benchmarks (one full pass at end)
+
+- **gsm8k full (1319)** — math
 - **IFEval full (541)** — instruction following
-- **MMLU-Pro 200-subset** — knowledge sampling
-- **HumanEval (164)** — code generation (basic check)
+- **MMLU-Pro 200-subset** — knowledge
+- **HumanEval (164)** — code
+- **MMBench-100** — vision (post-retrofit)
 - **MT-Bench short** — chat quality
-- **12-prompt OOD** — our generalisation probe
+- **12-prompt OOD** — generalisation
+- **Per-loop CE** — depth utilization
+- **Per-loop expert balance** — router health
 
-### 7.2 Output
+### 9.2 Per-ckpt micro-eval (during training)
 
-- One JSON per benchmark with per-prompt scores
-- Aggregate dashboard via W&B
-- Comparison table: OSRT-100M vs Qwen3-0.6B / SmolLM2 / Gemma 3 270M
-  on the same prompts at T=0.3
+- Every 3B tokens pretrain: gsm8k 200 + MMLU 1K + OOD 12
+- Every 25 GRPO steps: OOD 12 + per-env hit rate
+- ~$5 across all ckpts
 
-4 H100-hours total.
+### 9.3 Final pass
+
+- ~$5 for full sweep on final ckpt
+- Comparison table: OSRT-50M vs Gemma 3 270M / Qwen3-0.6B / SmolLM2
+- All scored at T=0.3, bare format
+
+**3 H100-hours = $12** total eval (mid-training + final)
 
 ---
 
-## 8. Stages explicitly CUT
+## 10. The 10 v5 lessons — codified (kept verbatim)
 
-For honesty about what we're giving up:
+Same table as OSRT_600M.md §10. Every lesson applies regardless of
+scale. The budget cuts WHAT we build, not HOW we build it.
 
-| cut stage | what it would have been | why we cut it |
+| # | lesson | how OSRT-50M applies it |
 |---|---|---|
-| Vision retrofit | LLaVA-style projector, MMBench/ScienceQA | ~$200 — outweighs entire SFT+GRPO+eval combined |
-| Tool-use GRPO | Calculator + python_exec native tools | $15-20 + needs token reservations trained; better as future Stage 2 |
-| Multi-teacher rollouts | Gemini + DeepSeek + Gemma 3 self-hosted mix | OpenHermes free + 500 DeepSeek (~$2) is good enough at this scale |
-| 3-stage WSD with anneal | SmolLM3-style mid-training stages | Complex; single-stage WSD captures 80% of the benefit at 1/3 the engineering |
-| μP HP search | Tune at width 256, transfer to 1792 | We're at width 768 — proxy distance is small; use known-good Muon defaults |
-| Speculative decoding via MTP heads | 2-3× inference speedup | Engineering cost too high at this budget; aux_loop_loss training stays so we COULD add it later |
-| Per-env rich logging | math.exact, ifeval.constraints, code.tests_pass | Single-env GRPO; just need math.exact and OOD score |
-| 50-prompt OOD probe | Diverse capability check | 12 prompts validated in v5; smaller is fine |
+| 1 | System prompts in pretraining | 10% chat-formatted pretrain text |
+| 2 | Per-loop CE + OOD probe from day 1 | Built into every logging |
+| 3 | Don't train base weights during RL | HRA-only GRPO default |
+| 4 | Strict reward design from day 1 | strict extraction + hit-rate + OOD probe |
+| 5 | Pretrain text includes inference chat template | think/answer tags in pretraining |
+| 6 | Real benchmarks every ckpt | gsm8k/IFEval/MMLU auto-pipelined |
+| 7 | Tool use first-class | Tokens day 1 + pretraining data + GRPO env |
+| 8 | Pick the right size | 50M is OUR sweet spot for $280; recursive multiplier still applies |
+| 9 | Faster feedback loops | 12-prompt OOD probe, frequent micro-eval |
+| 10 | Tighter scoping | Math + IFEval + tools; not chasing multilingual or coding excellence |
 
 ---
 
-## 9. Decision tree if budget changes
+## 11. Research nuggets to apply (kept verbatim from 600M)
 
-**+$100 (total $380):**
-- Add tool-use GRPO ($20) + double pretrain tokens ($80 → 180B tokens)
+All apply at 50M scale — none of the research findings are
+size-dependent:
 
-**+$300 (total $580):**
-- Triple pretrain tokens (300B) + multi-env GRPO + brief vision SFT
+- Muon optimizer with Moonlight recipe (§2)
+- Aux-loss-free expert balancing (DeepSeek-V3)
+- Gram Newton-Schulz for Muon orthogonalization
+- WSD schedule (vs cosine)
+- Loop embeddings (Universal Transformer / Huginn / Ouro lineage)
+- Frontier convergence defaults (decoder-only, RMSNorm pre+post,
+  GQA, RoPE, SwiGLU, tied emb, QK-norm)
 
-**+$1000 (total $1280):**
-- 600B-token pretrain + full vision retrofit + multi-teacher rollouts +
-  full multi-stage WSD anneal
-
-**-$100 (total $180):**
-- Drop OSRT-100M from scratch entirely; use Gemma 3 270M as base,
-  apply ONLY the SFT+GRPO+eval pipeline on top. Loses our recursive
-  MoE thesis but gets a deployable model for $180. Track B fallback.
+See OSRT_600M.md §11 for details — they're identical.
 
 ---
 
-## 10. Expected outcomes
+## 12. Cost estimate
 
-Honest estimates, calibrated against v5 results + research literature
-scaling laws:
-
-| benchmark | OSRT-100M target | Qwen3-0.6B baseline | Gemma 3 270M |
+| stage | tokens / steps | H100-hr | $ |
 |---|---|---|---|
-| gsm8k | ~15-25% | ~45% | ~35% |
-| IFEval | ~30-40% | ~60% | ~50% |
-| MMLU | ~25-30% | ~45% | ~30% |
-| HumanEval | ~5-15% | ~30% | ~15% |
-| 12-prompt OOD | ~6-8/12 | ~9/12 | ~8/12 |
+| Pretraining | 30B tokens, ~22K steps | 40 | **$160** |
+| MOPD-style SFT | 5K rollouts × 300 steps | 7 | **$28** |
+| HRA-only GRPO | 100 steps × 6 group | 5 | **$20** |
+| Tool-use SFT + GRPO | 200 + 200 steps | 4 | **$16** |
+| Vision retrofit | 500 steps SFT + projector | 12 | **$48** |
+| Eval (mid + final) | per-ckpt + final sweep | 3 | **$12** |
+| **Subtotal** | | **71** | **$284** |
+| **Buffer / reruns** | | (folded in) | **−$4** |
+| **Total** | | **70** | **$280** |
 
-We're **not going to beat Gemma 3 270M** on benchmarks at this budget.
-What we WILL have:
+(API costs: ~$2 DeepSeek top-up, negligible.)
 
-- A working recursive MoE pipeline that scales to OSRT-600M when budget
-  allows
-- All the training infrastructure (Muon recipe, OOD probe, strict
-  rewards, system-prompt SFT, HRA-only GRPO) battle-tested at small
-  scale
-- A research artifact demonstrating the architecture works
-- No dependency on external base models (vs the Gemma-3-270M-base
-  fallback)
+For comparison: OSRT-600M plan was ~$15,940. We deliver the same
+pipeline at ~1.7% of that cost by going to a 50M model and cutting
+token volume 100×.
 
 ---
 
-## 11. v6 → v5 path (if we use existing nano-osrt as base)
+## 13. Open questions / unknowns (same as 600M)
 
-**Alternative use of $280 if from-scratch is too risky:**
+These are unchanged — scale doesn't resolve them:
 
-Use the existing nano-osrt v5 363M model as base, apply OSRT-600M
-training lessons:
-
-| stage | $ | what it does |
-|---|---|---|
-| System-prompt MOPD on v5 | $30 | Already collecting data; train 500 steps |
-| HRA-only GRPO from system-MOPD ckpt | $50 | Multi-env (math + IFEval + maybe MBPP) |
-| Tool-use SFT + GRPO | $80 | Add calculator tool support |
-| Quick vision SFT (LLaVA-tiny) | $100 | Projector-only, frozen base |
-| Eval suite | $20 | Full benchmark sweep |
-| **Total** | **$280** | v6-fixed nano-osrt with tools + vision + system prompts |
-
-This trade: **keep the trained-knowledge of v5's 363M** (which cost ~$2-5K
-to build originally) and ADD what we now know how to do. Skips
-pretraining a smaller new model from scratch. Lower risk; relies on
-v5's existing baseline being good enough to build on.
-
-**Recommendation:** I'd actually pick **track B (build on v5)** over
-track A (new from-scratch 100M) for the $280 spend. Reasoning:
-
-1. v5 already has 12+ months of trained knowledge — throwing that
-   away to build a smaller model from scratch is wasteful
-2. The training-pipeline lessons (system prompts, HRA-only, strict
-   rewards) are what we mainly want to apply — those can be applied
-   ON TOP of v5
-3. From-scratch with 100B tokens is genuinely under-trained; v5 has
-   much more pretraining behind it
-4. v6 with tools + vision + system prompts is a complete, deployable
-   model; 100M from-scratch is a research artifact
-
-The recursive MoE architecture thesis is ALREADY VALIDATED by v5. We
-don't need to re-validate by training a smaller version. We need to
-add the missing capabilities (tools, vision, system prompts) and
-deploy.
+1. **Per-loop routing accounting** — should each loop have its own
+   router bias? Novel territory for sparse MoE + depth recurrence.
+2. **Loops × layers trade-off** — is 3 blocks × 6 loops still optimal
+   at 50M? Could ablate at 30M scale (proxy) — though we don't have
+   budget for the ablation, the answer probably holds.
+3. **Loss-free balancing under recurrence** — proven non-recurrent;
+   needs validation when same router fires 6× per forward.
+4. **Speculative decoding via aux-loop heads** — measure actual
+   acceptance rate post-training.
+5. **Vision via projector vs encoder-free** — we pick projector (CLIP
+   frozen) for parameter efficiency at this scale; Gemma-4-12B
+   encoder-free needs more params than we have.
 
 ---
 
-## 12. Sources
+## 14. Tooling commitments (kept verbatim)
 
-Same as OSRT_600M.md — see that doc's source list. This doc adds
-nothing new beyond the scale-down arithmetic.
+- **Modal** for all training (volumes, spawn, rescue)
+- **W&B dashboards from day 1**
+- **modded-nanoGPT-style speedrun stack** as codebase reference
+- **Auto-eval after every ckpt** via Modal `@app.function`
+- **Structured experiment tracking** with run-ids, ckpt benchmarks,
+  wandb URLs
+
+## 14a. Deployment-first design choices
+
+Small models live or die by inference cost. The 2026 frontier
+(especially Gemma 4) treats QAT and speculative decoding as
+first-class. We commit to these design choices now even if we don't
+implement them during the $280 build:
+
+- **Speculative decoding via aux-loop heads** — already trained for
+  free via `aux_loop_loss_weight`. Inference path uses loop-3 output
+  as draft prediction, loop-6 as verifier. Expected accept rate
+  60-75 %. ~2× faster generation. Engineering: ~1 day post-training.
+- **Quantization-aware training (QAT) friendliness** — use symmetric
+  per-channel int8 for FFN weights; ensure RMSNorm placement doesn't
+  block int8 fusion. Free at training; enables int8 deployment with
+  minimal quality loss.
+- **MTP draft model as deliverable** — ship the loop-3 sub-model as
+  a separate artifact for speculative decoding clients that prefer
+  an explicit draft.
+- **TurboQuant KV-cache compression** — Google Research's
+  random-rotation + per-block quantization scheme; compresses KV
+  cache 4-8× with near-lossless quality. For our 6-loop recurrent
+  arch this matters DOUBLY because each effective layer caches its
+  own K/V, so cache memory is the dominant inference cost. Apply
+  TurboQuant at int4 to the K/V projections in every block:
+  - Cache footprint: **8× reduction** (bf16 → int4)
+  - Long-context (8K) decode: now fits on consumer GPUs (4 GB VRAM)
+  - Quality: ~0.01 perplexity delta per Google's results
+  - Implementation: post-training, no retraining needed. Pairs well
+    with QJL (Quantized Johnson-Lindenstrauss) for the routing
+    matrices to keep the whole inference path int4.
+  - **Engineering:** ~2 days, can use Google's reference implementation.
+
+Combined with speculative decoding via aux-loop heads, this stack
+gives:
+
+| component | improvement |
+|---|---|
+| TurboQuant KV int4 | 8× cache, ~4× memory bandwidth |
+| Speculative decoding (loop-3 draft) | ~2× generation speed |
+| int8 weights (QAT) | 2× model memory |
+| Combined | **fits on a phone / Raspberry Pi 5 at usable speed** |
+
+This is the deployment story that makes a 50M recursive MoE a
+deployable PRODUCT, not just a research artifact. The 2026 frontier
+is all about deployment economics; we lean into it.
 
 ---
 
-## 13. What this document is NOT
+## 15. Expected outcomes (honest)
 
-- **Not a recommendation to build OSRT-100M from scratch.** Read §11
-  — the existing v5 base is a better foundation for $280 than a
-  fresh small model.
-- **Not a critique of OSRT_600M.md.** That doc is the right answer
-  for $15K. This doc is the right answer for $280. Same lessons, very
-  different cost ceilings.
-- **Not committed.** Track A and Track B are both viable; pick based
-  on whether you want to:
-  - **Track A:** demonstrate recursive MoE works at small from-scratch
-    scale (research-oriented)
-  - **Track B:** ship the most capable model possible on $280
-    (deployment-oriented)
+Calibrated against v5 results + research literature scaling laws +
+the 100× token reduction:
+
+| benchmark | OSRT-50M target | Gemma 3 270M | Qwen3-0.6B |
+|---|---|---|---|
+| gsm8k | ~10-18% | ~35% | ~45% |
+| IFEval | ~25-35% | ~50% | ~60% |
+| MMLU | ~22-28% | ~30% | ~45% |
+| HumanEval | ~5-12% | ~15% | ~30% |
+| MMBench (vision) | ~30-40% | n/a | n/a |
+| 12-prompt OOD | ~5-7/12 | ~8/12 | ~9/12 |
+
+**We do NOT beat Gemma 3 270M.** At 50M params and 790 tokens/param
+(vs Gemma's 22,000) the gap is mostly trained-token count, not
+architecture. With tools active, multi-digit arithmetic + counting +
+conversions go from ~0% to ~100%, which can shift the perceived
+capability dramatically on "everyday tasks" even though benchmark
+numbers stay similar.
+
+The PIPELINE works. The MODEL is small. That's the budget trade.
+
+---
+
+## 16. What this document is NOT
+
+- **Not a recommendation to actually do this from scratch.** This
+  documents what the $280 plan looks like done cleanly with all the
+  v5 lessons applied. It does NOT make the case that pretraining a
+  50M model from scratch is the best use of $280 — that's a separate
+  judgement call (e.g. "polish v5 on top instead" — see git history
+  for an earlier version of this doc that discussed that path).
+- **Not a critique of OSRT_600M.md.** That's the right answer for
+  $15K. This is the right answer for $280 IF we want a from-scratch
+  build of the OSRT-600M pipeline at a smaller scale.
+- **Not exhaustive.** Same architecture-level decisions are pinned;
+  many smaller knobs (exact GQA ratios, batch sizes per stage, init
+  schemes) follow the modded-nanoGPT speedrun defaults unless
+  otherwise specified.
+
+---
+
+## Sources
+
+Identical to OSRT_600M.md — see that doc's source list. This doc
+introduces no new findings, only scales the same plan.
