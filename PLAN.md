@@ -31,6 +31,86 @@ and probe results captured at the bottom of each stage block.
 
 ---
 
+## Architecture (for reporting / comparison)
+
+**nano-osrt — recursive Mixtral-style MoE**
+
+| component | value |
+|---|---|
+| Total parameters | ~363M base + 86M HRA = **~450M** |
+| Hidden dim | 1536 |
+| Physical blocks | 3 (weights shared across loops) |
+| Recursive loops | 6 (each block applied 6 times → 18 effective layers) |
+| Per-block layout | Attention + MoE (1 shared + 8 routed, **top-2 routing**) |
+| Per-pass adapters | Low-rank delta per (loop, block) — 18 adapter pairs |
+| HRA injection | Rank 256, +86M params |
+| Loop embeddings | Per-loop routing bias (1536-dim, 6 vectors) |
+| Vocab | 32K BPE (HF tokenizer) |
+| Architecture-fix knobs | `aux_loop_loss_weight` (per-loop LM-head aux loss) + `loop_dropout_prob` (stochastic depth) — added after probe showed loop collapse (loop 5 doing 90% of work) |
+
+### Active parameters per token
+
+Convention reminder: standard "active per token" includes embedding + attention + LayerNorms + LM head + shared experts + the top-k routed experts that fired for that token. Excludes routed experts not chosen.
+
+| component | active per fwd |
+|---|---|
+| Embedding (32K × 1536) | 49M |
+| Attention (3 blocks, weights shared across 6 loops) | 28M |
+| Shared experts (3 blocks × 1 shared FFN, shared across loops) | 21M |
+| Routed experts (top-2 of 8 per block per loop; over 6 loops routing usually hits 6-8 of 8 unique experts per block) | **66-264M** (low: deterministic routing reuses same 2; high: every loop picks different pair) |
+| HRA adapters | ~14M |
+| **Total active per token** | **~130-380M** |
+
+Realistic figure for "vs Llama/Qwen/Mixtral" comparisons: **~150-300M active per token**, depending on how the routing samples across loops.
+
+### Compute story (separate from active-param story)
+
+Because the 3 physical blocks are applied 6 times each, **compute is 6× the weight-memory active count**. The recursive trick trades parameter memory for inference compute.
+
+| metric | nano-osrt | comparable to |
+|---|---|---|
+| Weight memory active | ~150-300M | Qwen 2.5 0.5B (dense), Llama 3.2 1B (dense, smaller) |
+| FLOPs per token | ~1-2B equivalent | Phi-3-mini 3.8B compute footprint |
+
+So nano-osrt punches above its weight on per-parameter benchmarks because we burn ~6× compute per forward via the loop recursion. Worth flagging this when comparing capability scores.
+
+### Training lineage (for the published model card)
+
+```
+v5 pretrain (17K steps, FineWeb-Edu / CodeParrot / Wikipedia, 1024 ctx)
+  ↓
+v5 SFT base → SFT-long → SFT-ultralong (8192 ctx, math+code+chat)
+  ↓
+GRPO (700 steps, gsm8k verifiable rewards)
+  ↓
+pretrain_extend (continued mid-training on Nemotron-CC-Math + Stack v2 + RedPajama)
+  ↓
+sft_refresh + sft_math (format anchor + math polish)
+  ↓
+pretrain_extend2 (8100 steps, 9-stream mix: OpenR1-Math + OpenMath-Reasoning +
+                   Open-Web-Math + Open-Thoughts + Dolmino-FLAN +
+                   Dolmino-PES2O + UltraChat + Cosmopedia v2 + FineWeb-Edu)
+  ↓
+loop_fix + loop_fix_v2 (architecture fix — aux LM-head loss on every loop +
+                         loop dropout + curriculum + per-loop weights;
+                         fixed loop collapse where loop 5 did 90% of work)
+  ↓
+pretrain_extend3 (first mid-training with working recursive depth, 3000 steps)
+  ↓
+MOPD (1000 steps, distillation from 13K Gemini 3.5 Flash + DeepSeek v4-flash
+       rollouts across math/reasoning/chat/science/code)
+  ↓
+grpo_multi (verifiable rewards across math gsm8k + IFEval + MBPP test-pass)
+  ↓ (next)
+vision retrofit (encoder-free, Gemma 4 12B style, ~10M-param projector)
+  ↓
+optional tool_use GRPO (calculator + python_exec for arithmetic offload)
+  ↓
+full eval suite (gsm8k + MATH-500 + MMLU-Pro + IFEval + HumanEval + MMBench)
+```
+
+---
+
 ## Pipeline overview
 
 ```
