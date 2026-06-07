@@ -2480,6 +2480,8 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 number_check_reward=cfg.reward_number_match,
                 number_check_penalty=cfg.reward_number_miss,
                 strict_template_weight=cfg.reward_strict_template_weight,
+                strict_extraction=getattr(cfg, "strict_answer_extraction", False),
+                ambiguous_penalty=getattr(cfg, "ambiguous_answer_penalty", -0.5),
             )
         if env_name == "ifeval":
             total, bd = compose_template_rewards(
@@ -2591,8 +2593,83 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     def _sample_env() -> str:
         return env_rng.choices(cfg.env_names, weights=cfg.env_weights, k=1)[0]
 
+    # ── OOD probe runner ──
+    # Periodically evaluate the model on a held-out set the policy is
+    # NOT training on. Lets us detect reward hacking DURING the run:
+    # if training reward EMA climbs but OOD score drops, the model is
+    # exploiting the reward function rather than learning the skill.
+    ood_prompts = list(getattr(cfg, "ood_probe_prompts", ()))
+    ood_interval = int(getattr(cfg, "ood_probe_interval", 0) or 0)
+
+    def _run_ood_probe(at_step: int) -> dict:
+        """Run all OOD prompts at low temp and return (score, breakdown).
+
+        Score = fraction of prompts whose first <|answer|>...</|answer|>
+        block contains the expected_answer substring (case-insensitive).
+        Substring match is intentionally lenient — we're tracking
+        generalization, not exact-format compliance (which the training
+        rewards already cover).
+        """
+        if not ood_prompts:
+            return {"score": 0.0, "total": 0, "hits": 0, "details": []}
+        hits = 0
+        details: list[dict] = []
+        # Switch to eval mode for clean probe (no aux losses computed)
+        inner_for_gen.train(False)
+        for prompt_text, expected in ood_prompts:
+            full_prompt = f"{cfg.user_tag}{prompt_text}{cfg.assistant_tag}"
+            ids = tok.encode(full_prompt, add_special_tokens=False)
+            t = torch.tensor([ids], dtype=torch.long, device=device)
+            with torch.no_grad():
+                gen = inner_for_gen.generate(
+                    t,
+                    max_new_tokens=int(
+                        getattr(cfg, "ood_probe_max_new_tokens", 200),
+                    ),
+                    temperature=float(
+                        getattr(cfg, "ood_probe_temperature", 0.3),
+                    ),
+                    top_p=cfg.top_p,
+                    eos_token_id=tok.eos_token_id,
+                    stop_token_ids=list(cfg.stop_token_ids),
+                )
+            comp = tok.decode(
+                gen[0, len(ids):].tolist(),
+                skip_special_tokens=False,
+            )
+            ans = extract_answer_text(
+                comp,
+                answer_open=cfg.answer_open,
+                answer_close=cfg.answer_close,
+            ) or ""
+            # Lenient: substring match. Strict-format is the training
+            # objective; this is generalization.
+            hit = expected.lower() in ans.lower()
+            if hit:
+                hits += 1
+            details.append({
+                "prompt": prompt_text,
+                "expected": expected,
+                "answer": ans[:120],
+                "hit": hit,
+            })
+        return {
+            "score": hits / len(ood_prompts),
+            "total": len(ood_prompts),
+            "hits": hits,
+            "details": details,
+        }
+
+    # Import the extractor lazily inside the probe but resolve it here
+    # so we get a clear error if rewards.py is missing the symbol.
+    from nano_osrt.rewards import extract_answer_text  # noqa: E402
+
     start_time = time.time()
     print(f"\nStarting training at step {start_step}...")
+    if ood_prompts and ood_interval > 0:
+        print(
+            f"OOD probe: {len(ood_prompts)} prompts every {ood_interval} steps",
+        )
 
     for step in range(start_step, cfg.total_steps):
         # LR schedule (cosine with re-warm anchor)
@@ -2867,6 +2944,34 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                     "grpo_multi/mbpp_timeout_count": c["timeout"],
                 })
                 wandb.log(log_dict, step=step)
+
+        # ── OOD probe (every cfg.ood_probe_interval steps) ──
+        # Generalization check on a held-out set the policy is NOT
+        # training on. Diverges from training-reward EMA when the
+        # model starts reward-hacking.
+        if (
+            ood_interval > 0 and ood_prompts
+            and step > 0 and step % ood_interval == 0
+        ):
+            probe = _run_ood_probe(step)
+            print(
+                f"           ood_probe: {probe['hits']}/{probe['total']} "
+                f"({probe['score']:.1%})",
+                flush=True,
+            )
+            for d in probe["details"]:
+                mark = "✓" if d["hit"] else "✗"
+                print(
+                    f"             {mark} {d['prompt'][:60]:<60} "
+                    f"expect={d['expected']:<8} got={d['answer'][:40]!r}",
+                    flush=True,
+                )
+            if use_wandb:
+                wandb.log({
+                    "grpo_multi/ood_score": probe["score"],
+                    "grpo_multi/ood_hits": probe["hits"],
+                    "grpo_multi/ood_total": probe["total"],
+                }, step=step)
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:

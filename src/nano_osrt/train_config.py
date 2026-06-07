@@ -1786,3 +1786,48 @@ class MultiEnvGRPOConfig(GRPOConfig):
             "ground_truth_format": "mbpp_tests",
         },
     }
+
+    # ── Anti-hacking knobs (added after the step 75→150 regression) ──
+    # Strict numeric extraction closes the "last-number-wins" loophole
+    # where the model dumps multiple candidate numbers in the answer
+    # block hoping the last one matches GT. With strict_extraction=True,
+    # check_answer_score uses extract_numeric_answer_strict which only
+    # awards positive reward on single-number / boxed / concluding-phrase
+    # answers. Ambiguous answer blocks (multiple unmarked numbers) get
+    # `ambiguous_penalty` instead of a free 0.
+    strict_answer_extraction: bool = True
+    ambiguous_answer_penalty: float = -0.5
+
+    # ── OOD probe: in-loop generalization monitor ──
+    # Periodically run a held-out set of prompts the model is NOT
+    # training on. If train reward EMA climbs but OOD score drops →
+    # reward hacking, stop the run. Lets us catch the failure mode
+    # the step 75→150 regression revealed (in-distribution gsm8k
+    # rollout reward climbed; out-of-distribution direct-arithmetic
+    # inference dropped) DURING training instead of post-hoc.
+    ood_probe_interval: int = 25  # every N optimizer steps
+    ood_probe_temperature: float = 0.3  # low temp for deterministic eval
+    ood_probe_max_new_tokens: int = 200
+    # 12 prompts spanning styles NOT in the training distribution:
+    #   - direct arithmetic (NOT gsm8k word-problem style)
+    #   - comparison
+    #   - conversion
+    #   - simple instruction following (NOT IFEval-style constraints)
+    #   - short code (NOT mbpp test_list style)
+    # Each has an expected_answer pattern that must appear in the
+    # FIRST answer block. Scored as fraction-of-prompts-correct.
+    ood_probe_prompts: tuple = (  # noqa: RUF012
+        ("What is 23 + 14?", "37"),
+        ("What is 17 * 23?", "391"),
+        ("What is 12 + 8 * 3?", "36"),
+        ("Compute 24 - 7 - 3.", "14"),
+        ("Which is bigger: 0.9 or 0.11?", "0.9"),
+        ("How many seconds are in 3 minutes?", "180"),
+        ("Convert 100 centimeters to meters.", "1"),
+        ("What is half of 50?", "25"),
+        ("If a train travels 60 mph for 2 hours, how far does it go?",
+         "120"),
+        ("Round 3.7 to the nearest integer.", "4"),
+        ("What is the square root of 64?", "8"),
+        ("Count: how many letters are in 'banana'?", "6"),
+    )

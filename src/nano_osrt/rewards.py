@@ -60,6 +60,80 @@ def extract_numeric_answer(
     return None
 
 
+def extract_numeric_answer_strict(
+    text: str,
+    answer_open: str = "<|answer|>",
+    answer_close: str = "<|/answer|>",
+) -> tuple[str | None, str]:
+    """STRICT numeric answer extractor — closes the "last-number-wins" loophole.
+
+    The loose extract_numeric_answer above lets a model spam multiple
+    numbers and win on whichever happens to be last. GRPO exploits this:
+    "I tried 50, then 32, but actually 18" → reward thinks model said 18.
+
+    This stricter version returns (answer, confidence) where confidence
+    is one of:
+      - "single_number":     answer block contains exactly ONE number
+      - "boxed":             answer wrapped in **N** or `N` or boxed{N}
+      - "concluding":        last sentence is "= N" / "is N" / "answer: N"
+      - "ambiguous":         multiple numbers, no clear conclusion → None
+      - "no_extraction":     no number found at all → None
+
+    Only "single_number", "boxed", "concluding" yield a non-None answer.
+    GRPO can no longer dump numbers and hope.
+
+    Use this in `check_answer_score` when a config flag is set; keep the
+    loose version for inference scoring / display so a verbose-but-correct
+    free-form answer still gets partial credit at probe-time.
+    """
+    if answer_open not in text or answer_close not in text:
+        return None, "no_answer_block"
+
+    start = text.rindex(answer_open) + len(answer_open)
+    end_rel = text[start:].find(answer_close)
+    if end_rel < 0:
+        return None, "no_answer_close"
+    inside = text[start:start + end_rel].strip()
+
+    # All numbers in the answer block (allow integers, decimals, neg, commas)
+    numbers = re.findall(r"-?\d+(?:[,.]\d+)*", inside)
+    if not numbers:
+        return None, "no_extraction"
+
+    cleaned = [n.replace(",", "") for n in numbers]
+
+    # Confidence tier 1: exactly one number in the entire answer block
+    if len(cleaned) == 1:
+        return cleaned[0], "single_number"
+
+    # Confidence tier 2: a "boxed" or marked-up number — many appear,
+    # but ONE is clearly the answer (e.g. **18**, `18`, \\boxed{18}, *18*)
+    boxed = re.findall(
+        r"(?:\*\*|`|\\boxed\{|\$\\boxed\{|\*)"
+        r"(-?\d+(?:[,.]\d+)*)"
+        r"(?:\*\*|`|\}|\$|\*)",
+        inside,
+    )
+    if len(boxed) == 1:
+        return boxed[0].replace(",", ""), "boxed"
+
+    # Confidence tier 3: concluding phrase — last clause says "answer is N"
+    # or "= N" or "Therefore, N". Catches well-formatted reasoning that
+    # explicitly commits to the final answer.
+    concluding = re.search(
+        r"(?:answer\s+is|=\s*|therefore[,:]?\s*|so\s+the\s+answer\s+is\s*|"
+        r"final\s+answer[\s:]*|=\s*\\boxed\{)"
+        r"\s*\$?(-?\d+(?:[,.]\d+)*)\$?\s*[.\s]*$",
+        inside,
+        flags=re.IGNORECASE,
+    )
+    if concluding:
+        return concluding.group(1).replace(",", ""), "concluding"
+
+    # Multiple numbers, no clear marker — model is hedging. Reject.
+    return None, "ambiguous"
+
+
 def extract_gsm8k_answer(answer_text: str) -> str | None:
     """Extract the ground truth answer from GSM8K #### format."""
     if "####" in answer_text:
@@ -172,6 +246,8 @@ def check_answer_score(
     think_close: str = "<|/think|>",
     answer_open: str = "<|answer|>",
     answer_close: str = "<|/answer|>",
+    strict_extraction: bool = False,
+    ambiguous_penalty: float = -0.5,
 ) -> tuple[float, str]:
     """Tiered correctness reward using the format-aware extractor.
     Matches Unsloth's `check_answer` tier schedule but adapted to our
@@ -183,21 +259,36 @@ def check_answer_score(
         within 20 % (ratio)      +0.5
         wrong / unparseable      -1.5
         no extract (no answer)   -0.0  (penalty handled by match_format)
+        ambiguous (strict only)  ambiguous_penalty (-0.5)
 
     Why a separate function from `correctness_partial_credit`?
     The Unsloth schedule has TIGHTER positive rewards (max 3.0 vs 5.0)
     which composes better with multi-component reward stacks — keeps
     the math signal from drowning out the format signal.
+
+    strict_extraction=True closes the "last-number-wins" hack the v1
+    GRPO run revealed: model dumps multiple numbers in the answer
+    block, hoping the last one matches GT. Strict mode uses
+    extract_numeric_answer_strict which only returns an answer when
+    extraction is high-confidence (single number / boxed / concluding
+    phrase) and applies `ambiguous_penalty` when the answer block
+    contains multiple unmarked numbers.
     """
-    # Use the format-aware numeric extractor regardless of regex match
-    # — it pulls the LAST number from inside the answer tag and handles
-    # both exact-format and looser cases (multi-answer block, missing
-    # think). The format-strictness signal is captured by the separate
-    # `match_format_*` rewards, so we don't double-penalise here.
-    guess = extract_numeric_answer(
-        text, think_close=think_close,
-        answer_open=answer_open, answer_close=answer_close,
-    )
+    if strict_extraction:
+        guess, confidence = extract_numeric_answer_strict(
+            text, answer_open=answer_open, answer_close=answer_close,
+        )
+        if confidence == "ambiguous":
+            # Model is hedging — small negative reward instead of just zero
+            # so GRPO actively learns to commit to a single answer.
+            return ambiguous_penalty, "ambiguous"
+    else:
+        # Use the loose format-aware numeric extractor — picks the LAST
+        # number inside the answer tag. Backwards-compatible default.
+        guess = extract_numeric_answer(
+            text, think_close=think_close,
+            answer_open=answer_open, answer_close=answer_close,
+        )
 
     if guess is None or guess == "":
         return 0.0, "no_extract"
@@ -994,6 +1085,8 @@ def compose_template_rewards(
     number_check_penalty: float = -0.5,
     user_marker: str = "<|user|>",
     strict_template_weight: float = 0.0,
+    strict_extraction: bool = False,
+    ambiguous_penalty: float = -0.5,
 ) -> tuple[float, dict]:
     """Run all template + correctness rewards as a list and sum.
 
@@ -1041,6 +1134,8 @@ def compose_template_rewards(
             completion, gt,
             think_open=think_open, think_close=think_close,
             answer_open=answer_open, answer_close=answer_close,
+            strict_extraction=strict_extraction,
+            ambiguous_penalty=ambiguous_penalty,
         )
         total += ans_score
         bd["r_check_answer"] = ans_score
