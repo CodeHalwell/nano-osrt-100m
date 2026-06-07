@@ -90,8 +90,21 @@ W_{t+1} = W_t - η·(U_t + λ·W_t)        # update + decoupled weight decay
 **Sources:**
 - DeepSeek-V2 paper (arXiv 2405.04434)
 - DeepSeek-V3 technical report (arXiv 2412.19437)
-- DeepSeek-V4 technical report (preview, arXiv 2511.23404, Dec 2025)
+- DeepSeek-V4 preview announcement (DeepSeek API news,
+  https://api-docs.deepseek.com/news/news260424 — released 2026-04-24)
+- DeepSeek-V4-Flash Hugging Face card
+  (huggingface.co/deepseek-ai/DeepSeek-V4-Flash) — primary public spec
+  for mHC, CSA/HCA, Muon, sqrt(softplus) routing, hash routing
+- HF Transformers DeepSeek-V4 model docs
+  (github.com/huggingface/transformers/.../model_doc/deepseek_v4.md)
 - DeepSeek-V3.2 (arXiv 2512.02556)
+
+> 🔧 **CITATION CORRECTION (2026-06-07).** Earlier drafts cited
+> arXiv 2511.23404 as the DeepSeek-V4 technical report. That arXiv
+> ID is the **LFM2 Technical Report** (see §3). DeepSeek-V4 has no
+> arXiv preprint yet — the primary sources are the DeepSeek news
+> page and the Hugging Face model card linked above. See
+> `review/SYNTHESIS.md` Tier 1 #10.
 
 ### Key innovations across versions
 
@@ -160,7 +173,9 @@ Trained 671B-total / 37B-active on ~15T tokens.
 
 ## 3. LFM2 (Liquid AI)
 
-**Source:** "LFM2 Technical Report" (Liquid AI, Dec 2025)
+**Source:** "LFM2 Technical Report" (Liquid AI, Nov 2025) —
+**arXiv: 2511.23404**. Previously miscredited to DeepSeek-V4
+elsewhere in this doc; corrected as of 2026-06-07.
 
 ### Family
 

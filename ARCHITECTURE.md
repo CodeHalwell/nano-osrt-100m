@@ -40,11 +40,21 @@ ARCHITECTURE.md alone.
 
 OSRT-600M is a **recursive Mixtral-style sparse MoE transformer** with
 **3 physical decoder blocks applied 6 times via depth recurrence**
-(giving 18 effective layers), using **HRA adapters**, **gated short
-convolutions + GQA attention**, **manifold-constrained
-hyper-connections**, **Muon-optimized weights**, and **MLA-style KV
-cache compression** — totaling ~599M physical params, ~206M active
-per token, ~2.5B FLOPs equivalent per token.
+(giving 18 effective layers), using **HRA adapters**, **GQA attention**,
+**manifold-constrained hyper-connections**, **Muon-optimized weights**,
+and **MLA-style KV cache compression** — totaling ~599M physical
+params, ~232M active per token (canonical, see §2.1 for full
+breakdown), ~2.5B FLOPs equivalent per token.
+
+> ⚠ **ACCOUNTING NOT YET CODE-GENERATED.** All param/FLOP/memory
+> numbers in this doc are hand-derived. A `compute_budget.py` script
+> (Phase 1 of remediation per `review/SYNTHESIS.md`) will replace these
+> with generated values. Treat current numbers as approximate until then.
+
+> 🔧 **"GATED SHORT CONVOLUTIONS" REMOVED.** The original overview
+> claimed a hybrid conv + GQA architecture, but no conv sub-block is
+> specified anywhere in this doc. Spec is attention + MoE only.
+> See `review/SYNTHESIS.md` Tier 2 #16 if you want to add it.
 
 ---
 
@@ -55,7 +65,7 @@ per token, ~2.5B FLOPs equivalent per token.
 ```
 COMPONENT                                          PHYSICAL          ACTIVE PER TOKEN
 ─────────────────────────────────────────────────────────────────────────────────────
-Embedding (32,768 × 1,536, tied with LM head)      100,663,296       ≈ same
+Embedding (65,536 × 1,536, tied with LM head)      100,663,296       ≈ same
   -- one row used per token at embedding lookup
   -- full matrix touched at LM head computation
 
@@ -144,7 +154,15 @@ Use these as ratios, not absolutes.)
 - **Pre-tokenization**: GPT-2 style regex (handles contractions,
   numbers, punctuation)
 
-### 3.2 Special tokens (reserved IDs)
+> 🔧 **THIS SPEC ≠ CURRENT `tokenizer/tokenizer.json`.** The on-disk
+> tokenizer is the v5 artifact: PAD=0, BOS=1, EOS=2, no `<|end_turn|>`,
+> no tool/image/audio tokens, ID 14 is `!`. The IDs below are the
+> **target v6 contract**. The tokenizer MUST be retrained from scratch
+> against this table before any v6 training begins. After retraining,
+> add a `tokenizer_contract_test.py` that asserts `tok("<|end_turn|>")
+> == [14]` and friends. See `review/SYNTHESIS.md` Tier 0 #1.
+
+### 3.2 Special tokens (reserved IDs — v6 contract)
 
 | token | id | role |
 |---|---|---|
@@ -317,6 +335,26 @@ W_O ∈ ℝ^(1536 × 1536)        # 2.36M params
 
 Per block: ~5.76M params; across 3 blocks: ~17.3M. Plus HRA adapters.
 
+> 🛑 **DECISION REQUIRED — V-from-K rank/expressivity.** Restricting
+> V to a linear function of K means token value information must lie
+> in the span of the token's keys. A token that needs to act as a
+> routing anchor (high K affinity for many queries) while also
+> contributing context-specific V cannot do so under this design.
+> See `review/SYNTHESIS.md` Tier 1 #7. Three options:
+>   (a) Accept the constraint (current spec, smallest model).
+>   (b) Widen latent K to 768 dim, then split to independent K (512)
+>       and V (512) projections at decode — recovers ~1M params,
+>       restores expressivity.
+>   (c) True DeepSeek MLA: compress both K and V into one shared
+>       latent c_KV with decoupled-RoPE keys for matrix absorption.
+>       Largest spec change; biggest inference FLOP savings.
+>
+> **Important: V-from-K must operate on the un-rotated K.** RoPE is
+> position-dependent, so applying it before caching breaks the
+> linear K→V relationship. Cache the un-rotated K_DOWN; apply RoPE
+> at attention time on both the cached K and the freshly computed
+> Q for the current token.
+
 ### 6.3 V derived from K (MLA-inspired)
 
 ```
@@ -447,6 +485,33 @@ expert_id = hash(token_id) mod 12
 
 Stabilizes early training (prevents collapse before router learns).
 Block 2 uses normal learned routing.
+
+> 🛑 **DECISION REQUIRED — hash routing semantics under recurrence.**
+> The current text is ambiguous on three independent questions; pick
+> one answer to each before implementing. See `review/SYNTHESIS.md`
+> Tier 1 #6.
+>
+> **Q1: Top-K behaviour.** §7.4 sets top-2 for learned routing.
+> Does hash routing also select 2 experts (e.g. two hashes per token),
+> or only 1? If hash → 1 expert, active FLOPs differ from learned
+> blocks and §2.1 needs adjustment.
+>
+> **Q2: Loop dependence.** Blocks 0 and 1 are reused across all 6
+> loop iterations. Three options:
+>   (a) `expert_id = hash(token_id) mod 12` (loop-independent — same
+>       expert in loop 1 and loop 6, prevents depth specialization)
+>   (b) `expert_id = hash(token_id + loop_idx) mod 12` (Antigravity
+>       recommendation — allows depth specialization)
+>   (c) Hash only on loop 0; loops 1-5 use learned router on blocks
+>       0 and 1 (most flexible, least stable)
+>
+> **Q3: Hash-to-learned transition.** Is the switch at block index
+> 2 hard (binary), or annealed across training (start all-hash, end
+> with only block 0 hashed)? v5 never trained this; we are guessing.
+>
+> Recommendation (mine, not authoritative): Q1 top-1, Q2 (b)
+> loop-indexed hash, Q3 hard binary at block 2. Wait for user
+> confirmation.
 
 ### 7.6 Aux-loss-free load balancing
 
@@ -642,6 +707,31 @@ longer-range structure.
 ---
 
 ## 10. Forward pass walkthrough
+
+> 🛑 **PSEUDOCODE BELOW HAS KNOWN BUGS** — do not implement literally.
+> See `review/SYNTHESIS.md` Tier 0 #3 for the full list. Three bugs to
+> fix before this becomes implementable:
+>
+> **Bug 1 — `expand()` aliasing in mHC init (line: `X = x.unsqueeze
+> (-2).expand(-1, -1, 4, -1)`):** `expand()` creates a view with shared
+> storage across the expanded dim. The subsequent in-place write
+> `X[:, :, 0, :] = X[:, :, 0, :] + loop_bias` will either error or
+> silently corrupt all 4 channels. Fix: use `.repeat(1, 1, 4, 1)` or
+> `.expand(...).clone()`.
+>
+> **Bug 2 — Shape arithmetic in `x_view = (A_l @ X.reshape(B, L, 4,
+> 1536).transpose(2, 3)).squeeze(-1)`:** after transpose the tensor is
+> `[B, L, 1536, 4]`, and `A_l` is `[1, 4]` — the matmul doesn't produce
+> `[B, L, 1536]`. Fix: rewrite using einsum with named axes, e.g.
+> `torch.einsum("blh,blhd->bld", A, X)` where `A: [B, L, 4]` and
+> `X: [B, L, 4, 1536]`.
+>
+> **Bug 3 — Final collapse uses stale `A_l`:** `x_final = (A_l @
+> X.transpose(-1, -2)).squeeze(-1)` reuses whichever `A_l` was
+> generated last (in the FFN sub-block of block 2 of loop 5), not a
+> dedicated collapse parameter. **DECISION REQUIRED:** define a
+> dedicated final collapse head (constant learnable weights, dynamic
+> head, or simple mean over channels) before this can be implemented.
 
 Detailed pseudocode for one forward pass on a batch of `B` sequences
 of length `L`:
@@ -917,23 +1007,41 @@ kv_cache: dict
 
 ### 13.3 Compression stack at deployment
 
-| step | reduction | size at 4K |
-|---|---|---|
-| Raw cache (BF16) | 1× | 72 MB |
-| + V-from-K (cache K only) | 2× | 36 MB |
-| + TurboQuant int4 | 4-8× | 4.5-9 MB |
-| + Sliding window (if applicable) | 2-4× | 1-4 MB |
+The §13.1 baseline already excludes V (K-only), so the V-from-K row
+in earlier drafts was double-counting. Corrected table — apply
+compression *once* against the K-only baseline:
 
-Final deployment cache: **< 5 MB at 4K context**.
+| step | format | size at 4K |
+|---|---|---|
+| Standard GQA reference (K+V, BF16) — for comparison only | BF16 | 144 MB |
+| **§13.1 baseline (K_DOWN only, BF16)** | BF16 | **72 MB** |
+| + TurboQuant int4 on K_DOWN | int4 | 9-18 MB |
+| + Sliding window (if applicable, 1K window over 4K context) | int4 + SW | 2-5 MB |
+
+Final deployment cache: **~9-18 MB at 4K context** (TurboQuant only),
+**~2-5 MB at 4K context** (with 1K sliding window). The previous
+"< 5 MB" headline required *both* TurboQuant and sliding window;
+state both assumptions when quoting it.
 
 ### 13.4 Cache update during decode
 
-After each new token, append to all 18 caches:
+After each new token, append the **un-rotated** K_DOWN to all 18 caches.
+RoPE is applied at attention time, NOT before caching (otherwise the
+linear K→V relationship in V-from-K is broken — see §6.2 callout):
+
 ```
 for r in range(6):
     for b in range(3):
-        new_K = W_K_DOWN[b] @ new_x_in_loop_r_block_b
-        kv_cache[(r, b)] = concat(kv_cache[(r, b)], new_K, axis=seq)
+        # Compute un-rotated latent K — DO NOT apply RoPE here
+        new_K_down = W_K_DOWN[b] @ new_x_in_loop_r_block_b
+        kv_cache[(r, b)] = concat(kv_cache[(r, b)], new_K_down, axis=seq)
+
+# At attention time:
+#   K_unrot = kv_cache[(r, b)]          # cached un-rotated K
+#   V       = W_V_FROM_K[b] @ K_unrot + b_V[b]   # derive V from un-rotated K
+#   K       = apply_rope(K_unrot, position_ids)  # then rotate K for QK math
+#   Q       = apply_rope(W_Q[b] @ x_new, position_ids)
+#   attn    = softmax(Q @ K.T / sqrt(d)) @ V
 ```
 
 Each loop iteration computes FRESH K at that loop (the input differs
@@ -961,17 +1069,38 @@ genuinely different representations.
 
 ### 14.2 Memory budget at deployment
 
-```
-Embedding (int8):           100 MB
-Attention (int8 × 3):        17 MB
-Shared experts (int8 × 3):   64 MB → 16 MB int8
-Routed experts (FP4):       319 MB → 80 MB FP4
-HRA (bf16):                  86 MB → 172 MB bf16
-Misc (bf16):                ~5 MB
+Numbers below are decimal MB (1 MB = 1,000,000 bytes), no allocator
+overhead, no per-tensor quantization metadata. **Reconciled** — the
+previous draft had two math errors:
 
-TOTAL on disk:              ~390 MB (int8 mixed)
-At inference (active):       ~150 MB (only active routed experts loaded)
+1. Routed experts at FP4 was 80 MB (off by ~2×). 318.5M params × 4
+   bits = 159 MB. Including per-block AlphaQ metadata (~2%) ≈ 162 MB.
+2. HRA params (86M) × 2 bytes (bf16) = **172 MB**, not 86 MB.
+
 ```
+Embedding (int8, 100M params × 1 byte):              100 MB
+Attention (int8 × 3 physical blocks, ~17M params):    17 MB
+Shared experts (int8 × 3 physical blocks, 64M):       64 MB
+Routed experts (FP4 @ ~3.5 bit avg, 318.5M params):  ~140 MB
+HRA adapters (bf16, 86M params × 2 bytes):           172 MB
+Misc (router, mHC, norms, loop_emb, bf16):            ~5 MB
+
+TOTAL ON DISK (all loaded into RAM):                 ~498 MB
+```
+
+To actually fit the claimed 150-250 MB envelope, one of the following
+must change (no decision made here — see `review/SYNTHESIS.md` Tier 2 #11):
+
+- HRA adapters folded back into base weights post-RL (eliminates 172 MB)
+- HRA quantized to int8 (172 MB → 86 MB)
+- Embedding quantized to int4 (100 MB → 50 MB)
+- Routed experts pushed to 2-bit average (~80 MB)
+
+The previous "150 MB active" line assumed *only the active routed
+experts are resident*. That requires offloading inactive experts to
+disk/CPU and paging them in on demand — an inference-system design
+decision, not a model weight decision. State the assumption when
+quoting it.
 
 ### 14.3 AlphaQ bit allocation (routed experts)
 
@@ -1242,9 +1371,66 @@ work worth not re-discovering.
 
 ---
 
+## 18. Open decisions (from plan review)
+
+Two outside reviews (`review/agy-plan-reviewed.md` and
+`review/codex-plan-review.md`, synthesized in
+`review/SYNTHESIS.md`) flagged the following decisions as needing
+user resolution before implementation begins. Mechanical fixes from
+those reviews have been applied in-place above; the items below need
+*you* to decide.
+
+### Tier 0 — Repo state
+
+- **`src/nano_osrt` is missing.** `pyproject.toml`, `tests/`, and
+  `app.py` all point at it, but v5 source was moved to
+  `archive/v5/src/`. Decide: declare root design-only and update
+  metadata, OR start the v6 package layout now. Until resolved
+  `uv run --group dev pytest -q` will fail at collection.
+- **Tokenizer regeneration.** §3.2 contract assumes a v6 tokenizer
+  with PAD/BOS/EOS swapped and 18 new special tokens vs the v5
+  artifact on disk. Schedule the retrain before any v6 training.
+
+### Tier 1 — Architecture
+
+- **mHC final collapse head** (§10 callout, §8 silent). Currently
+  uses stale `A_l`. Pick: dedicated learnable head, mean over
+  channels, or another constrained collapse op.
+- **V-from-K vs widen-latent** (§6.2 callout). Pick (a), (b), or
+  (c) as listed there.
+- **Hash routing semantics** (§7.5 callout). Three sub-questions
+  (top-K, loop dependence, transition behaviour).
+- **Tier 1 cost reconciliation** (`README.md`). 50K H100-hours at
+  $4/hr = $200K, not $15K. Either change the hour estimate or the
+  price assumption (spot @ ~$0.30/hr brings it to $15K-ish).
+
+### Tier 2 — Specification clarity
+
+Listed in `review/SYNTHESIS.md` Tier 2 (#11-#21). Of those, the
+ones most likely to bite in implementation:
+
+- HRA injection count: 87 claimed vs 132 enumerated (need
+  enumeration table — does shared-expert HRA get one set across
+  the 12 routed experts, or per-expert?).
+- Three aux losses (`loop_lm_aux_loss_weight`,
+  `router_balance_loss_weight`, `router_z_loss_weight`) need
+  distinct names — currently conflated as "aux loss".
+- Speculative decoding (§12) is greedy-only; document explicitly
+  it's not distribution-preserving (vs full speculative sampling).
+- `forward()` / `generate()` signatures don't agree (§10 vs §12).
+
+---
+
 ## Document changelog
 
 - **2026-06-07** — initial creation, captures complete OSRT-600M
   architecture spec as planned in README.md
 - **2026-06-07** — added §17 implementation notes ported from v5
   optimization commits on `archived/v5-optimizations` branch
+- **2026-06-07** — mechanical fixes from plan review
+  (`review/SYNTHESIS.md`): vocab typo, K-only KV cache double-count
+  removed, deployment memory math reconciled, V-from-K + RoPE
+  ordering clarified, tokenizer-spec-vs-disk mismatch flagged. Added
+  inline `DECISION REQUIRED` callouts on §6.2 (V-from-K), §7.5
+  (hash routing), §10 (mHC pseudocode bugs). Added §18 listing open
+  decisions.

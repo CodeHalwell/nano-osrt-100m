@@ -826,20 +826,33 @@ v5 (363M) training that shaped the v6 600M plan.
 
 ## 12. Cost estimate — three budget tiers
 
-### Tier 1 — Ideal "ship-ready" build (~$16K)
+### Tier 1 — Ideal "ship-ready" build (~$16K target)
 
 What the OSRT-600M plan looks like at full scale, no compromises.
-Numbers below assume H100 at ~$4/hr on Modal.
 
-| stage | tokens / steps | cost |
+> ⚠ **COST RECONCILIATION REQUIRED.** The previous table had a
+> 10× math error. 50K H100-hours × $4/hr = $200,000, not $15,000.
+> The ~$16K target only holds under one of:
+> (a) **spot/preemptible H100 at ~$0.30/hr** (= $15K for 50K-hr) — this
+>     is what the table implicitly assumed; state it explicitly.
+> (b) **fewer GPU-hours** — e.g. 4K H100-hours @ $4/hr = $16K, which
+>     means rethinking the 3T-token budget down to ~250B tokens.
+> See `review/SYNTHESIS.md` Tier 1 #9. The table below uses
+> assumption (a). If you want assumption (b), the pretraining row
+> needs to drop to ~250B tokens.
+
+Numbers assume H100 spot at ~$0.30/hr. On-demand H100 at $4/hr would
+make the pretraining line $200K and the total ~$200,700.
+
+| stage | tokens / steps | cost @ $0.30/hr spot |
 |---|---|---|
 | Pretraining (3T tokens, 600M) | 3T tokens, ~50K H100-hours | **~$15,000** |
-| MOPD-style SFT (5K rollouts × 500 steps) | 5K rollouts (~$10 API) + 1.5K H100-hours | **~$700** |
-| HRA-only GRPO (multi-env, 500 steps) | 500 steps × ~30 sec compiled | **~$15** |
+| MOPD-style SFT (5K rollouts × 500 steps) | 5K rollouts (~$10 API) + 1.5K H100-hours | **~$465** |
+| HRA-only GRPO (multi-env, 500 steps) | 500 steps × ~30 sec compiled | **~$2** |
 | Vision retrofit (LLaVA-style) | 2K steps SFT + 200K image-text pairs | **~$200** |
-| Tool-use GRPO (500 steps) | 500 × ~30 sec | **~$15** |
+| Tool-use GRPO (500 steps) | 500 × ~30 sec | **~$2** |
 | Eval suite (full sweep) | gsm8k + MMLU + IFEval + HumanEval + MMBench | **~$10** |
-| **Total** | | **~$15,940** |
+| **Total** | | **~$15,679** |
 
 For comparison: SmolLM2 (Allal et al.) total cost was ~$250K at 11T
 tokens on a 1.7B dense model. OSRT-600M at 3T tokens / 600M MoE = ~6%
