@@ -1694,28 +1694,22 @@ class MultiEnvGRPOConfig(GRPOConfig):
     means group rewards are computed on tightly-scoped completions.
     """
 
-    # GRPO step_75 → 150 EXTENSION with tightened architecture-fix
-    # knobs. Step-75 probe showed depth utilization REGRESSED (n=6
-    # CE 3.00 → 4.30, "more loops hurt" verdict) while inference
-    # accuracy improved (3/6 → 4/6). The original GRPO knobs
-    # (aux=0.03, dropout=0.05) didn't preserve depth use under
-    # policy-gradient pressure. Resume from step_75 with:
-    #   - aux_loop_loss_weight 0.03 → 0.10 (3.3× stronger depth signal)
-    #   - loop_dropout_prob   0.05 → 0.00 (no truncation; full chain
-    #     for every rollout so the model can't shortcut)
-    #   - strict_template_weight 0.5 → 1.0 (stronger penalty on the
-    #     multi-answer-block failure mode that reappeared)
-    # lr_anchor_step=75 re-warms over 10 steps so the new objective
-    # gets gradient instead of the near-zero cosine tail.
+    # GRPO step_75 → 150 RERUN with ORIGINAL knobs (controlled test
+    # vs the tighter-config run that regressed inference 4/6 → 2/6).
+    # Hypothesis: the tighter knobs (aux=0.10, dropout=0, strict=1.0)
+    # over-constrained the output distribution, costing multi-step
+    # reasoning prompts. This run uses the ORIGINAL settings (aux=0.03,
+    # dropout=0.05, strict=0.5) over the SAME step range so we can
+    # isolate which knob change caused the regression.
     total_steps: int = 150
     lr_anchor_step: int = 75
     warmup_steps: int = 10
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
 
-    # Tightened architecture-fix knobs (see total_steps note above).
-    aux_loop_loss_weight: float = 0.10
-    loop_dropout_prob: float = 0.00
+    # ORIGINAL architecture-fix knobs (reverted from the tighter run).
+    aux_loop_loss_weight: float = 0.03
+    loop_dropout_prob: float = 0.05
     loop_dropout_min_loops: int = 3
     per_loop_aux_weights: None = None
 
@@ -1739,8 +1733,8 @@ class MultiEnvGRPOConfig(GRPOConfig):
     reward_approx_format_neg: float = -1.0
     reward_number_match: float = 1.5
     reward_number_miss: float = -0.5
-    reward_strict_template_weight: float = 1.0  # 0.5 → 1.0 for tighter
-    # multi-answer-block penalty during the step 75→150 extension
+    reward_strict_template_weight: float = 0.5  # ORIGINAL (reverted from
+    # the 1.0 tighter setting that caused regression at step 150)
 
     # Stop-token IDs for rollout generation. <|/answer|>=10, <|user|>=11.
     stop_token_ids: tuple[int, ...] = (10, 11)  # noqa: RUF012
