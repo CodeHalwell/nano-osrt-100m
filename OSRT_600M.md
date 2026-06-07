@@ -222,17 +222,19 @@ breaks down when generating multi-turn responses because the model
 has no clear "I'm done with this turn" signal. ChatML and Llama 3
 templates use explicit end-of-turn markers; we should too.
 
-### 3.2 Vocab size — 48K, not 32K
+### 3.2 Vocab size — 65,536 (matched to LFM2)
 
-48K (between SmolLM2 49,152 and LFM2 65,536) balances:
+LFM2's family uses 65,536 BPE constant across all sizes (350M-2.6B).
+For our 600M model:
 
-- English-centric is the focus, so we don't need Llama 3's 128K or
-  Gemma's 256K
-- Slightly better code tokenisation than 32K (function names,
-  operators)
-- ~58M params for the tied embedding vs v5's 50M — modest extra cost
-- Future fine-tuning to new domains has more room (Gemma team's
-  rationale for 256K)
+- English + 6 multilingual (Arabic, Japanese, Korean, Spanish,
+  French, German) + code coverage
+- Includes FIM tokens, tool-calling tokens, ChatML chat template
+- ~100M params for the tied embedding (16.9% of total) — same ratio
+  LFM2-700M achieves; not bankrupting like Gemma 3 270M's 63%
+- Future fine-tuning to new domains has reasonable room
+- We chose this size over 32K (too tight for code/multilingual) or
+  131K+ (too expensive at our budget — would be ~200M+ on embedding)
 
 ### 3.3 Pretraining text includes chat templates
 
@@ -594,7 +596,7 @@ Three recent papers add to the OSRT-600M deployment story:
 - Result: ~5× memory reduction vs BF16, ~3× faster generation on CPU,
   near-lossless quality
 
-For a 726M-total model, this deploys in **~250 MB RAM at usable
+For our ~599M total model, this deploys in **~200 MB RAM at usable
 speed on phones / Raspberry Pi 5**.
 
 ## 10b. DeepSeek-V4 (Nov/Dec 2025) integrations
@@ -789,71 +791,30 @@ stability + post-training quality. The medium items (mHC, HCA, FP4
 QAT) would shift us into a clearly stronger architecture but require
 more development time.
 
-## 11. Research nuggets to apply
+## 11. Research grounding
 
-### 11.1 Muon optimizer (the headline 2026 frontier)
+All architecture and training decisions in this doc cite specific
+prior work. The full summary of every paper, finding, and
+recommendation that shaped OSRT-600M lives in [`RESEARCH.md`](RESEARCH.md).
 
-- **2× compute efficiency vs AdamW** at compute-optimal (Moonshot 3B/16B
-  MoE, 5.7T tokens)
-- **~50% memory savings** (no second moment vector)
-- **4-point cross-entropy gap** vs Lion in ablation (this exact arch)
-- Apply only to 2D hidden matrices; AdamW for embeddings + LM head +
-  norms + biases
-- Required additions: **weight decay**, **update-RMS alignment**,
-  **QK-norm + QK-clip** (Muon makes attention logits more prone to
-  blow-up)
+The headline references baked into this plan:
 
-### 11.2 Aux-loss-free expert balancing (DeepSeek-V3)
+- **Muon** (Moonshot, Feb 2025) → §2 optimizer choice
+- **DeepSeekMoE / V3 / V4** → §1 architecture, §2.2 routing, §10b OPD
+- **LFM2** (Liquid AI, Dec 2025) → §1.1 dim/vocab matching, §3 tokenizer
+- **Ouro / Huginn** → §1 recursion validation
+- **SmolLM2/3** (Allal et al.) → §4 data + WSD schedule
+- **Gemma 3** → §1.3 sandwich RMSNorm, §4 context progression
+- **Qwen3** → §1.3 GQA + QK-norm + global-batch balancing
+- **AlphaQ** (Yang et al., ICLR 2026 DeLTa) → §10a expert quantization
+- **TurboQuant + QJL** (Google) → §10a KV-cache compression
+- **MLA + matrix absorption** (DeepSeek-V2/V3) → §1.5 attention variant
+- **modded-nanoGPT** → §14 codebase reference
 
-- Per-expert bias `b_i`, nudged ±γ=0.001 by load deviation
-- NOT in the gradient (heuristic-only)
-- Removes the gradient distortion of α=0.10 aux loss
-- Safe at low-to-medium sparsity (top-2 of 12 is fine; super-high
-  sparsity = lower-layer imbalance)
-
-### 11.3 Gram Newton-Schulz (Dao-AILab)
-
-- Drop-in for standard Newton-Schulz in Muon
-- Iterates on small Gram matrix XX^T instead of full X
-- ~2× FLOP reduction for non-square matrices (attention QKV, gates)
-- Symmetric GEMM kernels = Hopper/Blackwell optimised
-- 5 iterations, reset at step 2-3
-
-### 11.4 WSD schedule
-
-- Warmup → Stable → Decay (vs cosine)
-- Branch decay at any point → inject high-quality data
-- SmolLM3 / MiniCPM / Gemma 3 use this
-- v5 used cosine and forced full-run commitments
-
-### 11.5 μP / μTransfer
-
-- Tune HPs on width-256 proxy → transfer to 1792
-- Saves 10-100× on HP search
-- Half-aligned with Muon — add strong weight decay
-
-### 11.6 Loop embeddings (LIE) — kept from v5
-
-- Per-loop bias vector added before attention block
-- `min(r, 7)` cap means we can't safely loop past R=8 — kept at R=6
-- Critical for letting shared weights act as virtual distinct layers
-- Already in v5 — keep, don't change
-
-### 11.7 Ouro / Huginn validation
-
-- Looped 1.4B (R4) beats dense Qwen3-4B on GSM8K (78.92 vs 72.86)
-- Validates the recursive-MoE thesis: parameter efficiency via
-  weight tying with depth recurrence works
-- 6 loops × 3 blocks is a sweet spot — Ouro reports instability
-  beyond R6, Huginn at R32 needs heavy stabilisation
-
-### 11.8 Frontier convergence (use defaults that work)
-
-- Decoder-only, RMSNorm pre-norm, GQA, RoPE, SwiGLU — universal
-- Tied embeddings at ≤4B — Qwen3 standard
-- QK-norm — Qwen3, Gemma 3, modded-nanoGPT
-- WSD schedule — SmolLM3, MiniCPM, Gemma 3
-- AdamW baseline → migrate to Muon
+See [`RESEARCH.md`](RESEARCH.md) for the deeper-dive summaries,
+specific paper citations, and which findings we adopted vs deferred.
+See [`LEARNINGS.md`](LEARNINGS.md) for everything we learned from
+v5 (363M) training that shaped the v6 600M plan.
 
 ---
 
