@@ -478,6 +478,23 @@ _TBD_
 
 ---
 
+## Known gaps
+
+### System-prompt support — MISSING in v5
+
+The tokenizer has `<|system|>` as token id 13, but no training stage ever wired it in. The model has never seen a system block in context.
+
+**Discovery:** during grpo_v2 we tried inference with `<|system|>{instructions}<|user|>{q}<|assistant|>` + 3-shot prefix. Result: model emitted malformed output (no `<|/think|>` close, then degenerate `<|/answer|><|answer|>...` loop), scored 0/12 on OOD probe. Bare `<|user|>{q}<|assistant|>` got 6/12 same model. The system prompt is OOD.
+
+**Root cause:** SFT/MOPD used teacher rollouts from Gemini API which returns plain user→assistant exchanges. Our JSONL recording captured only `{prompt, response}`, no system role. MOPD training wrapper was `<|user|>{prompt}<|assistant|>{response}` — system role never appeared.
+
+**Fix paths (in priority order):**
+1. **Bundle into Stage 6 tool_use SFT/GRPO**: tools naturally need system prompts ("you have a calculator"). Train them together. Most natural extension.
+2. **Quick MOPD pass with system prompts** (~$10-15): re-collect 2-3k rollouts from DeepSeek v4-flash with varied system prompts present. Brief ~500-step MOPD on top of grpo_v2_final.
+3. **Synthetic SFT** (~$2-3): hand-write ~50 system+user pairs, teacher-generate responses, short 200-step SFT.
+
+Compare-out to other models: Gemma 1/2 also officially have no system prompt support (only retrofitted in Gemma 3). We're in the same camp until we fix it.
+
 ## Out of scope (for now)
 
 - MTP head retrofit (engineering-heavy, marginal gain at 363M)
