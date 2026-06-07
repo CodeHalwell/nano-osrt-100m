@@ -2383,7 +2383,50 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         )
 
     # Optimizer
-    if hra_params:
+    # HRA-only training mode freezes the base weights so only the
+    # rank-256 adapters get gradient updates. Closes the capability
+    # regression failure mode the step 75→150 runs revealed (base
+    # weights drifted away from MOPD distribution under
+    # policy-gradient pressure, costing capabilities). See
+    # MultiEnvGRPOConfig.hra_only_training for full rationale.
+    hra_only = bool(getattr(cfg, "hra_only_training", False))
+    if hra_only and not hra_params:
+        raise ValueError(
+            "hra_only_training=True requires hra_enabled=True (no HRA "
+            "params to train otherwise).",
+        )
+    if hra_only:
+        # Freeze every parameter that isn't an HRA adapter. Use id()-set
+        # rather than name matching so we're robust to torch.compile()
+        # renaming and to any future HRA injection-point changes.
+        hra_id_set = {id(p) for p in hra_params}
+        frozen_count = 0
+        frozen_param_count = 0
+        for p in model.parameters():
+            if id(p) not in hra_id_set:
+                p.requires_grad = False
+                frozen_count += 1
+                frozen_param_count += p.numel()
+        trainable_count = sum(p.numel() for p in hra_params)
+        print(
+            f"HRA-only training: froze {frozen_count} tensors "
+            f"({frozen_param_count:,} params). "
+            f"Trainable: {len(hra_params)} HRA tensors "
+            f"({trainable_count:,} params).",
+        )
+        # Optimizer over HRA-only — single param group with group_name
+        # = "hra" so the LR schedule below applies the hra_lr/peak_lr
+        # cosine scaling instead of the default peak_lr scaling.
+        optimizer = torch.optim.AdamW(
+            [{
+                "params": hra_params,
+                "lr": cfg.hra_lr,
+                "weight_decay": cfg.weight_decay,
+                "group_name": "hra",
+            }],
+            betas=(0.9, 0.95), eps=1e-8,
+        )
+    elif hra_params:
         param_groups = get_param_groups(
             model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay,
         )

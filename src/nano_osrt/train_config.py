@@ -1787,6 +1787,31 @@ class MultiEnvGRPOConfig(GRPOConfig):
         },
     }
 
+    # ── HRA-only training (preserves base weights, only adapters update) ──
+    # Closes the capability-regression failure mode that hit at step 76+:
+    # base weight drift under policy-gradient pressure was costing us
+    # capabilities the MOPD distillation built. With hra_only_training=True
+    # the 363M base weights are frozen; only the 86M HRA adapters get
+    # gradient updates. Equivalent to the standard "LoRA-only RL" pattern
+    # (DPO/PPO/GRPO commonly do this).
+    #
+    # Benefits:
+    #   - MOPD/SFT capability anchor is structurally preserved
+    #   - KL drift bounded by construction (base contribution to logits
+    #     stays fixed; only the additive adapter contribution shifts)
+    #   - ~4× fewer params getting Adam state → faster + less memory
+    #   - Lower risk of catastrophic forgetting
+    #
+    # Trade-offs:
+    #   - Slower adaptation (smaller effective parameter capacity)
+    #   - Some capabilities may not be reachable through the rank-256
+    #     low-rank delta alone
+    #   - If the model genuinely needs base-weight surgery (e.g. a new
+    #     reasoning circuit), HRA-only can't deliver it
+    #
+    # Recommend ON for any GRPO v2 run after the step 75→150 regression.
+    hra_only_training: bool = False
+
     # ── Anti-hacking knobs (added after the step 75→150 regression) ──
     # Strict numeric extraction closes the "last-number-wins" loophole
     # where the model dumps multiple candidate numbers in the answer
