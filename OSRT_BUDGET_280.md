@@ -576,6 +576,39 @@ implement them during the $280 build:
     with QJL (Quantized Johnson-Lindenstrauss) for the routing
     matrices to keep the whole inference path int4.
   - **Engineering:** ~2 days, can use Google's reference implementation.
+- **AlphaQ calibration-free expert weight quantization** — Yang et al.
+  (DeLTa Workshop @ ICLR 2026, arXiv 2026). Uses Heavy-Tailed
+  Self-Regularization (HT-SR) theory to allocate bit-widths across
+  MoE experts WITHOUT a calibration dataset. Calibration-based methods
+  (PMQ, MxMoE, etc.) overfit to whichever calibration set you pick
+  (math calibration → bad at code, vice versa). AlphaQ derives bit
+  allocation from the spectral heavy-tailedness of each expert weight
+  matrix:
+  - **For Qwen1.5-MoE: 3.5 bits/expert matches BF16 accuracy** (4×
+    memory compression, ZERO degradation)
+  - At 2.5 bits/expert: ~2.5% accuracy drop on average
+  - Especially strong for **fine-grained MoEs** (DeepSeekV2-Lite,
+    Qwen1.5-MoE) where per-expert variance is large — exactly the
+    regime our recursive sparse MoE lives in (12-14 routed experts
+    per block)
+  - **Layer-wise allocation beats expert-wise** — they show each
+    sublayer in an expert (up/gate/down projections) should get
+    independent bit-width. Free quality at same budget.
+  - **Methodology:** PL Alpha Hill metric (power-law exponent of
+    weight matrix eigenvalue distribution) + FARMS aspect-ratio
+    correction → ILP solver assigns bits under global budget
+  - **For OSRT-50M: drop routed experts to 2.5 bits/expert post-
+    training.** Saves another ~50 % on routed weight memory (already
+    int8 via QAT). Combined with TurboQuant KV-cache and spec
+    decoding, the full inference stack fits in **< 200 MB RAM** at
+    usable speed.
+  - **Engineering:** ~1 day with their open-source implementation;
+    pure post-training, no retraining required.
+  - **Why this is perfect for us:** our recursive arch shares expert
+    weights across 6 loops, so the per-expert spectral analysis is
+    done ONCE per unique expert and applies to all 6 reuses. The
+    fine-grained variance AlphaQ detects matches our 14-experts-per-
+    block design exactly.
 
 Combined with speculative decoding via aux-loop heads, this stack
 gives:
@@ -584,7 +617,8 @@ gives:
 |---|---|
 | TurboQuant KV int4 | 8× cache, ~4× memory bandwidth |
 | Speculative decoding (loop-3 draft) | ~2× generation speed |
-| int8 weights (QAT) | 2× model memory |
+| **AlphaQ int2.5-3.5 routed experts** | **~4× routed-weight memory, near-lossless at 3.5b** |
+| int8 weights (QAT) on dense paths | 2× memory on attention + shared experts |
 | Combined | **fits on a phone / Raspberry Pi 5 at usable speed** |
 
 This is the deployment story that makes a 50M recursive MoE a

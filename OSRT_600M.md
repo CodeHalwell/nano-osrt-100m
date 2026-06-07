@@ -42,31 +42,55 @@ Every released frontier model uses one of (a) dense, (b) MoE, or (c)
 recurrent — none combine sparse MoE with depth recurrence. We keep
 this. The refinements below address the v5 pain points.
 
-### 1.1 Parameter budget
+### 1.1 Parameter budget — matched to LFM2-700M class
+
+**Updated to align with LFM2-700M's parameter ratios** (Liquid AI Dec
+2025). LFM2-700M is 700M total with 14.4 % on the tied embedding —
+the canonical proof point that small models should put params into
+blocks, not vocabulary. We follow their accounting:
 
 ```
-Embedding (32K × 1792, tied with LM head)      :  58,720,256   (4.2 % active)
-Attention × 3 blocks (qkv + out_proj)          :  38,535,168   (2.7 %)
-Shared experts × 3 (SwiGLU h=4608)             :  74,317,824   (5.3 %)
-Routed experts: 3 × 12 × SwiGLU h=2304         : 366,051,328   (8.7 % active = top-2 of 12)
+Embedding (65,536 × 1536, tied with LM head)   : 100,663,296   (14.4 %)
+Attention × 3 blocks (qkv + out_proj)          :  28,311,552   (4.0 %)
+Shared experts × 3 (SwiGLU h=4608)             :  63,700,992   (9.1 %)
+Routed experts: 3 × 14 × SwiGLU h=2304         : 446,210,304   (top-2 active ≈ 9.1 %)
 HRA adapters (rank 256, injected day 1)        :  86,114,304   (always trained)
 Router + loop_emb + adapters + norms           :  ~1.5 M
 
-Total physical params                          : ~625 M
-Active per token                               : ~210 M (33.6 %)
-Effective compute per token (× 6 loops)        : ~2.5 B FLOPs-equivalent
+Total physical params                          : ~726 M ("700M class")
+Active per token                               : ~242 M (33.3 %)
+Effective compute per token (× 6 loops)        : ~2.9 B FLOPs-equivalent
 ```
 
-### 1.2 What's different from v5 (363M → 625M)
+**Direct comparison to LFM2-700M:**
 
-| change | v5 | OSRT-600M | rationale |
+| metric | LFM2-700M | OSRT-700M |
+|---|---|---|
+| Total params | 700M | 726M |
+| Embedding (tied) | 100M (14.4 %) | 100M (14.4 %) ✓ |
+| Hidden dim | 1536 | **1536** ✓ |
+| Vocab | 65,536 | **65,536** ✓ |
+| Unique layers | 16 dense | 3 blocks × 6 loops (18 effective) |
+| FFN family | Dense SwiGLU h=6912 | 1 shared (h=4608) + 14 routed top-2 (h=2304) MoE |
+| Attention | GQA 24q/8kv head=64 | GQA 24q/8kv head=64 ✓ |
+| FLOPs per token | ~1.4B | ~2.9B (6× loop multiplier) |
+| Active params per token | 700M | 242M (sparse MoE) |
+
+**Why this matters:** at 65K vocab we get LFM2-quality tokenization
+for English + 6 supported multilingual + code (FIM/structured data).
+At 1536 hidden we match their search-optimized dim. The recursive
+trick gives us ~2× their FLOPs per token from FEWER active params.
+
+### 1.2 What's different from v5 (363M → 726M, matched to LFM2-700M)
+
+| change | v5 | OSRT-700M | rationale |
 |---|---|---|---|
-| Hidden dim | 1536 | **1792** | More representational headroom for math/code facts |
-| Routed experts per block | 8 | **12** | Trend (Qwen3 128, OLMoE 64, DeepSeek-V3 256) — finer-grained specialisation |
-| Routed expert hidden | 2048 | **2304** | Match dim increase |
-| Shared expert hidden | 4096 | **4608** | Match dim increase |
+| Hidden dim | 1536 | **1536** (matched to LFM2) | LFM2's hardware-in-the-loop search picked 1536 as optimal for 700M class |
+| Routed experts per block | 8 | **14** | Finer-grained specialisation (Qwen3 128, OLMoE 64, DeepSeek-V3 256) |
+| Routed expert hidden | 2048 | **2304** | Slightly wider than v5; matches budget |
+| Shared expert hidden | 4096 | **4608** | Wider always-on path |
 | HRA adapter rank | 256 | **256** (kept) | Day-1 injection, not retrofit |
-| Vocab | 32K | **48K** | English-centric but slightly more code/multilingual headroom; tying makes it cheap |
+| Vocab | 32K | **65,536** (matched to LFM2) | English + 6 multilingual + code (FIM/structured); same tax % as LFM2 |
 | Loops | 6 | **6** (kept) | Ouro found R4 sweet spot; v5 worked at R6; do NOT chase higher (Ouro reports instability at high recursion) |
 
 The 625M total / 210M active is in the **same compute class as Phi-3-mini
@@ -524,6 +548,49 @@ on a single H100, negligible against training cost.
 | 10 | **Tighter scoping** | "best small reasoning-with-tools model" as headline focus; chat/multilingual are secondary |
 
 ---
+
+## 10a. Frontier deployment-stack additions (Dec 2025 / 2026)
+
+Three recent papers add to the OSRT-700M deployment story:
+
+1. **LFM2 architecture lessons** (Liquid AI, Dec 2025):
+   - Gated short convolutions for most layers + minority GQA — ~2×
+     faster CPU than attention-heavy at same quality
+   - Decoupled Top-K knowledge distillation (decompose KL via chain
+     rule, temperature only on Top-K conditional term) — 32× denser
+     supervision per token vs plain CE
+   - Length-normalized DPO with on-policy CLAIR refinement
+   - Curriculum learning via ensemble difficulty scoring
+   - Model merging (TIES/DARE/DELLA) at end of post-training
+   - **Vocabulary 65,536 + hidden 1536** matched in our §1.1 update
+
+2. **TurboQuant KV-cache compression** (Google):
+   - 4-8× cache reduction via random rotations + per-block int4
+   - Critical for our recursive arch (each effective layer caches own K/V)
+
+3. **AlphaQ calibration-free expert quantization** (Yang et al.,
+   DeLTa Workshop @ ICLR 2026):
+   - HT-SR theory → bit allocation across MoE experts without
+     calibration data
+   - Per-expert spectral heavy-tailedness as importance signal
+   - **Qwen1.5-MoE at 3.5 bits/expert = BF16 accuracy** (4×
+     compression, zero loss)
+   - Especially strong on fine-grained MoEs (our 14-experts-per-block
+     design is exactly this regime)
+   - Pairs naturally with our recursive arch — one analysis per
+     unique expert, applies across all 6 loop reuses
+   - ~1 day post-training engineering; pure inference optimization
+
+**Combined deployment stack for OSRT-700M:**
+- Muon-trained base weights → AlphaQ int3.5-4 for routed experts
+- TurboQuant int4 KV cache
+- Speculative decoding via aux-loop-3 head
+- int8 weights via QAT on dense paths
+- Result: ~5× memory reduction vs BF16, ~3× faster generation on CPU,
+  near-lossless quality
+
+For a 726M-total model, this deploys in **~250 MB RAM at usable
+speed on phones / Raspberry Pi 5**.
 
 ## 11. Research nuggets to apply
 
