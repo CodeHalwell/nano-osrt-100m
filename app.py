@@ -2572,6 +2572,19 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     ema_overall = RewardEMA(alpha=0.1, print_every_n_calls=cfg.log_interval)
     ema_per_env = {n: RewardEMA(alpha=0.1) for n in cfg.env_names}
 
+    # Cumulative capability counters across all steps. Lets us read a
+    # success rate (rolling), not just per-step volatility. Window of
+    # last N steps via deque would be cleaner; for now we accumulate
+    # from start_step and report cumulative — the rate is monotonic
+    # easier to interpret than a sliding window.
+    cum_outcomes: dict[str, dict[str, int]] = {
+        "math": {"exact": 0, "close": 0, "miss": 0},
+        "ifeval": {"constraints_hit": 0, "constraints_miss": 0,
+                   "no_answer": 0},
+        "mbpp_code": {"all_pass": 0, "all_fail": 0, "timeout": 0,
+                      "no_answer": 0, "other": 0},
+    }
+
     # Env sampler — weighted random, seeded so reruns are reproducible
     env_rng = _random.Random(42 + start_step)
 
@@ -2607,6 +2620,22 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         step_rewards: list[float] = []
         step_env_rewards: dict[str, list[float]] = {n: [] for n in cfg.env_names}
         step_env_counts: dict[str, int] = {n: 0 for n in cfg.env_names}
+        # Per-env CAPABILITY counters (separate from reward EMA). Detects
+        # reward hacking: when env reward climbs but actual task success
+        # rate stays flat, the model is gaming format rewards without
+        # learning the underlying skill.
+        #   math.exact   = exact-string or exact-numeric verdicts
+        #   math.close   = within-5pct or within-20pct (partial credit)
+        #   math.miss    = wrong, non_numeric_wrong, no_extract
+        #   ifeval.constraints_hit / .constraints_miss (verifiable count)
+        #   mbpp.all_pass / .partial / .all_fail / .timeout / .other
+        step_env_outcomes: dict[str, dict[str, int]] = {
+            "math": {"exact": 0, "close": 0, "miss": 0},
+            "ifeval": {"constraints_hit": 0, "constraints_miss": 0,
+                       "no_answer": 0},
+            "mbpp_code": {"all_pass": 0, "all_fail": 0, "timeout": 0,
+                          "no_answer": 0, "other": 0},
+        }
 
         for _accum in range(cfg.grad_accum_steps):
             env_name = _sample_env()
@@ -2657,6 +2686,39 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 r, bd = _score_completion(env_name, comp_text, gt)
                 rewards.append(r)
                 step_env_rewards[env_name].append(r)
+
+                # Per-env capability counters — extract from bd
+                if env_name == "math":
+                    tier = bd.get("check_answer_tier", "")
+                    if tier in ("exact", "exact_numeric"):
+                        step_env_outcomes["math"]["exact"] += 1
+                    elif tier in ("within_5pct", "within_20pct"):
+                        step_env_outcomes["math"]["close"] += 1
+                    else:
+                        step_env_outcomes["math"]["miss"] += 1
+                elif env_name == "ifeval":
+                    verdict = bd.get("ifeval_verdict", "")
+                    if verdict == "no_answer":
+                        step_env_outcomes["ifeval"]["no_answer"] += 1
+                    else:
+                        step_env_outcomes["ifeval"]["constraints_hit"] += (
+                            bd.get("ifeval_hits", 0)
+                        )
+                        step_env_outcomes["ifeval"]["constraints_miss"] += (
+                            bd.get("ifeval_misses", 0)
+                        )
+                elif env_name == "mbpp_code":
+                    verdict = bd.get("mbpp_verdict", "")
+                    if verdict == "all_pass":
+                        step_env_outcomes["mbpp_code"]["all_pass"] += 1
+                    elif verdict == "all_fail":
+                        step_env_outcomes["mbpp_code"]["all_fail"] += 1
+                    elif verdict == "timeout":
+                        step_env_outcomes["mbpp_code"]["timeout"] += 1
+                    elif verdict == "no_answer":
+                        step_env_outcomes["mbpp_code"]["no_answer"] += 1
+                    else:
+                        step_env_outcomes["mbpp_code"]["other"] += 1
             step_rewards.extend(rewards)
 
             advantages = compute_group_advantages(rewards)
@@ -2708,6 +2770,11 @@ def _run_grpo_multi(sanity: bool = False) -> None:
         for n, rs in step_env_rewards.items():
             if rs:
                 ema_per_env[n].update(sum(rs) / len(rs))
+
+        # Cumulative capability counter updates
+        for env_name, step_buckets in step_env_outcomes.items():
+            for bucket, n_hits in step_buckets.items():
+                cum_outcomes[env_name][bucket] += n_hits
         mean_reward_step = (
             sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
         )
@@ -2746,6 +2813,33 @@ def _run_grpo_multi(sanity: bool = False) -> None:
             )
             print(f"           ema_reward_per_env: {per_env_str}", flush=True)
 
+            # Capability success rates — the bullshit-detector for reward
+            # hacking. If reward EMA climbs but these don't, the model
+            # is gaming format rewards without learning the actual task.
+            m = cum_outcomes["math"]
+            m_total = m["exact"] + m["close"] + m["miss"]
+            m_rate = (m["exact"] / m_total) if m_total > 0 else 0.0
+            m_partial_rate = (
+                (m["exact"] + m["close"]) / m_total if m_total > 0 else 0.0
+            )
+
+            i = cum_outcomes["ifeval"]
+            i_attempted = i["constraints_hit"] + i["constraints_miss"]
+            i_rate = i["constraints_hit"] / i_attempted if i_attempted > 0 else 0.0
+
+            c = cum_outcomes["mbpp_code"]
+            c_total = c["all_pass"] + c["all_fail"] + c["timeout"] + c["other"]
+            c_rate = (c["all_pass"] / c_total) if c_total > 0 else 0.0
+
+            print(
+                f"           hit_rate: math.exact={m_rate:.1%} "
+                f"(+close={m_partial_rate:.1%}) [{m['exact']}/{m_total}]  "
+                f"ifeval.constraints={i_rate:.1%} "
+                f"[{i['constraints_hit']}/{i_attempted}]  "
+                f"mbpp.all_pass={c_rate:.1%} [{c['all_pass']}/{c_total}]",
+                flush=True,
+            )
+
             if use_wandb:
                 log_dict = {
                     "grpo_multi/loss": step_loss,
@@ -2761,6 +2855,17 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                         log_dict[f"grpo_multi/env_{n}_ema_reward"] = (
                             ema_per_env[n].value
                         )
+                # Capability success rates (cumulative)
+                log_dict.update({
+                    "grpo_multi/math_exact_rate": m_rate,
+                    "grpo_multi/math_partial_rate": m_partial_rate,
+                    "grpo_multi/math_total_rollouts": m_total,
+                    "grpo_multi/ifeval_constraint_hit_rate": i_rate,
+                    "grpo_multi/ifeval_constraints_attempted": i_attempted,
+                    "grpo_multi/mbpp_all_pass_rate": c_rate,
+                    "grpo_multi/mbpp_total_rollouts": c_total,
+                    "grpo_multi/mbpp_timeout_count": c["timeout"],
+                })
                 wandb.log(log_dict, step=step)
 
         # Checkpoints
