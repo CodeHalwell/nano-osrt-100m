@@ -9,6 +9,7 @@ repeat any of the v5 mistakes.
 
 **Companion docs:**
 - [`README.md`](README.md) — the v6 design that bakes in these lessons
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — v6 technical spec
 - [`RESEARCH.md`](RESEARCH.md) — external research that shaped v6
 
 ---

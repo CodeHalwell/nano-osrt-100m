@@ -6,13 +6,19 @@
 
 This document captures **everything we would do differently** to build the
 next-generation OSRT model from scratch, given full hindsight on the v5
-training run. It pulls in:
+training run.
 
-1. Lessons from the v5 lineage (PLAN.md, ARCHITECTURE.md, TRAINING.md)
-2. The recursive-MoE + Muon research synthesis (June 2026 SLM frontier)
-3. Multimodal design notes (MULTIMODAL.md)
-4. Specific gaps discovered DURING v5 training (system prompts,
-   reward hacking, base-weight drift, etc.)
+**Companion docs (read in order for full context):**
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — complete implementation-ready
+  technical specification (every layer, dimension, formula). Someone
+  could code the model from this doc alone.
+- [`LEARNINGS.md`](LEARNINGS.md) — full v5 (363M) lessons captured
+- [`RESEARCH.md`](RESEARCH.md) — external research bibliography (Muon,
+  DeepSeek V2/V3/V4, LFM2, Ouro/Huginn, AlphaQ, TurboQuant, ...)
+- `archive/v5/` — v5-era code and historical docs preserved
+
+This README is the WHY (design philosophy + integrated plan).
+ARCHITECTURE.md is the HOW (technical spec).
 
 The target is a **600M-parameter recursive MoE** — bigger than v5 (363M)
 where it matters (more routed experts, more knowledge), with EVERY
