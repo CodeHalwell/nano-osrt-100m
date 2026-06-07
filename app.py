@@ -864,6 +864,114 @@ def mopd_sanity():
     run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# system_sft: teaches the model to handle <|system|>...<|user|>...
+# format. Resumes from grpo_v2_step_50.pt and trains on OpenHermes
+# rollouts (filtered to system-prompt-bearing rows).
+# Same loader path as MOPD; the RolloutDataset auto-detects the
+# `system` field and emits `<|system|>{sys}<|user|>{q}<|assistant|>{a}`
+# when present.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=86400,
+)
+def system_sft():
+    """SFT pass that teaches the model to handle <|system|> blocks."""
+    _run_system_sft(sanity=False)
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={
+        "/vol/checkpoints": vol,
+        "/vol/tokenizer": tokenizer_vol,
+        "/vol/hf_cache": hf_cache_vol,
+        "/vol/rollouts": rollouts_vol,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    timeout=3600,
+)
+def system_sft_sanity():
+    """30-step system_sft sanity — validates that <|system|> prefix
+    appears in batches and loss flows through the assistant turn only."""
+    _run_system_sft(sanity=True)
+
+
+def _run_system_sft(sanity: bool = False) -> None:
+    import os
+    import modal as _modal
+    from transformers import AutoTokenizer
+    from nano_osrt.config import NanoOSRTConfig
+    from nano_osrt.train import run_pretrain_extend
+    from nano_osrt.train_config import SystemSFTConfig
+
+    _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
+    _tok_vol.reload()
+    tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
+
+    cfg = SystemSFTConfig()
+    if sanity:
+        cfg.total_steps = 30
+        cfg.warmup_steps = 5
+        cfg.log_interval = 5
+        cfg.ckpt_interval = 999_999
+        cfg.eval_interval = 999_999
+        cfg.wandb_log = False
+        cfg.compile_enabled = False
+        cfg.aux_loop_curriculum_steps = 0
+
+    # Wire the rollout loader through the same phases dict the
+    # pretrain_extend trainer reads. Same shape MOPD uses.
+    cfg.phases["extend"]["end"] = cfg.total_steps
+    cfg.phases["extend"]["batch_size"] = 4
+    cfg.phases["extend"]["grad_accum_steps"] = cfg.grad_accum_steps
+    # System prompts make the prefix longer. Bump seq_len 1024 → 1536
+    # to fit system+user+assistant comfortably.
+    cfg.phases["extend"]["seq_len"] = 1536
+
+    model_config = NanoOSRTConfig(
+        vocab_size=len(tok), real_vocab_size=len(tok),
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        aux_loop_loss_weight=cfg.aux_loop_loss_weight,
+        per_loop_aux_weights=cfg.per_loop_aux_weights,
+        loop_dropout_prob=cfg.loop_dropout_prob,
+        loop_dropout_min_loops=cfg.loop_dropout_min_loops,
+    )
+    print(
+        f"system_sft{' SANITY' if sanity else ''}: {cfg.total_steps} steps "
+        f"from {cfg.pretrained_checkpoint}, peak_lr={cfg.peak_lr}, "
+        f"rollout_path={cfg.rollout_dataset_path}.",
+        flush=True,
+    )
+    if not os.path.exists(cfg.rollout_dataset_path):
+        raise FileNotFoundError(
+            f"Rollout JSONL not found at {cfg.rollout_dataset_path}. "
+            "Upload via: `modal volume put osrt-rollouts "
+            "rollouts/system_prompt_sft.jsonl system_prompt_sft.jsonl`",
+        )
+
+    run_pretrain_extend(model_config, cfg, vol, "/vol/tokenizer")
+
+
 @app.function(
     gpu="H100",
     image=image,
@@ -2707,6 +2815,50 @@ def _run_grpo_multi(sanity: bool = False) -> None:
     # so we get a clear error if rewards.py is missing the symbol.
     from nano_osrt.rewards import extract_answer_text  # noqa: E402
 
+    # ── Troubleshoot-gen runner ──
+    # Prints a single completion at the TRAINING temperature every N
+    # steps. Different from ood_probe (low-temp deterministic eval) —
+    # this shows what rollouts ACTUALLY look like at the temperature
+    # being used for GRPO. Catches reward-hacking patterns by eye
+    # (multi-answer-blocks, number dumping, format drift).
+    troubleshoot_interval = int(
+        getattr(cfg, "troubleshoot_gen_interval", 0) or 0,
+    )
+    troubleshoot_prompt = getattr(
+        cfg, "troubleshoot_gen_prompt", "What is 17 * 23?",
+    )
+
+    def _run_troubleshoot_gen(at_step: int) -> None:
+        inner_for_gen.train(False)
+        full_prompt = f"{cfg.user_tag}{troubleshoot_prompt}{cfg.assistant_tag}"
+        ids = tok.encode(full_prompt, add_special_tokens=False)
+        t = torch.tensor([ids], dtype=torch.long, device=device)
+        with torch.no_grad():
+            gen = inner_for_gen.generate(
+                t,
+                max_new_tokens=int(
+                    getattr(cfg, "troubleshoot_gen_max_new_tokens", 200),
+                ),
+                temperature=cfg.temperature,  # training temp
+                top_p=cfg.top_p,
+                eos_token_id=tok.eos_token_id,
+                stop_token_ids=list(cfg.stop_token_ids),
+            )
+        completion = tok.decode(
+            gen[0, len(ids):].tolist(), skip_special_tokens=False,
+        )
+        print(
+            f"\n  ── troubleshoot-gen @ step {at_step} (T={cfg.temperature}) ──",
+            flush=True,
+        )
+        print(f"  PROMPT: {troubleshoot_prompt}", flush=True)
+        # Wrap completion at ~100 chars for readability
+        for line in completion[:600].splitlines() or [""]:
+            print(f"  | {line}", flush=True)
+        if len(completion) > 600:
+            print(f"  | ... ({len(completion) - 600} more chars)", flush=True)
+        print("", flush=True)
+
     start_time = time.time()
     print(f"\nStarting training at step {start_step}...")
     if ood_prompts and ood_interval > 0:
@@ -2988,6 +3140,16 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 })
                 wandb.log(log_dict, step=step)
 
+        # ── Troubleshoot generation (every troubleshoot_interval steps) ──
+        # Print a single rollout-temperature sample so we can SEE what
+        # the model is producing during training. Cheaper than OOD probe.
+        if (
+            troubleshoot_interval > 0
+            and step > 0
+            and step % troubleshoot_interval == 0
+        ):
+            _run_troubleshoot_gen(step)
+
         # ── OOD probe (every cfg.ood_probe_interval steps) ──
         # Generalization check on a held-out set the policy is NOT
         # training on. Diverges from training-reward EMA when the
@@ -3151,6 +3313,12 @@ def main(stage: str = "pretrain"):
     elif stage == "grpo_multi_sanity":
         call = grpo_multi_sanity.spawn()
         print(f"Spawned grpo_multi_sanity as call: {call.object_id}")
+    elif stage == "system_sft":
+        call = system_sft.spawn()
+        print(f"Spawned system_sft as call: {call.object_id}")
+    elif stage == "system_sft_sanity":
+        call = system_sft_sanity.spawn()
+        print(f"Spawned system_sft_sanity as call: {call.object_id}")
     elif stage == "sft":
         sft.remote()
     elif stage == "sft_long":

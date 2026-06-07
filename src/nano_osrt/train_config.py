@@ -954,6 +954,58 @@ class MOPDConfig(PretrainExtend3Config):
     wandb_run_id: str = ""
 
 
+class SystemSFTConfig(MOPDConfig):
+    """System-prompt SFT — teaches the model to attend to <|system|> blocks.
+
+    Resumes from grpo_v2_step_50.pt (or mopd_final.pt) and trains on
+    rollouts where each record has a `system` field. RolloutDataset
+    formats them as:
+        <|system|>{sys}<|user|>{prompt}<|assistant|>{response}
+
+    Loss is computed only on the assistant turn (the system+user
+    prefix is masked with -100), so the model learns to:
+      1. USE the system prompt as context for generation
+      2. NOT regenerate the system prompt verbatim (that would mean
+         training the model to predict tokens that are in the
+         loss-ignored prefix — there's no gradient teaching it to
+         echo, only to attend)
+    The regurgitation penalty added later in GRPO is a
+    backstop for residual echoing this SFT doesn't fully eliminate.
+
+    Schedule:
+        500 steps from grpo_v2_step_50.pt at peak_lr 1e-6 → cosine
+        to 1e-7. Same architecture-fix knobs as MOPD (aux=0.05,
+        loop_dropout=0.10) so depth utilisation stays preserved.
+        ~$5-7 Modal at batch=4/accum=8 over ~10K rollouts.
+    """
+
+    total_steps: int = 500
+    lr_anchor_step: int = 0
+    warmup_steps: int = 25
+    peak_lr: float = 1e-6  # lower than MOPD — small alignment tweak
+    min_lr: float = 1e-7
+    grad_accum_steps: int = 8
+
+    aux_loop_loss_weight: float = 0.05
+    loop_dropout_prob: float = 0.10
+    loop_dropout_min_loops: int = 3
+    aux_loop_curriculum_steps: int = 0  # already curriculum'd
+    aux_loop_weight_start: float = 0.05
+
+    rollout_dataset_path: str = "/vol/rollouts/system_prompt_sft.jsonl"
+
+    log_interval: int = 10
+    ckpt_interval: int = 100  # 5 ckpts
+
+    # Resume from the best v2 ckpt we have (grpo_v2 step_50 was the
+    # only v2 ckpt actually saved before we stopped). Falls back to
+    # mopd_final if grpo_v2_step_50.pt isn't on the volume.
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_grpo_v2_step_50.pt"
+    stage_prefix: str = "sys_sft"
+    wandb_run_name: str = "osrt-sys-sft"
+    wandb_run_id: str = ""
+
+
 class SFTConfig:
     """Balanced SFT config for v5 — math + code + STEM + general."""
 
@@ -1694,34 +1746,33 @@ class MultiEnvGRPOConfig(GRPOConfig):
     means group rewards are computed on tightly-scoped completions.
     """
 
-    # GRPO step_75 → 150 RERUN with ORIGINAL knobs (controlled test
-    # vs the tighter-config run that regressed inference 4/6 → 2/6).
-    # Hypothesis: the tighter knobs (aux=0.10, dropout=0, strict=1.0)
-    # over-constrained the output distribution, costing multi-step
-    # reasoning prompts. This run uses the ORIGINAL settings (aux=0.03,
-    # dropout=0.05, strict=0.5) over the SAME step range so we can
-    # isolate which knob change caused the regression.
+    # GRPO v2: fresh from mopd_final.pt with HRA-only + anti-hacking
+    # defences. Step 75→150 in v1 regressed inference 4/6 → 2/6 with
+    # both knob configs (tighter and original) — base weights drifted,
+    # capabilities lost. v2 freezes base, only adapts the rank-256 HRA.
     total_steps: int = 150
-    lr_anchor_step: int = 75
-    warmup_steps: int = 10
+    lr_anchor_step: int = 0  # fresh schedule from mopd_final
+    warmup_steps: int = 15
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
 
-    # ORIGINAL architecture-fix knobs (reverted from the tighter run).
+    # ORIGINAL architecture-fix knobs (these worked best in v1).
     aux_loop_loss_weight: float = 0.03
     loop_dropout_prob: float = 0.05
     loop_dropout_min_loops: int = 3
     per_loop_aux_weights: None = None
 
-    # GRPO sampling — wider than math-only GRPO for env diversity.
-    # max_gen_len trimmed 512 → 384 (matches the math-only GRPO
-    # config). Saves ~25 % rollout time. gsm8k / IFEval / MBPP
-    # responses very rarely need the extra headroom.
+    # GRPO sampling
     group_size: int = 8
     max_gen_len: int = 384
     temperature: float = 1.0
     top_p: float = 0.95
-    kl_coeff: float = 0.05  # was 0.20 in math-only; want more policy movement
+    # kl_coeff bumped 0.05 → 0.15 for v2. v1 used 0.05 (loose anchor)
+    # and the policy drifted hard; per-step KL was running 0.10-0.20.
+    # 0.15 matches the math-only GRPO setting that completed 800 steps
+    # without collapse. With HRA-only this is double-safety: base is
+    # frozen AND the adapter contribution is anchored to ref.
+    kl_coeff: float = 0.15
     clip_range: float = 0.20  # PPO default
 
     # Compose template rewards (Unsloth-style stack). These flow into
@@ -1733,18 +1784,19 @@ class MultiEnvGRPOConfig(GRPOConfig):
     reward_approx_format_neg: float = -1.0
     reward_number_match: float = 1.5
     reward_number_miss: float = -0.5
-    reward_strict_template_weight: float = 0.5  # ORIGINAL (reverted from
-    # the 1.0 tighter setting that caused regression at step 150)
+    reward_strict_template_weight: float = 0.5
 
     # Stop-token IDs for rollout generation. <|/answer|>=10, <|user|>=11.
     stop_token_ids: tuple[int, ...] = (10, 11)  # noqa: RUF012
 
     log_interval: int = 10
-    ckpt_interval: int = 75  # 4 ckpts over 300 steps
+    ckpt_interval: int = 50  # 3 ckpts over 150 steps
 
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_mopd_final.pt"
-    stage_prefix: str = "grpo_multi"
-    wandb_run_name: str = "osrt-grpo-multi"
+    # v2 stage_prefix so v2 ckpts don't collide with the v1 step_75/final
+    # already on the volume. v1 artifacts preserved.
+    stage_prefix: str = "grpo_v2"
+    wandb_run_name: str = "osrt-grpo-v2"
 
     # Multi-env registry. Per micro-batch we sample ONE env according
     # to env_weights; group_size rollouts come from that env for the
@@ -1809,8 +1861,20 @@ class MultiEnvGRPOConfig(GRPOConfig):
     #   - If the model genuinely needs base-weight surgery (e.g. a new
     #     reasoning circuit), HRA-only can't deliver it
     #
-    # Recommend ON for any GRPO v2 run after the step 75→150 regression.
-    hra_only_training: bool = False
+    # ON by default for v2 (was added after the step 75→150 regression
+    # in v1; this is the central architectural fix for v2).
+    hra_only_training: bool = True
+
+    # ── Troubleshoot generation (every N steps) ──
+    # Prints a sample completion at the TRAINING temperature so we can
+    # eyeball what rollouts actually look like during the run. Different
+    # from ood_probe (which uses low temp for deterministic eval).
+    # Useful for catching reward-hacking patterns visually — e.g. the
+    # model emitting "I tried 50, then 32, but 18" hedge would jump
+    # out here while reward EMA looked fine.
+    troubleshoot_gen_interval: int = 10
+    troubleshoot_gen_prompt: str = "What is 17 * 23?"
+    troubleshoot_gen_max_new_tokens: int = 200
 
     # ── Anti-hacking knobs (added after the step 75→150 regression) ──
     # Strict numeric extraction closes the "last-number-wins" loophole

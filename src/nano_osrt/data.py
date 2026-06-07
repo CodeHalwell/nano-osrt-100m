@@ -686,19 +686,31 @@ class RolloutDataset(IterableDataset):
         prompt = (rec.get("prompt") or "").strip()
         thinking = (rec.get("thinking") or "").strip()
         response = (rec.get("response") or "").strip()
+        # NEW: optional system prompt. When present, the prefix becomes
+        # <|system|>{sys}<|user|>{q}<|assistant|>. Loss is still only
+        # computed on the assistant portion (everything before is in the
+        # ignored prefix), so the model learns to ATTEND to the system
+        # block but not regenerate it.
+        system = (rec.get("system") or "").strip()
         if not prompt or not response:
             return None
 
-        prefix_text = f"<|user|>{prompt}<|assistant|>"
+        if system:
+            prefix_text = (
+                f"<|system|>{system}<|user|>{prompt}<|assistant|>"
+            )
+        else:
+            prefix_text = f"<|user|>{prompt}<|assistant|>"
         if thinking:
             target_text = (
                 f"<|think|>{thinking}<|/think|>"
                 f"<|answer|>{response}<|/answer|>"
             )
         else:
-            # Gemini sometimes skips thinking on easy prompts. Train on
-            # direct-answer format too — student should learn to produce
-            # `<|answer|>` even without a `<|think|>` block.
+            # Datasets without explicit `thinking` (OpenHermes, etc.)
+            # are trained as direct answer-only outputs. The model should
+            # learn that `<|answer|>` follows `<|assistant|>` even
+            # without a `<|think|>` block.
             target_text = f"<|answer|>{response}<|/answer|>"
 
         prefix_ids = tok.encode(prefix_text, add_special_tokens=False)
