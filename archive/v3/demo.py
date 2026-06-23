@@ -10,9 +10,8 @@ import argparse
 
 import gradio as gr
 import torch
-from transformers import AutoTokenizer
-
 from src.nano_osrt.hf_model import NanoOSRTForCausalLM
+from transformers import AutoTokenizer
 
 # ── Model loading ───────────────────────────────────────────────────────
 
@@ -92,24 +91,39 @@ def generate_stream(
 
     with torch.no_grad():
         for i in range(max_tokens):
-            context = generated[:, -MODEL.config.seq_len:]
+            context = generated[:, -MODEL.config.seq_len :]
             out = MODEL.forward(context)
-            next_logits = out["logits"][:, -1, :MODEL.config.real_vocab_size].float()
+            next_logits = out["logits"][:, -1, : MODEL.config.real_vocab_size].float()
 
-            # Repetition penalty
+            # Repetition penalty: vectorised boolean mask avoids CPU-GPU sync
+            # and supports batch sizes > 1 (original loop hardcoded [0]).
             if repetition_penalty != 1.0:
-                for token_id in set(generated[0].tolist()):
-                    if token_id < next_logits.shape[-1]:
-                        if next_logits[0, token_id] > 0:
-                            next_logits[0, token_id] /= repetition_penalty
-                        else:
-                            next_logits[0, token_id] *= repetition_penalty
+                vocab_size = next_logits.shape[-1]
+                mask = torch.zeros(
+                    (generated.shape[0], vocab_size),
+                    dtype=torch.bool,
+                    device=next_logits.device,
+                )
+                clamped = generated.clamp(max=vocab_size - 1)
+                mask.scatter_(1, clamped, True)
+                mask &= generated < vocab_size  # exclude out-of-vocab ids
+                next_logits = torch.where(
+                    mask,
+                    torch.where(
+                        next_logits > 0,
+                        next_logits / repetition_penalty,
+                        next_logits * repetition_penalty,
+                    ),
+                    next_logits,
+                )
 
             if temperature > 0:
                 next_logits = next_logits / temperature
 
                 if top_k > 0:
-                    topk_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    topk_vals, _ = torch.topk(
+                        next_logits, min(top_k, next_logits.size(-1))
+                    )
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
@@ -140,6 +154,7 @@ def generate_stream(
 
 # ── Gradio UI ───────────────────────────────────────────────────────────
 
+
 def create_demo():
     with gr.Blocks(title="NanoOSRT v3") as demo:
         gr.Markdown(
@@ -156,38 +171,67 @@ def create_demo():
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(height=500, label="Chat")
+                chatbot = gr.Chatbot(
+                    height=500,
+                    label="Chat",
+                    placeholder="**NanoOSRT v3**\n\nReady to chat! Try selecting one of the examples below or ask me a math or coding question.",
+                    buttons=["copy", "share"],
+                )
                 msg = gr.Textbox(
                     placeholder="Ask me anything... (try code or math questions)",
                     label="Message",
                     lines=2,
+                    max_lines=10,
+                    autofocus=True,
+                    info="Press Shift+Enter for a new line, or click Send to submit",
                 )
                 with gr.Row():
                     submit_btn = gr.Button("Send", variant="primary")
+                    stop_btn = gr.Button("Stop", variant="stop")
                     clear_btn = gr.Button("Clear")
 
             with gr.Column(scale=1):
-                gr.Markdown("### Generation Settings")
-                temperature = gr.Slider(
-                    minimum=0.0, maximum=2.0, value=0.2, step=0.05,
-                    label="Temperature",
-                )
-                top_p = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.95, step=0.05,
-                    label="Top-p",
-                )
-                top_k = gr.Slider(
-                    minimum=0, maximum=100, value=50, step=5,
-                    label="Top-k",
-                )
-                max_tokens = gr.Slider(
-                    minimum=32, maximum=1024, value=512, step=32,
-                    label="Max tokens",
-                )
-                repetition_penalty = gr.Slider(
-                    minimum=1.0, maximum=2.0, value=1.2, step=0.05,
-                    label="Repetition penalty",
-                )
+                with gr.Accordion("Generation Settings", open=False):
+                    temperature = gr.Slider(
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=0.2,
+                        step=0.05,
+                        label="Temperature",
+                        info="Controls randomness: lower is focused, higher is creative",
+                    )
+                    top_p = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.95,
+                        step=0.05,
+                        label="Top-p",
+                        info="Nucleus sampling: limits tokens to a cumulative probability mass",
+                    )
+                    top_k = gr.Slider(
+                        minimum=0,
+                        maximum=100,
+                        value=50,
+                        step=5,
+                        label="Top-k",
+                        info="Limits choices to the K most likely tokens",
+                    )
+                    max_tokens = gr.Slider(
+                        minimum=32,
+                        maximum=1024,
+                        value=512,
+                        step=32,
+                        label="Max tokens",
+                        info="Maximum number of tokens to generate",
+                    )
+                    repetition_penalty = gr.Slider(
+                        minimum=1.0,
+                        maximum=2.0,
+                        value=1.2,
+                        step=0.05,
+                        label="Repetition penalty",
+                        info="Penalises repeated tokens to reduce loops (1.0 = off)",
+                    )
 
                 gr.Markdown(
                     "### Model Info\n"
@@ -212,8 +256,32 @@ def create_demo():
             label="Try these examples",
         )
 
-        def respond(message, chat_history, display_history,
-                    temperature, top_p, top_k, max_tokens, repetition_penalty):
+        def respond(
+            message,
+            chat_history,
+            display_history,
+            temperature,
+            top_p,
+            top_k,
+            max_tokens,
+            repetition_penalty,
+        ):
+            # Input length validation to prevent DoS / memory exhaustion
+            if len(message) > 4000:
+                raise gr.Error("Message exceeds maximum length limit.")
+
+            # State payload validation to prevent DoS via malicious history arrays
+            if len(chat_history) > 100 or len(display_history) > 100:
+                raise gr.Error("Conversation history exceeds maximum turn limit.")
+
+            for msg in chat_history:
+                if (
+                    isinstance(msg, dict)
+                    and "content" in msg
+                    and len(msg["content"]) > 16000
+                ):
+                    raise gr.Error("A historical message exceeds maximum length limit.")
+
             # Add user message to both histories
             chat_history = chat_history + [{"role": "user", "content": message}]
             display_history = display_history + [
@@ -224,26 +292,58 @@ def create_demo():
 
             # Stream generation
             for partial in generate_stream(
-                message, chat_history[:-1],  # exclude the user msg we just added (it's in the prompt builder)
-                temperature, top_p, top_k, max_tokens, repetition_penalty,
+                message,
+                chat_history[
+                    :-1
+                ],  # exclude the user msg we just added (it's in the prompt builder)
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repetition_penalty,
             ):
                 display_history[-1] = gr.ChatMessage(role="assistant", content=partial)
                 yield chat_history, display_history, ""
 
             # Save final assistant response to chat_history
-            final = display_history[-1].content if hasattr(display_history[-1], 'content') else ""
+            final = (
+                display_history[-1].content
+                if hasattr(display_history[-1], "content")
+                else ""
+            )
             chat_history = chat_history + [{"role": "assistant", "content": final}]
             yield chat_history, display_history, ""
 
-        msg.submit(
+        msg_event = msg.submit(
             respond,
-            [msg, chat_state, chatbot, temperature, top_p, top_k, max_tokens, repetition_penalty],
+            [
+                msg,
+                chat_state,
+                chatbot,
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repetition_penalty,
+            ],
             [chat_state, chatbot, msg],
         )
-        submit_btn.click(
+        sub_event = submit_btn.click(
             respond,
-            [msg, chat_state, chatbot, temperature, top_p, top_k, max_tokens, repetition_penalty],
+            [
+                msg,
+                chat_state,
+                chatbot,
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repetition_penalty,
+            ],
             [chat_state, chatbot, msg],
+        )
+        stop_btn.click(
+            fn=None, inputs=None, outputs=None, cancels=[msg_event, sub_event]
         )
         clear_btn.click(lambda: ([], [], ""), outputs=[chat_state, chatbot, msg])
 
