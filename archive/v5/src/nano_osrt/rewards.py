@@ -1019,6 +1019,8 @@ def mbpp_test_reward(
         "LC_ALL": "C",
         "LANG": "C",
         "PYTHONIOENCODING": "utf-8",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
         # No HOME / TMP — let Python use defaults inside the tempdir cwd.
     }
 
