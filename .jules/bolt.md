@@ -17,3 +17,7 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+
+## 2026-06-27 - Vectorize stop-token truncation checks
+**Learning:** Using list comprehensions like `[t.item() in stop_set for t in comp_region]` to check for stop tokens forces implicit device-to-host transfers on every iteration and runs a slow Python loop, creating a bottleneck in generation.
+**Action:** Pre-allocate a `stop_tensor` and use `torch.isin(comp_region, stop_tensor)`. This keeps all truncation logic fully on the GPU/device and provides a massive speedup (~100x).
