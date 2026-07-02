@@ -69,7 +69,9 @@ def download(args):
         except Exception:
             pass
 
-        all_entries = [(e.path, "") for e in entries] + [(e.path, "v4/") for e in v4_entries]
+        all_entries = [(e.path, "") for e in entries] + [
+            (e.path, "v4/") for e in v4_entries
+        ]
 
         if args.latest_only:
             # Find latest numbered checkpoint
@@ -202,12 +204,18 @@ def status(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Transfer checkpoints between Modal accounts")
+    parser = argparse.ArgumentParser(
+        description="Transfer checkpoints between Modal accounts"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     dl = sub.add_parser("download", help="Download from Modal to local")
     dl.add_argument("--tokenizer-only", action="store_true")
-    dl.add_argument("--latest-only", action="store_true", help="Only latest checkpoint + rescue + final")
+    dl.add_argument(
+        "--latest-only",
+        action="store_true",
+        help="Only latest checkpoint + rescue + final",
+    )
 
     ul = sub.add_parser("upload", help="Upload from local to Modal")
     ul.add_argument("--tokenizer-only", action="store_true")

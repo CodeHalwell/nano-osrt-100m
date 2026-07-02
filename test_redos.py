@@ -1,6 +1,7 @@
 import re
 import time
 
+
 def test_redos():
     # Construct an adversarial payload
     text = "\n " * 20000 + "A"
@@ -12,5 +13,6 @@ def test_redos():
         print("New failed:", e)
     end = time.time()
     print(f"New took {end - start:.4f} seconds")
+
 
 test_redos()

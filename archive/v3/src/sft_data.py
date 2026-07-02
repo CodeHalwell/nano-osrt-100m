@@ -67,6 +67,7 @@ def format_numina_math(
         if final.startswith("\\boxed"):
             # Extract from \boxed{...}
             import re
+
             match = re.search(r"\\boxed\{(.+?)\}", final)
             if match:
                 final = match.group(1)
@@ -78,9 +79,7 @@ def format_numina_math(
     return question, assistant
 
 
-def format_ifeval(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
+def format_ifeval(example: dict, think_open: str, think_close: str) -> tuple[str, str]:
     """Format an ifeval-like-data example into user/assistant with CoT.
 
     Has 'prompt' and 'response' columns. The key value is teaching
@@ -150,9 +149,7 @@ def format_longform(
     return question, assistant
 
 
-def format_alpaca(
-    example: dict, think_open: str, think_close: str
-) -> tuple[str, str]:
+def format_alpaca(example: dict, think_open: str, think_close: str) -> tuple[str, str]:
     """Format an Alpaca example. Wraps the output with brief thinking."""
     instruction = example["instruction"]
     inp = example.get("input", "")
@@ -282,7 +279,9 @@ def format_evol_code(
             code = "\n\n".join(paragraphs[1:]).strip()
             assistant = f"{think_open}{reasoning}{think_close}\n{code}"
         else:
-            assistant = f"{think_open}Let me solve this step by step.{think_close}\n{output}"
+            assistant = (
+                f"{think_open}Let me solve this step by step.{think_close}\n{output}"
+            )
 
     return question, assistant
 
@@ -417,9 +416,7 @@ class SFTStream(IterableDataset):
                 if ds_cfg.get("hf_config"):
                     reload_kwargs["name"] = ds_cfg["hf_config"]
                 ds = load_dataset(ds_cfg["hf_id"], **reload_kwargs)
-                ds = ds.shuffle(
-                    buffer_size=2_000, seed=seed + rng.randint(0, 10000)
-                )
+                ds = ds.shuffle(buffer_size=2_000, seed=seed + rng.randint(0, 10000))
                 streams[idx] = iter(ds)
                 example = next(streams[idx])
 

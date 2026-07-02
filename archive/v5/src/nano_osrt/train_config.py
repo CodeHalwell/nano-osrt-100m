@@ -119,7 +119,7 @@ class PretrainConfig:
     grad_clip: float = 1.0
     log_interval: int = 50
     eval_interval: int = 1_000
-    eval_steps: int = 20           # number of batches per eval
+    eval_steps: int = 20  # number of batches per eval
     # Frequent ckpts protect against budget-driven Modal kills: with a
     # capped credit pool, the function dies hard (no clean shutdown,
     # no rescue ckpt) when the wallet hits zero. 500-step intervals
@@ -162,10 +162,10 @@ class PretrainConfig:
     # high while per-token entropy also stayed high). All four must hold by
     # step `early_stop_check_step` or training is considered failed.
     early_stop_check_step: int = 5_000
-    min_per_token_entropy_drop: float = 0.55   # init 2.08 → 1.53 (ln 8 = 2.08)
-    min_raw_max_prob: float = 0.30             # well above uniform 1/8 = 0.125
-    min_top_margin: float = 0.10               # clear gap between rank 0 and 1
-    min_marginal_entropy: float = 1.80         # balanced across experts
+    min_per_token_entropy_drop: float = 0.55  # init 2.08 → 1.53 (ln 8 = 2.08)
+    min_raw_max_prob: float = 0.30  # well above uniform 1/8 = 0.125
+    min_top_margin: float = 0.10  # clear gap between rank 0 and 1
+    min_marginal_entropy: float = 1.80  # balanced across experts
     # The four checks above use clean deployed routing (router + balance bias).
     # These guardrails make sure the learned pre-bias router is not secretly
     # collapsed while the non-gradient bias controller hides it.
@@ -344,16 +344,16 @@ class PretrainExtendConfig(PretrainConfig):
     # transition is a tiny upward LR bump (0.5 %), then cosine cools
     # more gently over the longer horizon.
     total_steps: int = 2_800
-    warmup_steps: int = 50          # 3 % of original — kept fixed (re-warmup
-                                    # already done in steps 0-50)
-    peak_lr: float = 1.5e-5         # 2.5 % of original 6e-4
-    min_lr: float = 1.5e-6          # cosine to 10 % of peak
-    weight_decay: float = 0.1       # softer wd than pretrain (0.3)
+    warmup_steps: int = 50  # 3 % of original — kept fixed (re-warmup
+    # already done in steps 0-50)
+    peak_lr: float = 1.5e-5  # 2.5 % of original 6e-4
+    min_lr: float = 1.5e-6  # cosine to 10 % of peak
+    weight_decay: float = 0.1  # softer wd than pretrain (0.3)
     grad_clip: float = 1.0
     log_interval: int = 25
     eval_interval: int = 250
     eval_steps: int = 20
-    ckpt_interval: int = 200        # ~14 ckpts over the 2,800-step run
+    ckpt_interval: int = 200  # ~14 ckpts over the 2,800-step run
 
     # Optimizer reuses the Muon hybrid from pretrain. The lower
     # peak_lr also propagates down to Muon via the same _peak_lr
@@ -361,7 +361,7 @@ class PretrainExtendConfig(PretrainConfig):
     # explicitly so we don't reuse the pretrain-tuned 0.02 (which
     # would shock SFT-flavored weights at this stage).
     optimizer_name: str = "muon"
-    muon_lr: float = 5e-3           # 25 % of pretrain's 0.02
+    muon_lr: float = 5e-3  # 25 % of pretrain's 0.02
     muon_min_lr: float = 5e-4
 
     # ── Routing exploration ─────────────────────────────────────────
@@ -370,7 +370,7 @@ class PretrainExtendConfig(PretrainConfig):
     # noise would hurt rather than help.
     router_gumbel_tau_init: float = 0.0
     router_gumbel_tau_final: float = 0.0
-    router_gumbel_anneal_steps: int = 1   # avoid div-by-zero
+    router_gumbel_anneal_steps: int = 1  # avoid div-by-zero
 
     # ── Early-stop gate ────────────────────────────────────────────
     # Push past the budget so the gate never trips — the four-metric
@@ -393,9 +393,7 @@ class PretrainExtendConfig(PretrainConfig):
     hra_scale: float = 1.0
     hra_before_load: bool = True
     hra_frozen: bool = True
-    pretrained_checkpoint: str = (
-        "/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt"
-    )
+    pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_sft_ultralong_final.pt"
 
     # Distinct ckpt prefix so this stage's checkpoints
     # (osrt_v5_extend_step_N.pt) don't collide with base pretrain
@@ -571,10 +569,10 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # exploration, deeper cool (min_lr 7e-7 vs 1e-6) for a tight
     # final state. ~2500 steps × ~1.5 sec compiled = ~62 min, ~$4.
     total_steps: int = 8_100
-    lr_anchor_step: int = 5_600     # resume point — phase 3 anchors here
-    warmup_steps: int = 60          # re-warm length over steps 5600-5660
-    peak_lr: float = 7e-6           # cooler peak for consolidation
-    min_lr: float = 7e-7            # 10% of peak — tight final cool
+    lr_anchor_step: int = 5_600  # resume point — phase 3 anchors here
+    warmup_steps: int = 60  # re-warm length over steps 5600-5660
+    peak_lr: float = 7e-6  # cooler peak for consolidation
+    min_lr: float = 7e-7  # 10% of peak — tight final cool
 
     # Muon hybrid mirrors extend1; lower peak_lr propagates via the
     # same _peak_lr tagging in train.py.
@@ -587,7 +585,7 @@ class PretrainExtend2Config(PretrainExtendConfig):
     # 25-step interval is sane for a 3000-step run (~120 step events
     # total instead of 3000), keeps wandb/console output manageable.
     log_interval: int = 25
-    ckpt_interval: int = 200        # ~15 ckpts over 3,000 steps
+    ckpt_interval: int = 200  # ~15 ckpts over 3,000 steps
     eval_interval: int = 9_999_999  # skip in-run eval (heartbeat risk)
     eval_steps: int = 20
 
@@ -1021,7 +1019,7 @@ class SFTConfig:
     log_interval: int = 25
     ckpt_interval: int = 500
     optimizer_name: str = "adamw"
-    seq_len: int = 2048              # short seq_len + packing (see v4_sft_data)
+    seq_len: int = 2048  # short seq_len + packing (see v4_sft_data)
 
     # HRA
     hra_enabled: bool = True
@@ -1165,8 +1163,8 @@ class SFTLongConfig(SFTConfig):
     total_steps: int = 1_000
     warmup_steps: int = 50
     seq_len: int = 4096
-    batch_size: int = 4               # halved from 8 to fit longer ctx
-    grad_accum_steps: int = 16        # doubled to keep effective batch 64
+    batch_size: int = 4  # halved from 8 to fit longer ctx
+    grad_accum_steps: int = 16  # doubled to keep effective batch 64
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
     log_interval: int = 25
@@ -1363,22 +1361,22 @@ class SFTRefreshConfig(SFTConfig):
     # exposure, not deep content; 200 steps × ~6 sec/step ≈ 20 min ≈
     # $1.30, well within remaining $2.70 budget.
     total_steps: int = 200
-    warmup_steps: int = 10            # 5 % of new total
+    warmup_steps: int = 10  # 5 % of new total
     seq_len: int = 2048
     batch_size: int = 8
     grad_accum_steps: int = 8
     peak_lr: float = 5e-6
     min_lr: float = 5e-7
-    log_interval: int = 10            # tighter logs for the short run
+    log_interval: int = 10  # tighter logs for the short run
     ckpt_interval: int = 50
 
     # HRA: keep trainable so adapters re-tune to the new base.
     hra_enabled: bool = True
     hra_rank: int = 256
     hra_scale: float = 1.0
-    hra_lr: float = 2.5e-5            # 33 % of base SFT hra_lr (7.5e-5)
+    hra_lr: float = 2.5e-5  # 33 % of base SFT hra_lr (7.5e-5)
     hra_freeze_pretrained: bool = False
-    hra_before_load: bool = True      # extend ckpt has HRA params
+    hra_before_load: bool = True  # extend ckpt has HRA params
 
     # Resume from the post-extend checkpoint.
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_extend_final.pt"
@@ -1509,11 +1507,11 @@ class SFTMathConfig(SFTRefreshConfig):
     """
 
     total_steps: int = 1_000
-    warmup_steps: int = 50          # 5 % of total
-    peak_lr: float = 3e-6           # lower than refresh's 5e-6
+    warmup_steps: int = 50  # 5 % of total
+    peak_lr: float = 3e-6  # lower than refresh's 5e-6
     min_lr: float = 3e-7
     log_interval: int = 25
-    ckpt_interval: int = 200        # 5 ckpts over 1,000 steps
+    ckpt_interval: int = 200  # 5 ckpts over 1,000 steps
 
     # HRA inherited as trainable. Resume from the freshly-format-
     # anchored ckpt (sft_refresh_final.pt has HRA params in its
@@ -1592,7 +1590,7 @@ class GRPOConfig:
     # 0.20 because the policy has drifted further from the SFT
     # reference over 700 steps.
     total_steps: int = 800
-    warmup_steps: int = 20          # short re-warm over steps 700-720
+    warmup_steps: int = 20  # short re-warm over steps 700-720
     # Steps elapsed before this LR phase. The warmup/cosine schedule
     # uses `step - lr_anchor_step` so re-warming after a resume
     # gives real gradient instead of the near-zero LR a continued
@@ -1610,7 +1608,7 @@ class GRPOConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     log_interval: int = 10
-    ckpt_interval: int = 100        # 5 ckpts over 500 steps (was 250)
+    ckpt_interval: int = 100  # 5 ckpts over 500 steps (was 250)
     seq_len: int = 8192
 
     # GRPO-specific
@@ -1914,8 +1912,7 @@ class MultiEnvGRPOConfig(GRPOConfig):
         ("How many seconds are in 3 minutes?", "180"),
         ("Convert 100 centimeters to meters.", "1"),
         ("What is half of 50?", "25"),
-        ("If a train travels 60 mph for 2 hours, how far does it go?",
-         "120"),
+        ("If a train travels 60 mph for 2 hours, how far does it go?", "120"),
         ("Round 3.7 to the nearest integer.", "4"),
         ("What is the square root of 64?", "8"),
         ("Count: how many letters are in 'banana'?", "6"),

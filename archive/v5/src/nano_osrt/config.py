@@ -39,21 +39,18 @@ class NanoOSRTConfig(PretrainedConfig):
         head_dim: int = 64,
         vocab_size: int = 32768,
         real_vocab_size: int = 32768,
-
         # Recursive structure (unchanged from v4)
         num_blocks: int = 3,
         recursive_loops: int = 6,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
-
         # --- MoE (v5 architecture) ---
         # No dense FFN. Shared expert replaces it at larger hidden size.
         # 8 routed experts × hidden 2048, top-2 (Mixtral-style).
         num_routed_experts: int = 8,
         top_k_experts: int = 2,
-        expert_hidden: int = 2048,          # routed experts
-        shared_expert_hidden: int = 4096,   # shared expert (replaces dense FFN)
-
+        expert_hidden: int = 2048,  # routed experts
+        shared_expert_hidden: int = 4096,  # shared expert (replaces dense FFN)
         # --- Routing (Switch-style + explicit load controller) ---
         # Balance loss: num_experts * sum(f_i * p_i) where
         #   f_i = fraction of tokens routed to expert i (hard assignment)
@@ -74,7 +71,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # pre-bias router logits while the explicit bias controller below
         # handles deployed clean-routing load.
         router_aux_loss_coeff: float = 0.10,
-
         # --- Router Z-loss (numerical safety + early router health) ---
         # Penalty on the router's pre-softmax log-partition:
         #   L_z = mean_token (logsumexp(router_logits))^2
@@ -85,7 +81,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # value is ~1e-3; small enough not to compete with task loss but
         # large enough to keep raw logit magnitudes O(1).
         router_z_loss_coeff: float = 1e-3,
-
         # --- Sequence-wise balance loss (DeepSeek-V3 §5.2) ---
         # Per-sequence Switch-style loss penalising imbalance INSIDE a
         # single sequence. Useful at long context where one document can
@@ -94,7 +89,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # When non-zero, a small value (1e-3 to 1e-2) is enough; the
         # global aux loss does the heavy lifting.
         router_seq_balance_loss_coeff: float = 0.0,
-
         # --- Per-loop auxiliary LM-head loss (architecture fix) ---
         # When > 0, an aux CE loss is computed on the hidden state at
         # the END of each recursive loop except the last one, by
@@ -108,7 +102,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # which is large enough to drive learning without overpowering
         # the primary objective. Set to 0 to disable.
         aux_loop_loss_weight: float = 0.0,
-
         # --- Per-loop aux weights (optional override) ---
         # If set (length must equal recursive_loops - 1), overrides
         # the uniform aux_loop_loss_weight with per-loop scaling. E.g.
@@ -117,7 +110,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # info and need more help to become useful). When None, all
         # intermediate loops are weighted uniformly by aux_loop_loss_weight.
         per_loop_aux_weights: list[float] | None = None,
-
         # --- Loop dropout (stochastic depth for recursive loops) ---
         # With probability loop_dropout_prob during training, truncate
         # the recursive loop chain to a random length in
@@ -129,7 +121,6 @@ class NanoOSRTConfig(PretrainedConfig):
         # output some fraction of the time. Set prob=0 to disable.
         loop_dropout_prob: float = 0.0,
         loop_dropout_min_loops: int = 3,
-
         # --- Balance-bias controller (DeepSeek-style) ---
         # Per-expert additive bias applied to router logits as part of the
         # routing mechanism in both train and eval. Bias is per recursive loop
@@ -149,37 +140,30 @@ class NanoOSRTConfig(PretrainedConfig):
         router_balance_bias_update_rate: float = 0.10,
         router_balance_bias_ema_rate: float = 0.05,
         router_balance_bias_max: float = 1.5,
-
         # Training-time noisy top-k. The training loop anneals this buffer;
         # default stays 0.0 so unit tests and standalone/eval forwards are
         # deterministic unless the trainer explicitly enables exploration.
         router_gumbel_tau_init: float = 0.0,
-
         # Capacity factor: expert_capacity = capacity_factor * N / num_experts
         # 2.0 is loose enough that router preferences actually drive routing.
         # Dropped tokens (exceeded capacity) skip the MoE path and get
         # only the shared expert + residual. Switch uses 1.25; we loosen
         # to 2.0 because v4 showed tight caps hide router decisions.
         router_capacity_factor: float = 2.0,
-
         # Orthogonal expert initialisation:
         # Initialise each routed expert's projection weights with mutually
         # orthogonal feature subspaces so experts start in different
         # directions of the hidden space. Uses QR decomposition of random
         # matrices with a per-expert seed offset.
         expert_orthogonal_init: bool = True,
-
         # Loop embedding init std (kept from v4 — was correct)
         loop_embedding_init_std: float = 0.1,
-
         # --- Sequence length (unchanged from v4) ---
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
-
         # --- Training defaults ---
         initializer_range: float = 0.02,
-
         # --- Token IDs (must match tokenizer special tokens) ---
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -195,7 +179,6 @@ class NanoOSRTConfig(PretrainedConfig):
         user_token_id: int = 11,
         assistant_token_id: int = 12,
         system_token_id: int = 13,
-
         **kwargs,
     ):
         self.dim = dim
@@ -282,9 +265,7 @@ class NanoOSRTConfig(PretrainedConfig):
                 f"num_routed_experts ({self.num_routed_experts})"
             )
         if self.top_k_experts < 1:
-            raise ValueError(
-                f"top_k_experts must be >= 1, got {self.top_k_experts}"
-            )
+            raise ValueError(f"top_k_experts must be >= 1, got {self.top_k_experts}")
         if self.top_k_experts > self.num_routed_experts // 2:
             raise ValueError(
                 f"top_k_experts ({self.top_k_experts}) > "
@@ -306,13 +287,11 @@ class NanoOSRTConfig(PretrainedConfig):
             )
         if self.router_aux_loss_coeff < 0:
             raise ValueError(
-                f"router_aux_loss_coeff must be >= 0, got "
-                f"{self.router_aux_loss_coeff}"
+                f"router_aux_loss_coeff must be >= 0, got {self.router_aux_loss_coeff}"
             )
         if self.router_z_loss_coeff < 0:
             raise ValueError(
-                f"router_z_loss_coeff must be >= 0, got "
-                f"{self.router_z_loss_coeff}"
+                f"router_z_loss_coeff must be >= 0, got {self.router_z_loss_coeff}"
             )
         if self.router_seq_balance_loss_coeff < 0:
             raise ValueError(

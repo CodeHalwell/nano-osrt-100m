@@ -37,9 +37,11 @@ from nano_osrt.train_config import PretrainConfig
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
+
 
 class _LocalVol:
     """Volume stub that satisfies `run_training`'s `vol.commit()` calls
@@ -62,7 +64,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tokenizer-path",
         default=os.environ.get("OSRT_TOKENIZER_PATH", "./tokenizer"),
         help="Local path to the HF tokenizer directory (default: ./tokenizer "
-             "or $OSRT_TOKENIZER_PATH).",
+        "or $OSRT_TOKENIZER_PATH).",
     )
     p.add_argument(
         "--ckpt-dir",
@@ -74,7 +76,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Override PretrainConfig.total_steps (default 300000). Useful "
-             "for sanity / partial-budget runs.",
+        "for sanity / partial-budget runs.",
     )
     p.add_argument(
         "--wandb-run-name",
@@ -85,7 +87,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wandb-run-id",
         default=None,
         help="Resume an existing W&B run by id (e.g. when resuming after a "
-             "credit-driven kill so the dashboard stays one continuous run).",
+        "credit-driven kill so the dashboard stays one continuous run).",
     )
     p.add_argument(
         "--no-wandb",

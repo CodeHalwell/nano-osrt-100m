@@ -33,8 +33,14 @@ image = (
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
     )
     .pip_install(
-        "transformers", "datasets", "lion-pytorch", "triton", "wandb",
-        "tokenizers", "sentencepiece", "safetensors",
+        "transformers",
+        "datasets",
+        "lion-pytorch",
+        "triton",
+        "wandb",
+        "tokenizers",
+        "sentencepiece",
+        "safetensors",
     )
     .pip_install("lm-eval", "langdetect", "immutabledict")
     .add_local_dir("src/nano_osrt", remote_path="/root/nano_osrt")
@@ -63,6 +69,7 @@ tokenizer_vol = modal.Volume.from_name("osrt-v4-tokenizer", create_if_missing=Tr
 def train_tokenizer():
     """Train custom 32K BPE tokenizer on pre-training data mix."""
     import sys
+
     sys.path.insert(0, "/root")
 
     # Force unbuffered stdout so Modal's log tail shows progress in real
@@ -89,6 +96,7 @@ def train_tokenizer():
 
     # Cleanup temp file
     import os
+
     os.remove(data_path)
 
     print("\nTokenizer saved to Modal volume 'osrt-v4-tokenizer'", flush=True)
@@ -106,18 +114,21 @@ def train_tokenizer():
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
     },
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def pretrain():
     """Run v4 pre-training with progressive seq_len curriculum."""
     # Force reload volume to avoid stale cache
     import modal as _modal
-    from transformers import AutoTokenizer
-
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_train import run_v4_training
     from nano_osrt.v4_train_config import V4PretrainConfig
+    from transformers import AutoTokenizer
+
     _tok_vol = _modal.Volume.from_name("osrt-v4-tokenizer")
     _tok_vol.reload()
 
@@ -127,6 +138,7 @@ def pretrain():
 
     # Debug: list what's on the volume
     import os
+
     print(f"Tokenizer volume contents: {os.listdir(tokenizer_path)}")
 
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -150,11 +162,14 @@ def pretrain():
 
     total_params = (
         model_config.vocab_size * model_config.dim  # embedding
-        + model_config.num_blocks * (
+        + model_config.num_blocks
+        * (
             model_config.dim * model_config.dim * 4  # attention (approx)
             + model_config.dim * model_config.dense_hidden * 3  # dense FFN
             + (model_config.num_shared_experts + model_config.num_routed_experts)
-            * model_config.dim * model_config.expert_hidden * 3  # MoE
+            * model_config.dim
+            * model_config.expert_hidden
+            * 3  # MoE
         )
     )
     print(f"Estimated parameters: ~{total_params / 1e6:.0f}M")
@@ -174,16 +189,18 @@ def pretrain():
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
     },
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def sft():
     """Run balanced SFT: math + code + STEM + general."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_sft_train import run_v4_sft
     from nano_osrt.v4_train_config import V4SFTConfig
+    from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
@@ -211,16 +228,18 @@ def sft():
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
     },
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def moe_recover():
     """Router+experts fine-tune experiment: wake up a dead MoE router."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_moe_recover import run_v4_moe_recover
     from nano_osrt.v4_train_config import V4MoERecoverConfig
+    from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained("/vol/tokenizer")
 
@@ -248,7 +267,10 @@ def moe_recover():
         "/vol/checkpoints": vol,
         "/vol/tokenizer": tokenizer_vol,
     },
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def grpo():
@@ -338,15 +360,23 @@ def grpo():
     # W&B
     use_wandb = cfg.wandb_log and wandb is not None
     if use_wandb:
-        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config={"stage": "grpo"})
+        wandb.init(
+            project=cfg.wandb_project, name=cfg.wandb_run_name, config={"stage": "grpo"}
+        )
 
     # Optimizer
     if hra_params:
-        param_groups = get_param_groups(model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay)
+        param_groups = get_param_groups(
+            model, hra_params, cfg.peak_lr, cfg.hra_lr, cfg.weight_decay
+        )
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.peak_lr,
-                                       weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.peak_lr,
+            weight_decay=cfg.weight_decay,
+            betas=(0.9, 0.95),
+        )
 
     # Prompt dataset
     print("Loading prompt dataset...")
@@ -367,8 +397,12 @@ def grpo():
         if step < cfg.warmup_steps:
             lr = cfg.peak_lr * step / cfg.warmup_steps
         else:
-            progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
-            lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+            progress = (step - cfg.warmup_steps) / max(
+                cfg.total_steps - cfg.warmup_steps, 1
+            )
+            lr = cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
+                1 + math.cos(math.pi * progress)
+            )
         for pg in optimizer.param_groups:
             if pg.get("group_name") == "hra":
                 pg["lr"] = lr * (cfg.hra_lr / cfg.peak_lr)
@@ -405,14 +439,20 @@ def grpo():
             for _ in range(cfg.group_size):
                 generated = prompt_tensor.clone()
                 for _t in range(cfg.max_gen_len):
-                    input_seq = generated[:, -cfg.seq_len:]
+                    input_seq = generated[:, -cfg.seq_len :]
                     with torch.no_grad():
                         out = model(input_seq)
-                        next_logits = out.logits[:, -1, :model_config.real_vocab_size].float()
+                        next_logits = out.logits[
+                            :, -1, : model_config.real_vocab_size
+                        ].float()
                     next_logits = next_logits / cfg.temperature
-                    sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                    sorted_logits, sorted_indices = torch.sort(
+                        next_logits, descending=True
+                    )
                     cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_mask = cumprobs - F.softmax(sorted_logits, dim=-1) >= cfg.top_p
+                    sorted_mask = (
+                        cumprobs - F.softmax(sorted_logits, dim=-1) >= cfg.top_p
+                    )
                     sorted_logits[sorted_mask] = float("-inf")
                     next_logits.scatter_(1, sorted_indices, sorted_logits)
                     probs = F.softmax(next_logits, dim=-1)
@@ -435,7 +475,8 @@ def grpo():
                 )
                 comp_tokens = len(comp_ids) - prompt_len
                 reward, breakdown = compute_reward(
-                    comp_text, ground_truth,
+                    comp_text,
+                    ground_truth,
                     correctness_weight=cfg.correctness_reward,
                     format_weight=cfg.format_reward,
                     length_penalty=cfg.length_penalty,
@@ -460,7 +501,7 @@ def grpo():
             for comp_ids, adv in zip(completions, advantages):
                 if abs(adv) < 1e-8:
                     continue
-                comp_ids = comp_ids[:cfg.seq_len].to(device)
+                comp_ids = comp_ids[: cfg.seq_len].to(device)
                 comp_len = len(comp_ids) - prompt_len
                 if comp_len <= 0:
                     continue
@@ -468,23 +509,27 @@ def grpo():
                 # Policy log probs on the sampled completion
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model(comp_ids.unsqueeze(0))
-                    logits = out.logits[0, :, :model_config.real_vocab_size].float()
-                shift_logits = logits[prompt_len - 1:-1]
+                    logits = out.logits[0, :, : model_config.real_vocab_size].float()
+                shift_logits = logits[prompt_len - 1 : -1]
                 shift_labels = comp_ids[prompt_len:]
-                policy_lp = F.log_softmax(shift_logits, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1)
-                ).squeeze(1)
+                policy_lp = (
+                    F.log_softmax(shift_logits, dim=-1)
+                    .gather(1, shift_labels.unsqueeze(1))
+                    .squeeze(1)
+                )
 
                 # Reference log probs (frozen, no grad)
                 with torch.no_grad():
                     ref_out = ref_model(comp_ids.unsqueeze(0))
                     ref_logits = ref_out.logits[
-                        0, :, :model_config.real_vocab_size
+                        0, :, : model_config.real_vocab_size
                     ].float()
-                ref_shift = ref_logits[prompt_len - 1:-1]
-                ref_lp = F.log_softmax(ref_shift, dim=-1).gather(
-                    1, shift_labels.unsqueeze(1)
-                ).squeeze(1)
+                ref_shift = ref_logits[prompt_len - 1 : -1]
+                ref_lp = (
+                    F.log_softmax(ref_shift, dim=-1)
+                    .gather(1, shift_labels.unsqueeze(1))
+                    .squeeze(1)
+                )
 
                 # Direct policy gradient weighted by group-normalised advantage.
                 # Since we perform only one gradient step per sampled batch,
@@ -516,33 +561,48 @@ def grpo():
             vram = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
             mean_kl = step_kl / max(step_total, 1)
-            print(f"step {step:>6d}/{cfg.total_steps} | loss {step_loss:.4f} | "
-                  f"reward {mean_reward:.3f} | acc {accuracy:.1%} | "
-                  f"kl {mean_kl:.4f} | lr {lr:.2e} | "
-                  f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s")
+            print(
+                f"step {step:>6d}/{cfg.total_steps} | loss {step_loss:.4f} | "
+                f"reward {mean_reward:.3f} | acc {accuracy:.1%} | "
+                f"kl {mean_kl:.4f} | lr {lr:.2e} | "
+                f"vram {vram:.1f}GB | elapsed {elapsed:.0f}s"
+            )
             if use_wandb:
-                wandb.log({
-                    "grpo/loss": step_loss,
-                    "grpo/mean_reward": mean_reward,
-                    "grpo/accuracy": accuracy,
-                    "grpo/approx_kl": mean_kl,
-                    "grpo/lr": lr,
-                }, step=step)
+                wandb.log(
+                    {
+                        "grpo/loss": step_loss,
+                        "grpo/mean_reward": mean_reward,
+                        "grpo/accuracy": accuracy,
+                        "grpo/approx_kl": mean_kl,
+                        "grpo/lr": lr,
+                    },
+                    step=step,
+                )
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({"step": step, "model_state_dict": inner.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict()},
-                       f"{ckpt_dir}/osrt_v4_grpo_step_{step}.pt")
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                f"{ckpt_dir}/osrt_v4_grpo_step_{step}.pt",
+            )
             vol.commit()
 
         # 23h safety
         if time.time() - start_time > 82_800:
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({"step": step, "model_state_dict": inner.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict()},
-                       f"{ckpt_dir}/osrt_v4_grpo_rescue.pt")
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                },
+                f"{ckpt_dir}/osrt_v4_grpo_rescue.pt",
+            )
             vol.commit()
             if use_wandb:
                 wandb.finish()
@@ -550,10 +610,14 @@ def grpo():
 
     # Final
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save({"model_state_dict": inner.state_dict(), "training_stage": "grpo"},
-               f"{ckpt_dir}/osrt_v4_grpo_final.pt")
+    torch.save(
+        {"model_state_dict": inner.state_dict(), "training_stage": "grpo"},
+        f"{ckpt_dir}/osrt_v4_grpo_final.pt",
+    )
     vol.commit()
-    print(f"\nGRPO complete. {cfg.total_steps} steps in {(time.time() - start_time) / 3600:.1f}h")
+    print(
+        f"\nGRPO complete. {cfg.total_steps} steps in {(time.time() - start_time) / 3600:.1f}h"
+    )
     if use_wandb:
         wandb.finish()
 
@@ -579,10 +643,9 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
     import torch.nn.functional as F
     from lm_eval import evaluator
     from lm_eval.api.model import LM
-    from transformers import AutoTokenizer
-
     from nano_osrt.v4_config import NanoOSRTv4Config
     from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
+    from transformers import AutoTokenizer
 
     class V4EvalModel(LM):
         def __init__(self):
@@ -643,9 +706,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                     print("  Detected HRA keys in checkpoint, injecting adapters...")
                     inject_hra(self.model, rank=256)
 
-            missing, unexpected = self.model.load_state_dict(
-                state_dict, strict=False
-            )
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
             if missing:
                 print(f"  MISSING keys ({len(missing)}): sample {missing[:3]}")
             if unexpected:
@@ -659,15 +720,24 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
             print(f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
         @property
-        def eot_token_id(self): return self.tokenizer.eos_token_id
+        def eot_token_id(self):
+            return self.tokenizer.eos_token_id
+
         @property
-        def max_length(self): return self.model.config.max_position_embeddings
+        def max_length(self):
+            return self.model.config.max_position_embeddings
+
         @property
-        def max_gen_toks(self): return 256
+        def max_gen_toks(self):
+            return 256
+
         @property
-        def batch_size(self): return self._batch_size
+        def batch_size(self):
+            return self._batch_size
+
         @property
-        def device(self): return self._device
+        def device(self):
+            return self._device
 
         def tok_encode(self, s, **kw):
             return self.tokenizer.encode(s, add_special_tokens=False)
@@ -715,10 +785,19 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
             # Strip any residual special-token markers the harness might
             # otherwise interpret as content.
             for tok in (
-                "<|begin_of_text|>", "<|end_of_text|>", "<|padding|>",
-                "<|user|>", "<|assistant|>", "<|system|>",
-                "<|think|>", "<|/think|>", ANS_OPEN, ANS_CLOSE,
-                "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+                "<|begin_of_text|>",
+                "<|end_of_text|>",
+                "<|padding|>",
+                "<|user|>",
+                "<|assistant|>",
+                "<|system|>",
+                "<|think|>",
+                "<|/think|>",
+                ANS_OPEN,
+                ANS_CLOSE,
+                "<|fim_prefix|>",
+                "<|fim_middle|>",
+                "<|fim_suffix|>",
                 "<|unknown|>",
             ):
                 extracted = extracted.replace(tok, "")
@@ -726,7 +805,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
 
         def _model_call(self, inps):
             with torch.no_grad():
-                return self.model(inps.to(self._device)).logits[:, :, :self.vocab_size]
+                return self.model(inps.to(self._device)).logits[:, :, : self.vocab_size]
 
         def loglikelihood(self, requests, **kw):
             results = []
@@ -736,16 +815,21 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 cont_ids = self.tok_encode(cont)
                 full = torch.tensor([ctx_ids + cont_ids], dtype=torch.long)
                 if full.shape[1] > self.max_length:
-                    full = full[:, -self.max_length:]
-                    ctx_len = max(0, len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length))
+                    full = full[:, -self.max_length :]
+                    ctx_len = max(
+                        0,
+                        len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length),
+                    )
                 else:
                     ctx_len = len(ctx_ids)
                 logits = self._model_call(full)
-                sl = logits[0, ctx_len-1:-1, :]
+                sl = logits[0, ctx_len - 1 : -1, :]
                 labels = full[0, ctx_len:].to(self._device)
                 lp = F.log_softmax(sl.float(), dim=-1)
                 tlp = lp.gather(1, labels.unsqueeze(1)).squeeze(1)
-                results.append((tlp.sum().item(), (sl.argmax(-1) == labels).all().item()))
+                results.append(
+                    (tlp.sum().item(), (sl.argmax(-1) == labels).all().item())
+                )
             return results
 
         def loglikelihood_rolling(self, requests, **kw):
@@ -755,7 +839,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 ids = self.tok_encode(s)
                 full = torch.tensor([ids], dtype=torch.long)
                 if full.shape[1] > self.max_length:
-                    full = full[:, -self.max_length:]
+                    full = full[:, -self.max_length :]
                 logits = self._model_call(full)
                 sl = logits[0, :-1, :]
                 labels = full[0, 1:].to(self._device)
@@ -774,14 +858,14 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 ctx_ids = self.tok_encode(ctx)
                 ctx_t = torch.tensor([ctx_ids], dtype=torch.long)
                 if ctx_t.shape[1] > self.max_length - max_gen:
-                    ctx_t = ctx_t[:, -(self.max_length - max_gen):]
+                    ctx_t = ctx_t[:, -(self.max_length - max_gen) :]
                 out = self.model.generate(
                     ctx_t.to(self._device),
                     max_new_tokens=max_gen,
                     temperature=0.0,
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
-                new_ids = out[0, ctx_t.shape[1]:].tolist()
+                new_ids = out[0, ctx_t.shape[1] :].tolist()
 
                 # Decode keeping the special tokens visible so we can
                 # extract <|answer|>...<|/answer|>. Strict benchmarks need
@@ -792,7 +876,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 # Also respect the harness-provided stop strings.
                 for stop in until:
                     if stop and stop in resp:
-                        resp = resp[:resp.index(stop)]
+                        resp = resp[: resp.index(stop)]
                 results.append(resp)
                 if (i + 1) % 50 == 0:
                     print(f"  Generated {i + 1}/{len(requests)}")
@@ -814,7 +898,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
         print(f"\n{task}:")
         for k, v in sorted(metrics.items()):
             if isinstance(v, float):
-                print(f"  {k}: {v:.4f} ({v*100:.2f}%)")
+                print(f"  {k}: {v:.4f} ({v * 100:.2f}%)")
             else:
                 print(f"  {k}: {v}")
     return results["results"]
@@ -850,7 +934,7 @@ def main(stage: str = "pretrain"):
             print(f"\n{task}:")
             for k, v in sorted(metrics.items()):
                 if isinstance(v, float):
-                    print(f"  {k}: {v:.4f} ({v*100:.2f}%)")
+                    print(f"  {k}: {v:.4f} ({v * 100:.2f}%)")
                 else:
                     print(f"  {k}: {v}")
     else:

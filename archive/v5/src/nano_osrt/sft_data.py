@@ -40,6 +40,7 @@ def format_gsm8k(example: dict) -> tuple[str, str, str]:
 def format_numina_math(example: dict) -> tuple[str, str, str]:
     """NuminaMath-CoT: problem + solution with reasoning."""
     import re
+
     question = example.get("problem", "")
     solution = example.get("solution", "")
 
@@ -295,7 +296,12 @@ def format_nemotron_tool_calling(example: dict) -> tuple[str, str, str]:
         content = m.get("content", "") or ""
         if role == "user" and not question:
             question = content
-        elif role == "assistant" and question and not assistant_content and not tool_calls:
+        elif (
+            role == "assistant"
+            and question
+            and not assistant_content
+            and not tool_calls
+        ):
             assistant_content = content
             tcs = m.get("tool_calls") or []
             if isinstance(tcs, list):
@@ -419,7 +425,8 @@ class SFTStream(IterableDataset):
                 try:
                     ds = load_dataset(ds_cfg["hf_id"], **load_kwargs)
                     return ds.shuffle(
-                        buffer_size=2_000, seed=seed + seed_offset,
+                        buffer_size=2_000,
+                        seed=seed + seed_offset,
                     )
                 except Exception as exc:
                     last_exc = exc
@@ -464,13 +471,10 @@ class SFTStream(IterableDataset):
             if total == 0:
                 return rng.choices(range(len(streams)), weights=weights, k=1)[0]
             deficits = [
-                weights[i] - tokens_seen[i] / total
-                for i in range(len(streams))
+                weights[i] - tokens_seen[i] / total for i in range(len(streams))
             ]
             max_def = max(deficits)
-            candidates = [
-                i for i, d in enumerate(deficits) if d >= max_def - 1e-6
-            ]
+            candidates = [i for i, d in enumerate(deficits) if d >= max_def - 1e-6]
             return rng.choice(candidates)
 
         # Packing buffer: accumulate multiple examples per sequence
@@ -500,7 +504,8 @@ class SFTStream(IterableDataset):
                 # repeats.
                 try:
                     ds = _open_stream(
-                        idx, seed_offset=rng.randint(1, 10000),
+                        idx,
+                        seed_offset=rng.randint(1, 10000),
                     )
                     streams[idx] = iter(ds)
                     example = next(streams[idx])
@@ -534,7 +539,8 @@ class SFTStream(IterableDataset):
                     time.sleep(2 * attempt)
                     try:
                         ds = _open_stream(
-                            idx, seed_offset=rng.randint(1, 100_000),
+                            idx,
+                            seed_offset=rng.randint(1, 100_000),
                         )
                         streams[idx] = iter(ds)
                         example = next(streams[idx])
@@ -638,7 +644,10 @@ def make_sft_loader(
         DataLoader yielding (input_ids, labels) batches.
     """
     ds = SFTStream(
-        dataset_configs, seq_len, tokenizer, seed,
+        dataset_configs,
+        seq_len,
+        tokenizer,
+        seed,
         user_tag=user_tag,
         assistant_tag=assistant_tag,
         think_open=think_open,

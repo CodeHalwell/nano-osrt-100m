@@ -14,10 +14,10 @@ Use:
   from nano_osrt.system_prompts import SYSTEM_PROMPTS, sample_system_prompt
   sys = sample_system_prompt(rng)  # uniform random
 """
+
 from __future__ import annotations
 
 import random
-
 
 # ── The pool ──
 # Each entry is a (name, prompt_text) tuple. Name is for logging.

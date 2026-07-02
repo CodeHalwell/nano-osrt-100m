@@ -20,7 +20,6 @@ import math
 
 import pytest
 import torch
-
 from nano_osrt.rewards import compute_reward, extract_numeric_answer
 from nano_osrt.v4_config import NanoOSRTv4Config
 from nano_osrt.v4_model import (
@@ -151,7 +150,9 @@ def test_importance_loss_minimum_at_uniform():
     # Fake logits aren't used for importance loss computation here
     moe._compute_losses(torch.zeros_like(conc), conc)
     # Should be >> 1.0: ~ N * (0.9^2 + 10 * other^2)
-    expected = cfg.num_routed_experts * (0.9 ** 2 + (cfg.num_routed_experts - 1) * other ** 2)
+    expected = cfg.num_routed_experts * (
+        0.9**2 + (cfg.num_routed_experts - 1) * other**2
+    )
     assert abs(moe.importance_loss.item() - expected) < 1e-4
     # With only 3 experts the theoretical max is ~2.445 (N=3,
     # 0.9 on one expert). We just need "clearly above uniform (1.0)".
@@ -423,10 +424,19 @@ class TestCapacityCappedAssignment:
         cap = math.ceil(1.25 * N * 2 / 3)
 
         ref_a, ref_w, ref_sf, ref_rs = _reference_assign_with_caps(
-            moe, cand_i, cand_s, N, cap, torch.device("cpu"),
+            moe,
+            cand_i,
+            cand_s,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         vec_a, vec_w, vec_sf, vec_rs = moe._assign_with_caps(
-            cand_i, cand_s, N, cap, torch.device("cpu"),
+            cand_i,
+            cand_s,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         assert torch.equal(vec_a, ref_a), "assigned indices differ from oracle"
         assert torch.allclose(vec_w, ref_w, atol=1e-6), "weights differ"
@@ -440,10 +450,19 @@ class TestCapacityCappedAssignment:
         cap = math.ceil(1.25 * N * 2 / 3)
 
         ref_a, ref_w, ref_sf, ref_rs = _reference_assign_with_caps(
-            moe, cand_i, cand_s, N, cap, torch.device("cpu"),
+            moe,
+            cand_i,
+            cand_s,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         vec_a, vec_w, vec_sf, vec_rs = moe._assign_with_caps(
-            cand_i, cand_s, N, cap, torch.device("cpu"),
+            cand_i,
+            cand_s,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         assert torch.equal(vec_a, ref_a)
         assert torch.allclose(vec_w, ref_w, atol=1e-6)
@@ -470,7 +489,9 @@ class TestCapacityCappedAssignment:
         N = 4096
         cand_i, cand_s = self._concentrated_candidates(N, 11, 11)
         cap = math.ceil(1.25 * N * 2 / 11)
-        assigned, _, _, _ = moe._assign_with_caps(cand_i, cand_s, N, cap, torch.device("cpu"))
+        assigned, _, _, _ = moe._assign_with_caps(
+            cand_i, cand_s, N, cap, torch.device("cpu")
+        )
         valid = assigned[assigned >= 0]
         counts = torch.bincount(valid, minlength=11)
         assert counts.max().item() <= cap, f"expert got {counts.max()} > cap {cap}"
@@ -480,9 +501,11 @@ class TestCapacityCappedAssignment:
         N = 2048
         cand_i, cand_s = self._random_candidates(N, 11, 11)
         cap = math.ceil(1.25 * N * 2 / 11)
-        assigned, _, sf, _ = moe._assign_with_caps(cand_i, cand_s, N, cap, torch.device("cpu"))
+        assigned, _, sf, _ = moe._assign_with_caps(
+            cand_i, cand_s, N, cap, torch.device("cpu")
+        )
         for i in range(N):
-            filled = assigned[i, :sf[i]]
+            filled = assigned[i, : sf[i]]
             assert filled.unique().shape[0] == sf[i], (
                 f"token {i} has duplicate expert: {filled.tolist()}"
             )
@@ -495,7 +518,11 @@ class TestCapacityCappedAssignment:
         cand_i, cand_s = self._concentrated_candidates(N, 3, 3)
         cap = math.ceil(0.5 * N * 2 / 3)
         assigned, assigned_w, sf, _ = moe._assign_with_caps(
-            cand_i, cand_s, N, cap, torch.device("cpu"),
+            cand_i,
+            cand_s,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         unfilled_mask = assigned == -1
         assert (assigned_w[unfilled_mask] == 0).all()
@@ -510,7 +537,11 @@ class TestCapacityCappedAssignment:
         cand_i, _ = self._random_candidates(N, 3, 3)
         cap = math.ceil(1.25 * N * 2 / 3)
         assigned, assigned_w, sf, _ = moe._assign_with_caps(
-            cand_i, None, N, cap, torch.device("cpu"),
+            cand_i,
+            None,
+            N,
+            cap,
+            torch.device("cpu"),
         )
         assert (assigned_w == 0).all()
         assert (sf == 2).all()
@@ -661,12 +692,19 @@ def test_loop_embedding_init_std_survives_post_init():
         actual_std = w.std().item()
         # With small tensors (recursive_loops × dim = 3 × 128 = 384 values)
         # the empirical std has some sampling error, so allow 30% tolerance.
-        assert 0.7 * cfg.loop_embedding_init_std < actual_std < 1.3 * cfg.loop_embedding_init_std, (
+        assert (
+            0.7 * cfg.loop_embedding_init_std
+            < actual_std
+            < 1.3 * cfg.loop_embedding_init_std
+        ), (
             f"Expected loop_embeddings std ~ {cfg.loop_embedding_init_std}, "
             f"got {actual_std:.4f}. HF post_init probably stomped the custom init."
         )
         # Verify the tag is present so the custom init path is taken
-        assert getattr(blk.moe.loop_embeddings, "_osrt_init_std", None) == cfg.loop_embedding_init_std
+        assert (
+            getattr(blk.moe.loop_embeddings, "_osrt_init_std", None)
+            == cfg.loop_embedding_init_std
+        )
 
 
 def test_token_embedding_still_uses_default_std():
@@ -706,7 +744,9 @@ def test_rope_ntk_scaling_changes_frequencies():
     """NTK scaling with factor=4 should produce different cos/sin than no scaling."""
     cos_base, _ = compute_rope_freqs(seq_len=16, dim=32, theta=10000.0)
     cos_scaled, _ = compute_rope_freqs(
-        seq_len=16, dim=32, theta=10000.0,
+        seq_len=16,
+        dim=32,
+        theta=10000.0,
         scaling={"type": "ntk", "factor": 4.0},
     )
     # The frequencies should differ at most positions except t=0
@@ -772,9 +812,7 @@ def test_compute_reward_v4_native_tags_scores_correct_answer():
 
 
 def test_compute_reward_wrong_answer_scores_zero_correctness():
-    completion = (
-        "<|think|>2+2=5<|/think|><|answer|>5<|/answer|>"
-    )
+    completion = "<|think|>2+2=5<|/think|><|answer|>5<|/answer|>"
     reward, breakdown = compute_reward(
         completion,
         "#### 4",
@@ -855,9 +893,7 @@ class TestKVCache:
             assert k.shape == (1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim)
             assert v.shape == (1, tiny_v4_config.heads, 8, tiny_v4_config.head_dim)
 
-    def test_incremental_matches_full(
-        self, tiny_v4_config: NanoOSRTv4Config
-    ) -> None:
+    def test_incremental_matches_full(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
 
@@ -879,17 +915,19 @@ class TestKVCache:
         step2_out = model(step2_ids, past_key_values=cache, use_cache=True)
 
         torch.testing.assert_close(
-            full_logits[:, 5, :], step2_out.logits[:, 0, :],
-            atol=5e-4, rtol=5e-4,
+            full_logits[:, 5, :],
+            step2_out.logits[:, 0, :],
+            atol=5e-4,
+            rtol=5e-4,
         )
         torch.testing.assert_close(
-            full_logits[:, 4, :], step1_out.logits[:, 0, :],
-            atol=5e-4, rtol=5e-4,
+            full_logits[:, 4, :],
+            step1_out.logits[:, 0, :],
+            atol=5e-4,
+            rtol=5e-4,
         )
 
-    def test_cache_grows_correctly(
-        self, tiny_v4_config: NanoOSRTv4Config
-    ) -> None:
+    def test_cache_grows_correctly(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
@@ -911,14 +949,18 @@ class TestGenerate:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        out = model.generate(input_ids, max_new_tokens=5, temperature=1.0, use_cache=True)
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=True
+        )
         assert out.shape == (1, 9)
 
     def test_generate_without_cache(self, tiny_v4_config: NanoOSRTv4Config) -> None:
         model = NanoOSRTv4ForCausalLM(tiny_v4_config)
         model.eval()
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
-        out = model.generate(input_ids, max_new_tokens=5, temperature=1.0, use_cache=False)
+        out = model.generate(
+            input_ids, max_new_tokens=5, temperature=1.0, use_cache=False
+        )
         assert out.shape == (1, 9)
 
     def test_generate_greedy_deterministic(
@@ -929,9 +971,15 @@ class TestGenerate:
         input_ids = torch.randint(0, tiny_v4_config.vocab_size, (1, 4))
 
         out_cached = model.generate(
-            input_ids.clone(), max_new_tokens=8, temperature=0.0, use_cache=True,
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=True,
         )
         out_nocache = model.generate(
-            input_ids.clone(), max_new_tokens=8, temperature=0.0, use_cache=False,
+            input_ids.clone(),
+            max_new_tokens=8,
+            temperature=0.0,
+            use_cache=False,
         )
         assert torch.equal(out_cached, out_nocache)

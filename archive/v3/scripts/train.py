@@ -11,8 +11,9 @@ Or, if the package is installed::
 
 import argparse
 
-from nano_osrt.config import ModelConfig, TrainConfig
 from nano_osrt.train import train
+
+from nano_osrt.config import ModelConfig, TrainConfig
 
 
 def parse_args() -> TrainConfig:

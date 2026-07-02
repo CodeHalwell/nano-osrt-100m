@@ -18,11 +18,11 @@ Schema matches what RolloutDataset expects:
 Format applied during SFT training:
     <|system|>{system}<|user|>{prompt}<|assistant|>{response}
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
@@ -97,27 +97,38 @@ SOURCES = {
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--out", default="rollouts/system_prompt_sft.jsonl",
+        "--out",
+        default="rollouts/system_prompt_sft.jsonl",
         help="Output JSONL path",
     )
     parser.add_argument(
-        "--max-per-source", type=int, default=5000,
+        "--max-per-source",
+        type=int,
+        default=5000,
         help="Cap per source (UltraChat will likely hit the limit much later)",
     )
     parser.add_argument(
-        "--sources", nargs="+", default=list(SOURCES.keys()),
+        "--sources",
+        nargs="+",
+        default=list(SOURCES.keys()),
         choices=list(SOURCES.keys()),
     )
     parser.add_argument(
-        "--min-user-len", type=int, default=10,
+        "--min-user-len",
+        type=int,
+        default=10,
         help="Skip rows with user text shorter than N chars",
     )
     parser.add_argument(
-        "--min-assistant-len", type=int, default=20,
+        "--min-assistant-len",
+        type=int,
+        default=20,
         help="Skip rows with assistant text shorter than N chars",
     )
     parser.add_argument(
-        "--max-assistant-len", type=int, default=4000,
+        "--max-assistant-len",
+        type=int,
+        default=4000,
         help="Skip rows with assistant text longer than N chars",
     )
     args = parser.parse_args()
@@ -154,10 +165,7 @@ def main():
                 if len(u) < args.min_user_len:
                     skipped[source] += 1
                     continue
-                if (
-                    len(a) < args.min_assistant_len
-                    or len(a) > args.max_assistant_len
-                ):
+                if len(a) < args.min_assistant_len or len(a) > args.max_assistant_len:
                     skipped[source] += 1
                     continue
 

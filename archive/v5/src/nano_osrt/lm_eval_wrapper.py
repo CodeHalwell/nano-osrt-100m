@@ -165,9 +165,7 @@ class NanoOSRTLMEval(LM):
         self._chat_format_generate = chat_format_generate
         self._chat_format_loglikelihood = chat_format_loglikelihood
         self._system_prompt = (
-            system_prompt
-            if system_prompt is not None
-            else self.DEFAULT_SYSTEM_PROMPT
+            system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         )
         self._default_temperature = float(default_temperature)
         self._max_temperature = float(max_temperature)
@@ -204,24 +202,28 @@ class NanoOSRTLMEval(LM):
         # in correctly during load_state_dict.
         if hra_enabled:
             from nano_osrt.hra import inject_hra
+
             print(f"[lm_eval] Injecting HRA (rank={hra_rank})", flush=True)
             inject_hra(model, rank=hra_rank)
 
         print(f"[lm_eval] Loading weights from {ckpt_path}", flush=True)
         ckpt = torch.load(
-            ckpt_path, map_location=self._device, weights_only=True,
+            ckpt_path,
+            map_location=self._device,
+            weights_only=True,
         )
         state_dict = ckpt.get("model_state_dict", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             print(
-                f"[lm_eval] WARNING: missing keys ({len(missing)}): "
-                f"{missing[:3]}", flush=True,
+                f"[lm_eval] WARNING: missing keys ({len(missing)}): {missing[:3]}",
+                flush=True,
             )
         if unexpected:
             print(
                 f"[lm_eval] WARNING: unexpected keys ({len(unexpected)}): "
-                f"{unexpected[:3]}", flush=True,
+                f"{unexpected[:3]}",
+                flush=True,
             )
 
         model.train(False)  # disables MoE capacity drops, enables KV-cache path
@@ -282,7 +284,8 @@ class NanoOSRTLMEval(LM):
             docstring)
         """
         gate = (
-            self._chat_format_generate if for_generate
+            self._chat_format_generate
+            if for_generate
             else self._chat_format_loglikelihood
         )
         if not gate:
@@ -347,6 +350,7 @@ class NanoOSRTLMEval(LM):
         # "1,234", "-2.5", "$18", "18 dollars" with leading/trailing
         # whitespace.
         import re
+
         if re.fullmatch(r"\$?-?[0-9][0-9.,]*\s*(?:dollars?|usd)?", ans, re.IGNORECASE):
             return f"{ans}\n#### {ans}"
         return ans
@@ -355,7 +359,8 @@ class NanoOSRTLMEval(LM):
 
     @torch.no_grad()
     def loglikelihood(
-        self, requests: list[Instance],
+        self,
+        requests: list[Instance],
     ) -> list[tuple[float, bool]]:
         """Score continuations given context.
 
@@ -407,12 +412,16 @@ class NanoOSRTLMEval(LM):
             batch = items[batch_start : batch_start + self._batch_size]
             max_len = max(len(it[3]) for it in batch)
             input_ids = torch.full(
-                (len(batch), max_len), pad_id,
-                dtype=torch.long, device=self._device,
+                (len(batch), max_len),
+                pad_id,
+                dtype=torch.long,
+                device=self._device,
             )
             for i, (_, _, _, full) in enumerate(batch):
                 input_ids[i, : len(full)] = torch.tensor(
-                    full, dtype=torch.long, device=self._device,
+                    full,
+                    dtype=torch.long,
+                    device=self._device,
                 )
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -432,17 +441,16 @@ class NanoOSRTLMEval(LM):
                     out[orig_idx] = (0.0, True)
                     continue
                 # Logits predicting continuation tokens.
-                cont_logits = logits[
-                    i, ctx_len - 1 : ctx_len - 1 + cont_len, :
-                ]
-                cont_log_probs = log_probs[
-                    i, ctx_len - 1 : ctx_len - 1 + cont_len, :
-                ]
+                cont_logits = logits[i, ctx_len - 1 : ctx_len - 1 + cont_len, :]
+                cont_log_probs = log_probs[i, ctx_len - 1 : ctx_len - 1 + cont_len, :]
                 cont_target = torch.tensor(
-                    cont_ids, dtype=torch.long, device=self._device,
+                    cont_ids,
+                    dtype=torch.long,
+                    device=self._device,
                 )
                 token_log_probs = cont_log_probs.gather(
-                    1, cont_target.unsqueeze(1),
+                    1,
+                    cont_target.unsqueeze(1),
                 ).squeeze(1)
                 argmax = cont_logits.argmax(dim=-1)
                 is_greedy = bool((argmax == cont_target).all().item())
@@ -457,7 +465,8 @@ class NanoOSRTLMEval(LM):
         return results
 
     def loglikelihood_rolling(
-        self, requests: list[Instance],
+        self,
+        requests: list[Instance],
     ) -> list[float]:
         """Not used by gsm8k / IFEval / MMLU. Implement if a benchmark
         we care about (e.g. WikiText perplexity) needs it."""
@@ -519,7 +528,9 @@ class NanoOSRTLMEval(LM):
             if len(ctx_ids) > keep:
                 ctx_ids = ctx_ids[-keep:]
             ctx_tensor = torch.tensor(
-                [ctx_ids], dtype=torch.long, device=self._device,
+                [ctx_ids],
+                dtype=torch.long,
+                device=self._device,
             )
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -533,7 +544,7 @@ class NanoOSRTLMEval(LM):
                     eos_token_id=self.eot_token_id,
                 )
 
-            gen_ids = out_ids[0, len(ctx_ids):].tolist()
+            gen_ids = out_ids[0, len(ctx_ids) :].tolist()
             text = self.tok_decode(gen_ids)
 
             # Truncate at first occurrence of any stop string. The

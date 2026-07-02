@@ -16,27 +16,40 @@ Usage:
 """
 
 import argparse
-import sys
 
 import torch
+from src.nano_osrt.hf_model import NanoOSRTForCausalLM
 from transformers import AutoTokenizer
-
-from src.nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
 
 
 def main():
     parser = argparse.ArgumentParser(description="NanoOSRT 100M Inference")
-    parser.add_argument("--checkpoint", type=str, help="Path to training checkpoint (.pt)")
+    parser.add_argument(
+        "--checkpoint", type=str, help="Path to training checkpoint (.pt)"
+    )
     parser.add_argument("--model", type=str, help="Path to HF-format model directory")
     parser.add_argument("--prompt", type=str, help="Single prompt to generate from")
-    parser.add_argument("--interactive", action="store_true", help="Interactive chat mode")
-    parser.add_argument("--export", type=str, help="Export checkpoint to HF format at this path")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Max new tokens to generate")
+    parser.add_argument(
+        "--interactive", action="store_true", help="Interactive chat mode"
+    )
+    parser.add_argument(
+        "--export", type=str, help="Export checkpoint to HF format at this path"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=512, help="Max new tokens to generate"
+    )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--repetition-penalty", type=float, default=1.2, help="Repetition penalty (1.0=none, 1.2=default)")
-    parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, cuda, mps")
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.2,
+        help="Repetition penalty (1.0=none, 1.2=default)",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto", help="Device: auto, cpu, cuda, mps"
+    )
     args = parser.parse_args()
 
     if not args.checkpoint and not args.model:
@@ -101,7 +114,7 @@ def main():
         )
 
         # Decode only the new tokens
-        new_tokens = output_ids[0, input_ids.shape[1]:]
+        new_tokens = output_ids[0, input_ids.shape[1] :]
         return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     # Single prompt mode

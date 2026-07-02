@@ -13,14 +13,14 @@ Usage:
 """
 
 import argparse
+
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from lm_eval import evaluator
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval import evaluator
-
-from src.nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
+from src.nano_osrt.hf_model import NanoOSRTForCausalLM
+from transformers import AutoTokenizer
 
 
 @register_model("nano-osrt")
@@ -105,9 +105,11 @@ class NanoOSRTHarnessModel(LM):
     def _model_call(self, inps: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             out = self.model(inps.to(self._device))
-            return out["logits"][:, :, :self.vocab_size]
+            return out["logits"][:, :, : self.vocab_size]
 
-    def _model_generate(self, context: torch.Tensor, max_length: int, stop=None, **kwargs) -> torch.Tensor:
+    def _model_generate(
+        self, context: torch.Tensor, max_length: int, stop=None, **kwargs
+    ) -> torch.Tensor:
         max_new = max_length - context.shape[1]
         with torch.no_grad():
             return self.model.generate(
@@ -131,19 +133,23 @@ class NanoOSRTHarnessModel(LM):
             # device!" because logits are on MPS but shift_labels would be
             # on CPU.
             full_ids = torch.tensor(
-                [ctx_ids + cont_ids], dtype=torch.long, device=self._device,
+                [ctx_ids + cont_ids],
+                dtype=torch.long,
+                device=self._device,
             )
 
             # Truncate to max_length
             if full_ids.shape[1] > self.max_length:
-                full_ids = full_ids[:, -self.max_length:]
-                ctx_len = max(0, len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length))
+                full_ids = full_ids[:, -self.max_length :]
+                ctx_len = max(
+                    0, len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length)
+                )
             else:
                 ctx_len = len(ctx_ids)
 
             logits = self._model_call(full_ids)
             # Shift: logits[t] predicts token[t+1]
-            shift_logits = logits[0, ctx_len - 1:-1, :]
+            shift_logits = logits[0, ctx_len - 1 : -1, :]
             shift_labels = full_ids[0, ctx_len:]
 
             log_probs = F.log_softmax(shift_logits.float(), dim=-1)
@@ -160,11 +166,13 @@ class NanoOSRTHarnessModel(LM):
         for (string,) in [req.args for req in requests]:
             ids = self.tok_encode(string)
             full_ids = torch.tensor(
-                [ids], dtype=torch.long, device=self._device,
+                [ids],
+                dtype=torch.long,
+                device=self._device,
             )
 
             if full_ids.shape[1] > self.max_length:
-                full_ids = full_ids[:, -self.max_length:]
+                full_ids = full_ids[:, -self.max_length :]
 
             logits = self._model_call(full_ids)
             shift_logits = logits[0, :-1, :]
@@ -188,7 +196,7 @@ class NanoOSRTHarnessModel(LM):
             ctx_tensor = torch.tensor([ctx_ids], dtype=torch.long)
 
             if ctx_tensor.shape[1] > self.max_length - max_gen:
-                ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen):]
+                ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen) :]
 
             output = self.model.generate(
                 ctx_tensor.to(self._device),
@@ -200,13 +208,13 @@ class NanoOSRTHarnessModel(LM):
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
-            new_tokens = output[0, ctx_tensor.shape[1]:]
+            new_tokens = output[0, ctx_tensor.shape[1] :]
             response = self.tok_decode(new_tokens.tolist())
 
             # Apply stop sequences
             for stop_seq in until:
                 if stop_seq in response:
-                    response = response[:response.index(stop_seq)]
+                    response = response[: response.index(stop_seq)]
 
             results.append(response)
         return results
@@ -215,16 +223,37 @@ class NanoOSRTHarnessModel(LM):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate NanoOSRT on benchmarks")
     parser.add_argument("--model", type=str, default="./nano-osrt-model")
-    parser.add_argument("--tasks", type=str, default="ifeval", help="Comma-separated task list")
+    parser.add_argument(
+        "--tasks", type=str, default="ifeval", help="Comma-separated task list"
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output", type=str, default="./eval_results")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of examples (for quick testing)")
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
-    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling threshold (1.0 = disabled)")
-    parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling (0 = disabled)")
     parser.add_argument(
-        "--repetition-penalty", type=float, default=1.0,
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of examples (for quick testing)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature (0.0 = greedy)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling threshold (1.0 = disabled)",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=0, help="Top-k sampling (0 = disabled)"
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
         help="Repetition penalty (1.0 = disabled; v3's original eval used 1.2 by accident)",
     )
     args = parser.parse_args()

@@ -25,7 +25,11 @@ from nano_osrt.train import apply_router_balance_updates, load_model_state_or_ra
 
 
 def get_sft_lr(
-    step: int, total_steps: int, warmup: int, peak: float, minimum: float,
+    step: int,
+    total_steps: int,
+    warmup: int,
+    peak: float,
+    minimum: float,
 ) -> float:
     """Cosine LR with linear warmup."""
     if step < warmup:
@@ -64,9 +68,14 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     hra_params = []
     if sft_cfg.hra_enabled and getattr(sft_cfg, "hra_before_load", False):
         from nano_osrt.hra import inject_hra
+
         print(f"Injecting HRA before load (rank={sft_cfg.hra_rank})...")
-        hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
-                                freeze_pretrained=sft_cfg.hra_freeze_pretrained)
+        hra_params = inject_hra(
+            model,
+            rank=sft_cfg.hra_rank,
+            scale=sft_cfg.hra_scale,
+            freeze_pretrained=sft_cfg.hra_freeze_pretrained,
+        )
 
     # Load pretrained weights — SFT MUST start from a real pretrained
     # checkpoint. Running SFT on a randomly-initialised model would waste
@@ -82,15 +91,22 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
     load_model_state_or_raise(
-        model, state_dict, context=f"SFT pretrained load from {ckpt_path}",
+        model,
+        state_dict,
+        context=f"SFT pretrained load from {ckpt_path}",
     )
     print("  Clean load: all keys matched.")
 
     if sft_cfg.hra_enabled and not getattr(sft_cfg, "hra_before_load", False):
         from nano_osrt.hra import inject_hra
+
         print(f"Injecting HRA after load (rank={sft_cfg.hra_rank})...")
-        hra_params = inject_hra(model, rank=sft_cfg.hra_rank, scale=sft_cfg.hra_scale,
-                                freeze_pretrained=sft_cfg.hra_freeze_pretrained)
+        hra_params = inject_hra(
+            model,
+            rank=sft_cfg.hra_rank,
+            scale=sft_cfg.hra_scale,
+            freeze_pretrained=sft_cfg.hra_freeze_pretrained,
+        )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters    : {total_params:>12,}")
@@ -126,19 +142,26 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # ------------------------------------------------------------------
     if sft_cfg.hra_enabled and hra_params:
         from nano_osrt.hra import get_param_groups
-        param_groups = get_param_groups(model, hra_params,
-                                        base_lr=sft_cfg.peak_lr,
-                                        hra_lr=sft_cfg.hra_lr,
-                                        weight_decay=sft_cfg.weight_decay)
+
+        param_groups = get_param_groups(
+            model,
+            hra_params,
+            base_lr=sft_cfg.peak_lr,
+            hra_lr=sft_cfg.hra_lr,
+            weight_decay=sft_cfg.weight_decay,
+        )
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
         print(
-            f"AdamW with differential LR (base={sft_cfg.peak_lr}, "
-            f"hra={sft_cfg.hra_lr})"
+            f"AdamW with differential LR (base={sft_cfg.peak_lr}, hra={sft_cfg.hra_lr})"
         )
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=sft_cfg.peak_lr,
-                                       weight_decay=sft_cfg.weight_decay,
-                                       betas=(0.9, 0.95), eps=1e-8)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=sft_cfg.peak_lr,
+            weight_decay=sft_cfg.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
 
     # ------------------------------------------------------------------
     # Resume.
@@ -211,8 +234,13 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     step = start_step
 
     while step < sft_cfg.total_steps:
-        lr = get_sft_lr(step, sft_cfg.total_steps, sft_cfg.warmup_steps,
-                         sft_cfg.peak_lr, sft_cfg.min_lr)
+        lr = get_sft_lr(
+            step,
+            sft_cfg.total_steps,
+            sft_cfg.warmup_steps,
+            sft_cfg.peak_lr,
+            sft_cfg.min_lr,
+        )
         for pg in optimizer.param_groups:
             if sft_cfg.hra_enabled and pg.get("group_name") == "hra":
                 pg["lr"] = lr * (sft_cfg.hra_lr / sft_cfg.peak_lr)
@@ -270,8 +298,7 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
             torch.cuda.reset_peak_memory_stats()
             total_positions = eff_batch * sft_cfg.seq_len
             tok_util = (
-                accum_trained_tokens / total_positions
-                if total_positions > 0 else 0
+                accum_trained_tokens / total_positions if total_positions > 0 else 0
             )
 
             print(
@@ -341,12 +368,15 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
         if step > 0 and step % sft_cfg.ckpt_interval == 0:
             path = f"{ckpt_dir}/osrt_v5_{prefix}_step_{step}.pt"
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({
-                "step": step,
-                "model_state_dict": inner.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "training_stage": prefix,
-            }, path)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "training_stage": prefix,
+                },
+                path,
+            )
             vol.commit()
             print(f"  -> Checkpoint saved: {path}")
 
@@ -356,20 +386,20 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
         # scanner either misses rescue files entirely or can't break
         # ties against same-step interval saves.
         if time.time() - start_time > 82_800:
-            rescue_path = (
-                f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
-            )
+            rescue_path = f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
             inner = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({
-                "step": step,
-                "model_state_dict": inner.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "training_stage": prefix,
-            }, rescue_path)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": inner.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "training_stage": prefix,
+                },
+                rescue_path,
+            )
             vol.commit()
             print(
-                f"\n23h boundary. Rescue checkpoint at step {step}: "
-                f"{rescue_path}",
+                f"\n23h boundary. Rescue checkpoint at step {step}: {rescue_path}",
             )
             if use_wandb:
                 wandb.finish()
@@ -380,11 +410,14 @@ def run_sft(model_config: NanoOSRTConfig, sft_cfg, vol, tokenizer) -> None:
     # --- Final ---
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     final_path = f"{ckpt_dir}/osrt_v5_{prefix}_final.pt"
-    torch.save({
-        "model_state_dict": inner.state_dict(),
-        "training_stage": prefix,
-        "total_steps": sft_cfg.total_steps,
-    }, final_path)
+    torch.save(
+        {
+            "model_state_dict": inner.state_dict(),
+            "training_stage": prefix,
+            "total_steps": sft_cfg.total_steps,
+        },
+        final_path,
+    )
     vol.commit()
     elapsed_total = time.time() - start_time
     print(f"\n{prefix.upper()} complete. {step:,} steps in {elapsed_total / 3600:.1f}h")

@@ -9,10 +9,9 @@ give each virtual layer its own geometric identity.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-
 from nano_osrt.modal_config import ModalConfig
 from nano_osrt.rope import apply_rope, compute_rope_freqs
+from torch import Tensor
 
 
 class SwiGLU(nn.Module):

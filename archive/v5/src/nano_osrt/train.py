@@ -55,7 +55,9 @@ def get_lr(step: int, cfg: PretrainConfig) -> float:
 
 
 def _set_param_group_lrs(
-    optimizer, step: int, cfg: PretrainConfig,
+    optimizer,
+    step: int,
+    cfg: PretrainConfig,
 ) -> float:
     """Apply the cosine schedule to every param group, respecting the
     per-group `_peak_lr` / `_min_lr` tags written at construction.
@@ -83,7 +85,8 @@ def _set_param_group_lrs(
         return cfg.peak_lr * ratio
 
     progress = (eff_step - cfg.warmup_steps) / max(
-        eff_total - cfg.warmup_steps, 1,
+        eff_total - cfg.warmup_steps,
+        1,
     )
     cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
     for pg in optimizer.param_groups:
@@ -274,6 +277,7 @@ def run_eval(
         # "Fatal Python error: PyGILState_Release" in one of the workers
         # — a leak per eval call. Force order + GC so workers exit cleanly.
         import gc
+
         del data_iter
         del loader
         gc.collect()
@@ -549,13 +553,16 @@ def _average_moe_snapshots(
         "bias_ema_max": avg.get("moe/bias_ema_max_mean", 0.0),
         "bias_ema_min": avg.get("moe/bias_ema_min_mean", 0.0),
         "prebias_per_token_H": avg.get(
-            "moe/prebias_per_token_entropy_mean", 0.0,
+            "moe/prebias_per_token_entropy_mean",
+            0.0,
         ),
         "prebias_marginal_H": avg.get(
-            "moe/prebias_marginal_entropy_mean", 0.0,
+            "moe/prebias_marginal_entropy_mean",
+            0.0,
         ),
         "prebias_assign_H": avg.get(
-            "moe/prebias_assignment_entropy_mean", 0.0,
+            "moe/prebias_assignment_entropy_mean",
+            0.0,
         ),
         "prebias_raw_max": avg.get("moe/prebias_raw_max_prob_mean", 0.0),
         "prebias_top_margin": avg.get("moe/prebias_top_margin_mean", 0.0),
@@ -566,7 +573,10 @@ def _average_moe_snapshots(
 
 
 def _check_early_stop_criteria(
-    step: int, summary: dict, cfg: PretrainConfig, model_cfg: NanoOSRTConfig,
+    step: int,
+    summary: dict,
+    cfg: PretrainConfig,
+    model_cfg: NanoOSRTConfig,
 ) -> list[str]:
     """Return list of failing criteria (empty means all pass)."""
     failures: list[str] = []
@@ -599,7 +609,9 @@ def _check_early_stop_criteria(
         )
     prebias_marginal_h = summary.get("prebias_marginal_H", marginal_h)
     min_prebias_marginal = getattr(
-        cfg, "min_prebias_marginal_entropy", cfg.min_marginal_entropy,
+        cfg,
+        "min_prebias_marginal_entropy",
+        cfg.min_marginal_entropy,
     )
     if prebias_marginal_h < min_prebias_marginal:
         failures.append(
@@ -615,9 +627,8 @@ def _check_early_stop_criteria(
             f"{min_prebias_expert:.4f} "
             "(one or more experts are dead before balance bias)"
         )
-    bias_limit = (
-        model_cfg.router_balance_bias_max
-        * getattr(cfg, "max_bias_saturation_fraction", 1.0)
+    bias_limit = model_cfg.router_balance_bias_max * getattr(
+        cfg, "max_bias_saturation_fraction", 1.0
     )
     if model_cfg.router_balance_bias_enabled and bias_limit > 0:
         bias_abs_max = summary.get("bias_abs_max", 0.0)
@@ -713,18 +724,14 @@ def run_training(
                 "shared_expert_hidden": model_config.shared_expert_hidden,
                 "capacity_factor": model_config.router_capacity_factor,
                 "aux_loss_coeff": model_config.router_aux_loss_coeff,
-                "balance_bias_enabled": (
-                    model_config.router_balance_bias_enabled
-                ),
+                "balance_bias_enabled": (model_config.router_balance_bias_enabled),
                 "balance_bias_update_rate": (
                     model_config.router_balance_bias_update_rate
                 ),
                 "balance_bias_max": model_config.router_balance_bias_max,
                 "router_gumbel_tau_init": train_cfg.router_gumbel_tau_init,
                 "router_gumbel_tau_final": train_cfg.router_gumbel_tau_final,
-                "router_gumbel_anneal_steps": (
-                    train_cfg.router_gumbel_anneal_steps
-                ),
+                "router_gumbel_anneal_steps": (train_cfg.router_gumbel_anneal_steps),
                 "peak_lr": train_cfg.peak_lr,
                 "optimizer": train_cfg.optimizer_name,
                 "total_steps": train_cfg.total_steps,
@@ -807,6 +814,7 @@ def run_training(
 
         if train_cfg.optimizer_name.lower() == "lion":
             from lion_pytorch import Lion
+
             optimizer = Lion(
                 [
                     {"params": other_params, "weight_decay": train_cfg.weight_decay},
@@ -901,10 +909,12 @@ def run_training(
             current_phase = phase_name
             current_seq_len = phase_cfg["seq_len"]
             grad_accum = phase_cfg.get(
-                "grad_accum_steps", train_cfg.grad_accum_steps,
+                "grad_accum_steps",
+                train_cfg.grad_accum_steps,
             )
             current_batch_size = phase_cfg.get(
-                "batch_size", train_cfg.batch_size,
+                "batch_size",
+                train_cfg.batch_size,
             )
 
             print(
@@ -912,9 +922,7 @@ def run_training(
                 f"batch: {current_batch_size} | accum: {grad_accum} | "
                 f"Step: {step}"
             )
-            print(
-                f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}"
-            )
+            print(f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}")
 
             if current_loader is not None:
                 # Tear down the previous phase's loader BEFORE building the
@@ -932,6 +940,7 @@ def run_training(
                 # refs and force a GC pass so old workers fully exit
                 # before any new ones come up.
                 import gc
+
                 loader_iter = None
                 current_loader = None
                 gc.collect()
@@ -947,10 +956,12 @@ def run_training(
             print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
         else:
             grad_accum = phase_cfg.get(
-                "grad_accum_steps", train_cfg.grad_accum_steps,
+                "grad_accum_steps",
+                train_cfg.grad_accum_steps,
             )
             current_batch_size = phase_cfg.get(
-                "batch_size", train_cfg.batch_size,
+                "batch_size",
+                train_cfg.batch_size,
             )
 
         # Schedule writes per-group LRs honouring _peak_lr / _min_lr
@@ -972,8 +983,10 @@ def run_training(
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
         need_ckpt = current_seq_len >= 8192
-        if (hasattr(base, "gradient_checkpointing")
-                and base.gradient_checkpointing != need_ckpt):
+        if (
+            hasattr(base, "gradient_checkpointing")
+            and base.gradient_checkpointing != need_ckpt
+        ):
             base.gradient_checkpointing = need_ckpt
 
         optimizer.zero_grad(set_to_none=True)
@@ -1020,9 +1033,7 @@ def run_training(
             # Pull separated components from the unwrapped model for clean
             # logging (total loss includes aux; these are the components).
             if inner.last_task_loss is not None:
-                accum_task_loss += (
-                    inner.last_task_loss.detach() / grad_accum
-                )
+                accum_task_loss += inner.last_task_loss.detach() / grad_accum
             if inner.last_balance_loss_normalised is not None:
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
@@ -1054,8 +1065,13 @@ def run_training(
             torch.cuda.reset_peak_memory_stats()
             eff_batch = current_batch_size * grad_accum
             steps_done = max(step - start_step, 1)
-            tok_per_sec = eff_batch * current_seq_len / max(
-                elapsed / steps_done, 1e-8,
+            tok_per_sec = (
+                eff_batch
+                * current_seq_len
+                / max(
+                    elapsed / steps_done,
+                    1e-8,
+                )
             )
 
             # moe_metrics / moe_summary are already computed above as the
@@ -1131,9 +1147,13 @@ def run_training(
         # --- Eval on held-out FineWeb-Edu ---
         if step > 0 and step % train_cfg.eval_interval == 0:
             eval_metrics = run_eval(
-                model, tokenizer_name, current_seq_len,
-                current_batch_size, train_cfg.eval_steps,
-                device, model_config.real_vocab_size,
+                model,
+                tokenizer_name,
+                current_seq_len,
+                current_batch_size,
+                train_cfg.eval_steps,
+                device,
+                model_config.real_vocab_size,
             )
             print(
                 f"  EVAL step {step} | "
@@ -1155,12 +1175,14 @@ def run_training(
             # single-batch snapshot — so the gate isn't tripped by sample
             # noise on a 16k-token micro-batch.
             failures = _check_early_stop_criteria(
-                step, moe_summary, train_cfg, model_config,
+                step,
+                moe_summary,
+                train_cfg,
+                model_config,
             )
             if failures:
                 print(
-                    f"\n>>> EARLY STOP at step {step}: "
-                    f"router-health criteria failed:",
+                    f"\n>>> EARLY STOP at step {step}: router-health criteria failed:",
                     flush=True,
                 )
                 for f in failures:
@@ -1218,8 +1240,7 @@ def run_training(
         vol.commit()
         elapsed_total = time.time() - start_time
         print(
-            f"\nPretrain complete. {step:,} steps in "
-            f"{elapsed_total / 3600:.1f}h",
+            f"\nPretrain complete. {step:,} steps in {elapsed_total / 3600:.1f}h",
             flush=True,
         )
         print(f"Final checkpoint: {final_path}", flush=True)
@@ -1317,6 +1338,7 @@ def run_pretrain_extend(
     # ── HRA injection (BEFORE state_dict load) ─────────────────────
     if extend_cfg.hra_enabled:
         from nano_osrt.hra import inject_hra
+
         print(f"Injecting HRA before load (rank={extend_cfg.hra_rank})...")
         inject_hra(
             model,
@@ -1349,9 +1371,7 @@ def run_pretrain_extend(
     # ── Freeze HRA after load ──────────────────────────────────────
     if extend_cfg.hra_enabled and getattr(extend_cfg, "hra_frozen", False):
         n_frozen_params, n_frozen_tensors = _freeze_hra_params(model)
-        trainable_after = sum(
-            p.numel() for p in model.parameters() if p.requires_grad
-        )
+        trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(
             f"Froze {n_frozen_tensors} HRA tensors "
             f"({n_frozen_params:,} params, "
@@ -1389,8 +1409,7 @@ def run_pretrain_extend(
                 "warmup_steps": extend_cfg.warmup_steps,
                 "total_steps": extend_cfg.total_steps,
                 "datasets": [
-                    d["name"]
-                    for d in extend_cfg.phases["extend"]["datasets"]
+                    d["name"] for d in extend_cfg.phases["extend"]["datasets"]
                 ],
             },
         }
@@ -1408,6 +1427,7 @@ def run_pretrain_extend(
             Muon,
             build_param_groups,
         )
+
         muon_params, adamw_groups = build_param_groups(
             inner_model.named_parameters(),
             weight_decay=extend_cfg.weight_decay,
@@ -1523,6 +1543,7 @@ def run_pretrain_extend(
     rollout_path = getattr(extend_cfg, "rollout_dataset_path", None)
     if rollout_path:
         from nano_osrt.data import make_rollout_loader
+
         print(f"    [MOPD] using rollout dataset: {rollout_path}")
         loader = make_rollout_loader(
             jsonl_path=rollout_path,
@@ -1550,8 +1571,10 @@ def run_pretrain_extend(
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     base = inner.model if hasattr(inner, "model") else inner
     need_ckpt = seq_len >= 8192
-    if (hasattr(base, "gradient_checkpointing")
-            and base.gradient_checkpointing != need_ckpt):
+    if (
+        hasattr(base, "gradient_checkpointing")
+        and base.gradient_checkpointing != need_ckpt
+    ):
         base.gradient_checkpointing = need_ckpt
 
     # Gumbel buffer fill (no-op since extend_cfg sets tau init = 0).
@@ -1565,10 +1588,14 @@ def run_pretrain_extend(
     base_cfg = inner.config
     final_aux_weight = getattr(base_cfg, "aux_loop_loss_weight", 0.0)
     aux_curriculum_steps = getattr(
-        extend_cfg, "aux_loop_curriculum_steps", 0,
+        extend_cfg,
+        "aux_loop_curriculum_steps",
+        0,
     )
     aux_curriculum_start = getattr(
-        extend_cfg, "aux_loop_weight_start", final_aux_weight,
+        extend_cfg,
+        "aux_loop_weight_start",
+        final_aux_weight,
     )
 
     while step < extend_cfg.total_steps:
@@ -1580,9 +1607,8 @@ def run_pretrain_extend(
         if aux_curriculum_steps > 0 and final_aux_weight > 0:
             if step < aux_curriculum_steps:
                 ratio = step / aux_curriculum_steps
-                base_cfg.aux_loop_loss_weight = (
-                    aux_curriculum_start
-                    + ratio * (final_aux_weight - aux_curriculum_start)
+                base_cfg.aux_loop_loss_weight = aux_curriculum_start + ratio * (
+                    final_aux_weight - aux_curriculum_start
                 )
             else:
                 base_cfg.aux_loop_loss_weight = final_aux_weight
@@ -1604,21 +1630,23 @@ def run_pretrain_extend(
                 # Loader exhausted — rebuild with a different seed.
                 # Honour the MOPD rollout-path override here too.
                 import gc
+
                 loader_iter = None
                 del loader
                 gc.collect()
                 if rollout_path:
                     from nano_osrt.data import make_rollout_loader
+
                     loader = make_rollout_loader(
                         jsonl_path=rollout_path,
                         seq_len=seq_len,
                         tokenizer_name=tokenizer_name,
                         batch_size=batch_size,
                         step_num=step,
-                        num_workers=getattr(
-                            extend_cfg, "dataloader_num_workers", 2),
+                        num_workers=getattr(extend_cfg, "dataloader_num_workers", 2),
                         prefetch_factor=getattr(
-                            extend_cfg, "dataloader_prefetch_factor", 2),
+                            extend_cfg, "dataloader_prefetch_factor", 2
+                        ),
                     )
                 else:
                     loader = make_loader(
@@ -1643,9 +1671,7 @@ def run_pretrain_extend(
             loss.backward()
 
             if inner.last_task_loss is not None:
-                accum_task_loss += (
-                    inner.last_task_loss.detach() / grad_accum
-                )
+                accum_task_loss += inner.last_task_loss.detach() / grad_accum
             if inner.last_balance_loss_normalised is not None:
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
@@ -1654,7 +1680,8 @@ def run_pretrain_extend(
             moe_snapshots.append(micro_metrics)
 
         torch.nn.utils.clip_grad_norm_(
-            model.parameters(), extend_cfg.grad_clip,
+            model.parameters(),
+            extend_cfg.grad_clip,
         )
         optimizer.step()
         apply_router_balance_updates(model)
@@ -1673,8 +1700,13 @@ def run_pretrain_extend(
             torch.cuda.reset_peak_memory_stats()
             eff_batch = batch_size * grad_accum
             steps_done = max(step - start_step, 1)
-            tok_per_sec = eff_batch * seq_len / max(
-                elapsed / steps_done, 1e-8,
+            tok_per_sec = (
+                eff_batch
+                * seq_len
+                / max(
+                    elapsed / steps_done,
+                    1e-8,
+                )
             )
 
             # Recursion telemetry: per-loop aux CE loss (if enabled) and
@@ -1683,9 +1715,11 @@ def run_pretrain_extend(
             # predict next-token. The adapter magnitude tells us whether
             # those loops' adapters are growing or staying tiny. Together
             # they answer "is the recursive depth being used?" in real time.
-            per_loop_aux = [
-                l.item() for l in inner.last_per_loop_aux_losses
-            ] if hasattr(inner, "last_per_loop_aux_losses") else []
+            per_loop_aux = (
+                [l.item() for l in inner.last_per_loop_aux_losses]
+                if hasattr(inner, "last_per_loop_aux_losses")
+                else []
+            )
             aux_total = (
                 inner.last_aux_loop_total.item()
                 if getattr(inner, "last_aux_loop_total", None) is not None
@@ -1724,8 +1758,7 @@ def run_pretrain_extend(
             if per_loop_aux:
                 aux_str = " ".join(f"{v:.3f}" for v in per_loop_aux)
                 print(
-                    f"           aux: total={aux_total:.3f}  "
-                    f"per_loop=[{aux_str}]",
+                    f"           aux: total={aux_total:.3f}  per_loop=[{aux_str}]",
                     flush=True,
                 )
             adapter_str = " ".join(f"{v:.3f}" for v in per_loop_adapter_norm)
@@ -1764,9 +1797,7 @@ def run_pretrain_extend(
 
         # ── 23h Modal safety rescue ────────────────────────────────
         if time.time() - start_time > 82_800:
-            rescue_path = (
-                f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
-            )
+            rescue_path = f"{ckpt_dir}/osrt_v5_{prefix}_rescue_step_{step}.pt"
             save_checkpoint(model, optimizer, step, rescue_path)
             vol.commit()
             print(
@@ -1786,8 +1817,7 @@ def run_pretrain_extend(
     vol.commit()
     elapsed_total = time.time() - start_time
     print(
-        f"\n{prefix} complete. {step:,} steps in "
-        f"{elapsed_total / 3600:.1f}h",
+        f"\n{prefix} complete. {step:,} steps in {elapsed_total / 3600:.1f}h",
         flush=True,
     )
     print(f"Final checkpoint: {final_path}", flush=True)

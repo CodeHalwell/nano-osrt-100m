@@ -21,7 +21,6 @@ from torch import Tensor
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
 
-
 # ── Custom text extractors for the extend-stage mix ─────────────────────
 # Used only when a dataset config sets `format=<key>`. Default
 # (no format key) falls through to TokenStream._extract_text which
@@ -130,13 +129,13 @@ def _format_nemotron_math_pretrain(example: dict) -> str:
 
 
 _R1_TAG_REWRITES = (
-    ("<think>",  "<|think|>"),
+    ("<think>", "<|think|>"),
     ("</think>", "<|/think|>"),
     # OpenThoughts uses these alternative tags for the same purpose.
     ("<|begin_of_thought|>", "<|think|>"),
-    ("<|end_of_thought|>",   "<|/think|>"),
+    ("<|end_of_thought|>", "<|/think|>"),
     ("<|begin_of_solution|>", "<|answer|>"),
-    ("<|end_of_solution|>",   "<|/answer|>"),
+    ("<|end_of_solution|>", "<|/answer|>"),
 )
 
 
@@ -175,10 +174,7 @@ def _format_openr1_math(example: dict) -> str:
         return ""
     pick = _rewrite_reasoning_tags(pick)
     answer_str = str(answer or "").strip()
-    return (
-        f"<|user|>{problem}<|assistant|>{pick}"
-        f"<|answer|>{answer_str}<|/answer|>"
-    )
+    return f"<|user|>{problem}<|assistant|>{pick}<|answer|>{answer_str}<|/answer|>"
 
 
 def _format_openmath_reasoning(example: dict) -> str:
@@ -197,10 +193,7 @@ def _format_openmath_reasoning(example: dict) -> str:
         return ""
     solution = _rewrite_reasoning_tags(solution)
     answer_str = str(answer or "").strip()
-    return (
-        f"<|user|>{problem}<|assistant|>{solution}"
-        f"<|answer|>{answer_str}<|/answer|>"
-    )
+    return f"<|user|>{problem}<|assistant|>{solution}<|answer|>{answer_str}<|/answer|>"
 
 
 def _format_openthoughts(example: dict) -> str:
@@ -268,10 +261,7 @@ def _format_bbh(example: dict) -> str:
         return ""
     if not (isinstance(tgt, str) and tgt.strip()):
         return ""
-    return (
-        f"<|user|>{inp}<|assistant|>"
-        f"<|answer|>{tgt}<|/answer|>"
-    )
+    return f"<|user|>{inp}<|assistant|><|answer|>{tgt}<|/answer|>"
 
 
 FORMAT_FN_PRETRAIN = {
@@ -432,13 +422,10 @@ class TokenStream(IterableDataset):
             if total == 0:
                 return rng.choices(range(len(streams)), weights=weights, k=1)[0]
             deficits = [
-                weights[i] - tokens_seen[i] / total
-                for i in range(len(streams))
+                weights[i] - tokens_seen[i] / total for i in range(len(streams))
             ]
             max_def = max(deficits)
-            candidates = [
-                i for i, d in enumerate(deficits) if d >= max_def - 1e-6
-            ]
+            candidates = [i for i, d in enumerate(deficits) if d >= max_def - 1e-6]
             return rng.choice(candidates)
 
         buffer: list[int] = []
@@ -596,9 +583,7 @@ def make_loader(
     Returns:
         DataLoader yielding (input_ids, labels) batches.
     """
-    ds = TokenStream(
-        dataset_configs, seq_len, tokenizer_name, seed=42 + step_num
-    )
+    ds = TokenStream(dataset_configs, seq_len, tokenizer_name, seed=42 + step_num)
     # num_workers=2 offloads HF streaming + BPE tokenisation to two
     # background processes so the main training thread doesn't wait on
     # them. Each worker gets its own seed (TokenStream reads
@@ -696,15 +681,12 @@ class RolloutDataset(IterableDataset):
             return None
 
         if system:
-            prefix_text = (
-                f"<|system|>{system}<|user|>{prompt}<|assistant|>"
-            )
+            prefix_text = f"<|system|>{system}<|user|>{prompt}<|assistant|>"
         else:
             prefix_text = f"<|user|>{prompt}<|assistant|>"
         if thinking:
             target_text = (
-                f"<|think|>{thinking}<|/think|>"
-                f"<|answer|>{response}<|/answer|>"
+                f"<|think|>{thinking}<|/think|><|answer|>{response}<|/answer|>"
             )
         else:
             # Datasets without explicit `thinking` (OpenHermes, etc.)
@@ -725,9 +707,7 @@ class RolloutDataset(IterableDataset):
             target_ids = target_ids[:max_target]
 
         seq_ids = prefix_ids + target_ids
-        seq_labels: list[int] = (
-            [-100] * len(prefix_ids) + list(target_ids)
-        )
+        seq_labels: list[int] = [-100] * len(prefix_ids) + list(target_ids)
         # Right-pad to seq_len
         pad_len = self.seq_len - len(seq_ids)
         if pad_len > 0:
@@ -770,9 +750,7 @@ class RolloutDataset(IterableDataset):
                     rollouts.append(rec)
 
         if not rollouts:
-            raise RuntimeError(
-                f"No usable rollouts in {self.jsonl_path}"
-            )
+            raise RuntimeError(f"No usable rollouts in {self.jsonl_path}")
         print(
             f"[RolloutWorker {worker_id}/{n_workers}] loaded "
             f"{len(rollouts)} rollouts from {self.jsonl_path}",

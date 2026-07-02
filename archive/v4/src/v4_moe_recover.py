@@ -15,13 +15,11 @@ decisions, and the experts are interchangeable. This run gives the MoE
 machinery a fresh training signal that rewards differentiation.
 """
 
-import glob
 import math
 import os
 import time
 
 import torch
-import torch.nn.functional as F
 
 try:
     import wandb
@@ -33,7 +31,9 @@ from nano_osrt.v4_data import make_v4_loader
 from nano_osrt.v4_model import NanoOSRTv4ForCausalLM
 
 
-def get_lr(step: int, total_steps: int, warmup: int, peak: float, minimum: float) -> float:
+def get_lr(
+    step: int, total_steps: int, warmup: int, peak: float, minimum: float
+) -> float:
     """Cosine LR with linear warmup."""
     if step < warmup:
         return peak * step / max(warmup, 1)
@@ -41,7 +41,9 @@ def get_lr(step: int, total_steps: int, warmup: int, peak: float, minimum: float
     return minimum + 0.5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
 
 
-def reinit_experts_from_shared(model: NanoOSRTv4ForCausalLM, noise_std: float = 0.01) -> None:
+def reinit_experts_from_shared(
+    model: NanoOSRTv4ForCausalLM, noise_std: float = 0.01
+) -> None:
     """Copy shared expert weights to all routed experts + add per-expert noise.
 
     This breaks symmetry: experts start from a known-good distribution
@@ -61,7 +63,9 @@ def reinit_experts_from_shared(model: NanoOSRTv4ForCausalLM, noise_std: float = 
                 ):
                     dst.weight.copy_(src.weight)
                     dst.weight.add_(torch.randn_like(dst.weight) * noise_std)
-        print(f"  Block {bi}: re-initialised {len(moe.experts)} routed experts from shared expert (+ noise σ={noise_std})")
+        print(
+            f"  Block {bi}: re-initialised {len(moe.experts)} routed experts from shared expert (+ noise σ={noise_std})"
+        )
 
 
 def freeze_all_except_moe(model: NanoOSRTv4ForCausalLM) -> tuple[int, int]:
@@ -99,7 +103,9 @@ def freeze_all_except_moe(model: NanoOSRTv4ForCausalLM) -> tuple[int, int]:
     return trainable_count, frozen_count
 
 
-def compute_diversity_loss(model: NanoOSRTv4ForCausalLM, x_sample: torch.Tensor) -> torch.Tensor:
+def compute_diversity_loss(
+    model: NanoOSRTv4ForCausalLM, x_sample: torch.Tensor
+) -> torch.Tensor:
     """Push routed experts toward producing different outputs on the same input.
 
     Loss = -mean_i mean_{j!=i} ||expert_i(x) - expert_j(x)||^2 / ||x||^2
@@ -131,7 +137,9 @@ def compute_diversity_loss(model: NanoOSRTv4ForCausalLM, x_sample: torch.Tensor)
     return total / max(count, 1)
 
 
-def run_v4_moe_recover(model_config: NanoOSRTv4Config, cfg, vol, tokenizer_name: str) -> None:
+def run_v4_moe_recover(
+    model_config: NanoOSRTv4Config, cfg, vol, tokenizer_name: str
+) -> None:
     """Execute the MoE recovery training loop."""
     device = torch.device("cuda")
 
@@ -160,10 +168,10 @@ def run_v4_moe_recover(model_config: NanoOSRTv4Config, cfg, vol, tokenizer_name:
     model_config.router_gumbel_tau_init = cfg.gumbel_tau
     model_config.router_gumbel_tau_final = cfg.gumbel_tau * 0.1
 
-    print(f"  importance_coeff      : 0.0 (was 0.05) — removed")
+    print("  importance_coeff      : 0.0 (was 0.05) — removed")
     print(f"  capacity_factor       : {cfg.capacity_factor} (was 1.25) — loosened")
-    print(f"  soft_warmup / blend   : 0 / 0 — straight to hard")
-    print(f"  balance_bias          : disabled")
+    print("  soft_warmup / blend   : 0 / 0 — straight to hard")
+    print("  balance_bias          : disabled")
     print(f"  gumbel_tau            : {cfg.gumbel_tau} → {cfg.gumbel_tau * 0.1}")
     print(f"  diversity_loss_coeff  : {cfg.diversity_coeff}")
     print()
@@ -296,7 +304,13 @@ def run_v4_moe_recover(model_config: NanoOSRTv4Config, cfg, vol, tokenizer_name:
             # Collect MoE telemetry
             base = model.model
             _mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
-            dense_gates, moe_gates, prob_ents, assign_ents, raw_ents = [], [], [], [], []
+            dense_gates, moe_gates, prob_ents, assign_ents, raw_ents = (
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
             all_overflow = []
             raw_maxes = []
             for block in base.blocks:
@@ -326,41 +340,52 @@ def run_v4_moe_recover(model_config: NanoOSRTv4Config, cfg, vol, tokenizer_name:
             )
 
             if use_wandb:
-                wandb.log({
-                    "recover/task_loss": accum_task.item(),
-                    "recover/diversity_loss": accum_div.item(),
-                    "recover/lr": lr,
-                    "recover/vram_gb": vram_gb,
-                    "moe/prob_entropy_mean": _mean(prob_ents),
-                    "moe/assign_entropy_mean": _mean(assign_ents),
-                    "moe/raw_assign_entropy_mean": _mean(raw_ents),
-                    "moe/raw_expert_max_mean": _mean(raw_maxes),
-                    "moe/overflow_rate_mean": _mean(all_overflow),
-                    "moe/dense_gate_mean": _mean(dense_gates),
-                    "moe/moe_gate_mean": _mean(moe_gates),
-                }, step=step)
+                wandb.log(
+                    {
+                        "recover/task_loss": accum_task.item(),
+                        "recover/diversity_loss": accum_div.item(),
+                        "recover/lr": lr,
+                        "recover/vram_gb": vram_gb,
+                        "moe/prob_entropy_mean": _mean(prob_ents),
+                        "moe/assign_entropy_mean": _mean(assign_ents),
+                        "moe/raw_assign_entropy_mean": _mean(raw_ents),
+                        "moe/raw_expert_max_mean": _mean(raw_maxes),
+                        "moe/overflow_rate_mean": _mean(all_overflow),
+                        "moe/dense_gate_mean": _mean(dense_gates),
+                        "moe/moe_gate_mean": _mean(moe_gates),
+                    },
+                    step=step,
+                )
 
         # Checkpoints
         if step > 0 and step % cfg.ckpt_interval == 0:
             path = f"{ckpt_dir}/osrt_v4_moe_recover_step_{step}.pt"
-            torch.save({
-                "step": step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "training_stage": "moe_recover",
-            }, path)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "training_stage": "moe_recover",
+                },
+                path,
+            )
             vol.commit()
             print(f"  -> Checkpoint saved: {path}")
 
     # Final
     final_path = f"{ckpt_dir}/osrt_v4_moe_recover_final.pt"
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "training_stage": "moe_recover",
-    }, final_path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "training_stage": "moe_recover",
+        },
+        final_path,
+    )
     vol.commit()
     elapsed_total = time.time() - start_time
-    print(f"\nMoE recovery complete. {cfg.total_steps:,} steps in {elapsed_total / 3600:.1f}h")
+    print(
+        f"\nMoE recovery complete. {cfg.total_steps:,} steps in {elapsed_total / 3600:.1f}h"
+    )
     print(f"Final model: {final_path}")
     if use_wandb:
         wandb.finish()

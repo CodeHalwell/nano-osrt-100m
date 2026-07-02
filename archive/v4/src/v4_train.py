@@ -129,7 +129,11 @@ def run_eval(
 
     eval_loader = make_v4_loader(
         dataset_configs=[
-            {"name": "fineweb-edu-eval", "hf_id": "HuggingFaceFW/fineweb-edu", "weight": 1.0},
+            {
+                "name": "fineweb-edu-eval",
+                "hf_id": "HuggingFaceFW/fineweb-edu",
+                "weight": 1.0,
+            },
         ],
         seq_len=seq_len,
         tokenizer_name=tokenizer_name,
@@ -162,10 +166,19 @@ def run_eval(
     eval_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(eval_loss, 20.0))  # cap to avoid overflow
 
-    return {"eval/loss": eval_loss, "eval/perplexity": perplexity, "eval/tokens": total_tokens}
+    return {
+        "eval/loss": eval_loss,
+        "eval/perplexity": perplexity,
+        "eval/tokens": total_tokens,
+    }
 
 
-def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig, vol, tokenizer_name: str) -> None:
+def run_v4_training(
+    model_config: NanoOSRTv4Config,
+    train_cfg: V4PretrainConfig,
+    vol,
+    tokenizer_name: str,
+) -> None:
     """Execute the v4 pre-training loop."""
     device = torch.device("cuda")
 
@@ -185,8 +198,12 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
     print(f"Physical parameters : {total_params:>12,}")
     print(f"Blocks              : {model_config.num_blocks}")
     print(f"Recursive loops     : {model_config.recursive_loops}")
-    print(f"Effective layers    : {model_config.num_blocks * model_config.recursive_loops}")
-    print(f"Experts             : {model_config.num_experts} ({model_config.num_shared_experts} shared + {model_config.num_routed_experts} routed, top-{model_config.top_k_experts})")
+    print(
+        f"Effective layers    : {model_config.num_blocks * model_config.recursive_loops}"
+    )
+    print(
+        f"Experts             : {model_config.num_experts} ({model_config.num_shared_experts} shared + {model_config.num_routed_experts} routed, top-{model_config.top_k_experts})"
+    )
     print(f"Hidden dim          : {model_config.dim}")
     print(f"Peak LR             : {train_cfg.peak_lr}")
     print(f"Optimizer           : {train_cfg.optimizer_name}")
@@ -242,10 +259,13 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         else:
             other_params.append(param)
 
-    print(f"Param groups: {len(other_params)} standard, {len(router_params)} router (wd=0)")
+    print(
+        f"Param groups: {len(other_params)} standard, {len(router_params)} router (wd=0)"
+    )
 
     if train_cfg.optimizer_name.lower() == "lion":
         from lion_pytorch import Lion
+
         optimizer = Lion(
             [
                 {"params": other_params, "weight_decay": train_cfg.weight_decay},
@@ -310,8 +330,10 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             grad_accum = phase_cfg.get("grad_accum_steps", train_cfg.grad_accum_steps)
             current_batch_size = phase_cfg.get("batch_size", train_cfg.batch_size)
 
-            print(f"\n>>> Phase: {current_phase} | seq_len: {current_seq_len} | "
-                  f"batch: {current_batch_size} | accum: {grad_accum} | Step: {step}")
+            print(
+                f"\n>>> Phase: {current_phase} | seq_len: {current_seq_len} | "
+                f"batch: {current_batch_size} | accum: {grad_accum} | Step: {step}"
+            )
             print(f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}")
 
             # (Per-step logic below owns gradient_checkpointing toggling —
@@ -373,7 +395,10 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         # as before. Toggling a bool triggers at most 2 torch.compile
         # recompiles per run (soft→blend→hard boundaries).
         need_ckpt = (target_mode != 2) or (current_seq_len >= 4096)
-        if hasattr(base, "gradient_checkpointing") and base.gradient_checkpointing != need_ckpt:
+        if (
+            hasattr(base, "gradient_checkpointing")
+            and base.gradient_checkpointing != need_ckpt
+        ):
             base.gradient_checkpointing = need_ckpt
 
         # Legacy router noise anneal (defaults to 0.0 → 0.0). Keep the
@@ -464,7 +489,11 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
             torch.cuda.reset_peak_memory_stats()
 
             eff_batch = current_batch_size * grad_accum
-            tok_per_sec = eff_batch * current_seq_len / max(elapsed / max(step - start_step, 1), 1e-8)
+            tok_per_sec = (
+                eff_batch
+                * current_seq_len
+                / max(elapsed / max(step - start_step, 1), 1e-8)
+            )
 
             # ── MoE diagnostics (cheap, high-value for debugging) ──
             # Pull gate values, aux losses, router entropy, expert usage
@@ -596,9 +625,13 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
                 if assign_entropies:
                     moe_metrics["moe/assign_entropy_mean"] = _mean(assign_entropies)
                 if clean_assign_entropies:
-                    moe_metrics["moe/clean_assign_entropy_mean"] = _mean(clean_assign_entropies)
+                    moe_metrics["moe/clean_assign_entropy_mean"] = _mean(
+                        clean_assign_entropies
+                    )
                 if raw_assign_entropies:
-                    moe_metrics["moe/raw_assign_entropy_mean"] = _mean(raw_assign_entropies)
+                    moe_metrics["moe/raw_assign_entropy_mean"] = _mean(
+                        raw_assign_entropies
+                    )
                 if max_fracs:
                     moe_metrics["moe/expert_max_mean"] = _mean(max_fracs)
                 if min_fracs:
@@ -760,9 +793,13 @@ def run_v4_training(model_config: NanoOSRTv4Config, train_cfg: V4PretrainConfig,
         # Use phase-specific batch_size to avoid OOM at seq_len 4096 / 8192.
         if step > 0 and step % train_cfg.eval_interval == 0:
             eval_metrics = run_eval(
-                model, tokenizer_name, current_seq_len,
-                current_batch_size, train_cfg.eval_steps,
-                device, model_config.real_vocab_size,
+                model,
+                tokenizer_name,
+                current_seq_len,
+                current_batch_size,
+                train_cfg.eval_steps,
+                device,
+                model_config.real_vocab_size,
             )
             print(
                 f"  EVAL step {step} | "
