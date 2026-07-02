@@ -21,11 +21,17 @@ from nano_osrt.model import (
 def tiny_config(**overrides) -> NanoOSRTConfig:
     """Small config for fast tests."""
     defaults = dict(
-        dim=128, heads=4, head_dim=32,
-        vocab_size=512, real_vocab_size=512,
-        num_blocks=2, recursive_loops=2,
-        num_routed_experts=8, top_k_experts=2,
-        expert_hidden=64, shared_expert_hidden=128,
+        dim=128,
+        heads=4,
+        head_dim=32,
+        vocab_size=512,
+        real_vocab_size=512,
+        num_blocks=2,
+        recursive_loops=2,
+        num_routed_experts=8,
+        top_k_experts=2,
+        expert_hidden=64,
+        shared_expert_hidden=128,
         max_position_embeddings=64,
     )
     defaults.update(overrides)
@@ -132,6 +138,7 @@ def test_orthogonal_init_matches_claimed_fan_in_variance():
     e = ExpertFFN(dim=1536, hidden=2048)
     orthogonal_expert_init(e, seed=0, gain=1.0)
     import math
+
     target = 1.0 / math.sqrt(1536)
     for name in ("w_gate", "w_up"):
         w = getattr(e, name).weight
@@ -169,9 +176,10 @@ def test_orthogonal_init_survives_full_model_construction():
     orthogonal_expert_init(fresh, seed=0 * 1000 + 0, gain=1.0)
     model_expert = model.model.blocks[0].moe.experts[0]
 
-    assert torch.allclose(model_expert.w_gate.weight, fresh.w_gate.weight, atol=1e-5), \
-        "Block 0 expert 0 w_gate doesn't match fresh orthogonal init — " \
+    assert torch.allclose(model_expert.w_gate.weight, fresh.w_gate.weight, atol=1e-5), (
+        "Block 0 expert 0 w_gate doesn't match fresh orthogonal init — "
         "post_init() or another init pass stomped the orthogonal weights."
+    )
     assert torch.allclose(model_expert.w_up.weight, fresh.w_up.weight, atol=1e-5)
     assert torch.allclose(model_expert.w_down.weight, fresh.w_down.weight, atol=1e-5)
 
@@ -193,8 +201,9 @@ def test_orthogonal_init_disabled_flag_works():
     model = NanoOSRTForCausalLM(cfg)
     # Experts should have the default normal init std
     std = model.model.blocks[0].moe.experts[0].w_gate.weight.std().item()
-    assert abs(std - cfg.initializer_range) < 0.01, \
+    assert abs(std - cfg.initializer_range) < 0.01, (
         f"Expected std ~{cfg.initializer_range}, got {std}"
+    )
 
 
 # ── MoE Layer ──────────────────────────────────────────────────────────
@@ -220,6 +229,7 @@ def test_moe_gate_applies_only_to_routed():
     where softplus equals 1.0 to compare against.
     """
     import math
+
     cfg = tiny_config()
     model = NanoOSRTForCausalLM(cfg)
     x = torch.randint(0, cfg.vocab_size, (1, 8))
@@ -314,19 +324,24 @@ def test_moe_balance_loss_penalises_collapse():
     torch.manual_seed(0)
     cfg = tiny_config(num_routed_experts=8, top_k_experts=2)
     moe = MoELayer(cfg)
+
     # Replace router with a constant-logit module favouring experts 0,1
     class ConstLogits(torch.nn.Module):
         def __init__(self, e: int) -> None:
             super().__init__()
             self.e = e
+
         def forward(self, h: torch.Tensor) -> torch.Tensor:
             logits = torch.full(
-                (h.shape[0], self.e), -10.0,
-                device=h.device, dtype=h.dtype,
+                (h.shape[0], self.e),
+                -10.0,
+                device=h.device,
+                dtype=h.dtype,
             )
             logits[:, 0] = 10.0
             logits[:, 1] = 10.0
             return logits
+
     moe.router = ConstLogits(cfg.num_routed_experts)
     x = torch.randn(8, 32, cfg.dim)
     _ = moe(x, loop_idx=0)
@@ -358,10 +373,12 @@ def test_moe_balance_loss_uses_raw_router_under_gumbel():
         def __init__(self, e: int) -> None:
             super().__init__()
             self.e = e
+
         def forward(self, h: torch.Tensor) -> torch.Tensor:
             logits = torch.zeros(
                 (h.shape[0], self.e),
-                device=h.device, dtype=h.dtype,
+                device=h.device,
+                dtype=h.dtype,
             )
             logits[:, 0] = 5.0
             logits[:, 1] = 5.0
@@ -453,10 +470,12 @@ def test_balance_bias_affects_clean_topk_selection():
 def test_balance_bias_persists_in_state_dict():
     cfg = tiny_config(num_routed_experts=4, top_k_experts=2)
     model = NanoOSRTForCausalLM(cfg)
-    bias = torch.tensor([
-        [0.1, -0.2, 0.3, -0.4],
-        [-0.3, 0.2, -0.1, 0.4],
-    ])
+    bias = torch.tensor(
+        [
+            [0.1, -0.2, 0.3, -0.4],
+            [-0.3, 0.2, -0.1, 0.4],
+        ]
+    )
     model.model.blocks[0].moe.router_balance_bias.copy_(bias)
 
     state = model.state_dict()
@@ -474,7 +493,9 @@ def test_balance_bias_persists_in_state_dict():
 def test_moe_drop_rate_low_at_loose_cap():
     """With capacity_factor 4.0, drops should be rare at uniform routing."""
     cfg = tiny_config(
-        num_routed_experts=8, top_k_experts=2, router_capacity_factor=4.0,
+        num_routed_experts=8,
+        top_k_experts=2,
+        router_capacity_factor=4.0,
     )
     moe = MoELayer(cfg)
     x = torch.randn(4, 16, cfg.dim)
@@ -486,28 +507,34 @@ def test_moe_drop_rate_high_at_tight_cap_and_collapse():
     """Forced collapse + tight cap should produce significant drops."""
     torch.manual_seed(0)
     cfg = tiny_config(
-        num_routed_experts=8, top_k_experts=2, router_capacity_factor=1.01,
+        num_routed_experts=8,
+        top_k_experts=2,
+        router_capacity_factor=1.01,
     )
     moe = MoELayer(cfg)
+
     # Patch router with a constant-logit module favouring experts 0,1
     class ConstLogits(torch.nn.Module):
         def __init__(self, e: int) -> None:
             super().__init__()
             self.e = e
+
         def forward(self, h: torch.Tensor) -> torch.Tensor:
             logits = torch.full(
-                (h.shape[0], self.e), -10.0,
-                device=h.device, dtype=h.dtype,
+                (h.shape[0], self.e),
+                -10.0,
+                device=h.device,
+                dtype=h.dtype,
             )
             logits[:, 0] = 10.0
             logits[:, 1] = 10.0
             return logits
+
     moe.router = ConstLogits(cfg.num_routed_experts)
     x = torch.randn(4, 16, cfg.dim)
     _ = moe(x, loop_idx=0)
     drop = moe.last_drop_rate[0]
-    assert drop > 0.3, \
-        f"Expected high drop rate with collapse + tight cap, got {drop}"
+    assert drop > 0.3, f"Expected high drop rate with collapse + tight cap, got {drop}"
 
 
 def test_moe_renormalises_top_k_gates():
@@ -523,7 +550,9 @@ def test_moe_renormalises_top_k_gates():
     top_probs, _ = probs.topk(cfg.top_k_experts, dim=-1)
     renorm = top_probs / top_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     assert torch.allclose(
-        renorm.sum(dim=-1), torch.ones(N), atol=1e-5,
+        renorm.sum(dim=-1),
+        torch.ones(N),
+        atol=1e-5,
     ), "Renormalised top-k gates don't sum to 1"
 
 
@@ -559,8 +588,9 @@ def test_moe_raw_max_prob_is_pre_renormalisation():
     # (slightly above since we're taking the max of 8 random draws).
     # Critical: must be < 0.5 so we know we're logging RAW not renormalised.
     raw_max = moe.last_raw_max_prob[0]
-    assert raw_max < 0.4, \
+    assert raw_max < 0.4, (
         f"Raw max_prob {raw_max} looks renormalised (top-2 renormalised averages 0.5)"
+    )
 
 
 def test_moe_per_token_entropy_vs_marginal():
@@ -618,9 +648,9 @@ def test_gradient_flows_to_multiple_experts():
     out.loss.backward()
     for blk in model.model.blocks:
         experts_with_grad = sum(
-            1 for e in blk.moe.experts
-            if e.w_gate.weight.grad is not None
-            and e.w_gate.weight.grad.abs().sum() > 0
+            1
+            for e in blk.moe.experts
+            if e.w_gate.weight.grad is not None and e.w_gate.weight.grad.abs().sum() > 0
         )
         assert experts_with_grad >= 2, (
             f"Only {experts_with_grad} experts got gradient; "
@@ -724,7 +754,9 @@ def test_capacity_drops_disabled_in_eval():
     """With model.train(False), drop_rate must be zero regardless of capacity."""
     torch.manual_seed(0)
     cfg = tiny_config(
-        num_routed_experts=8, top_k_experts=2, router_capacity_factor=1.01,
+        num_routed_experts=8,
+        top_k_experts=2,
+        router_capacity_factor=1.01,
     )
     model = NanoOSRTForCausalLM(cfg)
     model.train(False)
@@ -733,15 +765,18 @@ def test_capacity_drops_disabled_in_eval():
     _ = model(input_ids=x)
     for blk in model.model.blocks:
         for loop_drop in blk.moe.last_drop_rate:
-            assert loop_drop == 0.0, \
+            assert loop_drop == 0.0, (
                 f"Eval mode should have zero drops; got {loop_drop}"
+            )
 
 
 def test_capacity_drops_active_in_training():
     """In training mode with tight cap + forced collapse, drops should occur."""
     torch.manual_seed(0)
     cfg = tiny_config(
-        num_routed_experts=8, top_k_experts=2, router_capacity_factor=1.01,
+        num_routed_experts=8,
+        top_k_experts=2,
+        router_capacity_factor=1.01,
     )
     model = NanoOSRTForCausalLM(cfg)
     model.train(True)
@@ -751,21 +786,26 @@ def test_capacity_drops_active_in_training():
         def __init__(self, e: int) -> None:
             super().__init__()
             self.e = e
+
         def forward(self, h: torch.Tensor) -> torch.Tensor:
             logits = torch.full(
-                (h.shape[0], self.e), -10.0,
-                device=h.device, dtype=h.dtype,
+                (h.shape[0], self.e),
+                -10.0,
+                device=h.device,
+                dtype=h.dtype,
             )
             logits[:, 0] = 10.0
             logits[:, 1] = 10.0
             return logits
+
     model.model.blocks[0].moe.router = ConstLogits(cfg.num_routed_experts)
 
     x = torch.randint(0, cfg.vocab_size, (4, 32))
     _ = model(input_ids=x)
     drops = model.model.blocks[0].moe.last_drop_rate
-    assert any(d > 0 for d in drops), \
+    assert any(d > 0 for d in drops), (
         f"Training mode with forced collapse should produce drops; got {drops}"
+    )
 
 
 def test_eval_loss_excludes_balance_loss():
@@ -779,9 +819,10 @@ def test_eval_loss_excludes_balance_loss():
     model.train(False)
     out = model(input_ids=x, labels=labels)
     # In eval mode, out.loss should equal task_loss exactly
-    assert torch.allclose(out.loss, model.last_task_loss, atol=1e-5), \
-        f"Eval loss {out.loss.item()} should equal task_loss " \
+    assert torch.allclose(out.loss, model.last_task_loss, atol=1e-5), (
+        f"Eval loss {out.loss.item()} should equal task_loss "
         f"{model.last_task_loss.item()} but includes aux loss"
+    )
 
     # Confirm balance components are still populated (for telemetry)
     assert model.last_balance_loss is not None
@@ -844,8 +885,9 @@ def test_recursive_loops_produce_different_hidden():
     # z_loss, seq_balance_loss, presents). Only loop_rms is used here.
     _, loop_rms, *_ = model(x)
     rms_vals = [r.item() for r in loop_rms]
-    assert len(set(f"{r:.4f}" for r in rms_vals)) > 1, \
+    assert len(set(f"{r:.4f}" for r in rms_vals)) > 1, (
         f"Loops produced identical hidden state: {rms_vals}"
+    )
 
 
 # ── KV cache ───────────────────────────────────────────────────────────
@@ -964,9 +1006,10 @@ def test_last_loss_attrs_set_under_torch_compile():
         pytest.skip(f"torch.compile failed on test env: {e}")
 
     inner = compiled._orig_mod if hasattr(compiled, "_orig_mod") else compiled
-    assert inner.last_task_loss is not None, \
-        "last_task_loss not set on _orig_mod after compiled forward " \
+    assert inner.last_task_loss is not None, (
+        "last_task_loss not set on _orig_mod after compiled forward "
         "(attribute mutation regressed — training logs would go blank)"
+    )
     assert inner.last_balance_loss is not None
     assert inner.last_balance_loss_normalised is not None
 
@@ -981,7 +1024,10 @@ def test_generate_greedy_produces_expected_shape():
     model.train(False)
     ctx = torch.randint(0, cfg.vocab_size, (1, 8))
     out = model.generate(
-        ctx, max_new_tokens=12, temperature=0.0, repetition_penalty=1.0,
+        ctx,
+        max_new_tokens=12,
+        temperature=0.0,
+        repetition_penalty=1.0,
     )
     assert out.shape == (1, 8 + 12), f"Expected (1, 20), got {out.shape}"
 
@@ -1001,8 +1047,9 @@ def test_generate_sampling_respects_temperature():
 
     # Different seeds + non-zero temperature => sequences should differ
     # (at least one position). Extremely unlikely to fail for random model.
-    assert not torch.equal(a, b), \
+    assert not torch.equal(a, b), (
         "Sampled generation with different seeds produced identical output"
+    )
 
 
 def test_generate_kv_cache_matches_full_forward():
@@ -1026,7 +1073,9 @@ def test_generate_kv_cache_matches_full_forward():
     out_pre = model(ctx, use_cache=True)
     past = out_pre.past_key_values
     out_dec = model(
-        torch.tensor([[new_tok_id]]), past_key_values=past, use_cache=True,
+        torch.tensor([[new_tok_id]]),
+        past_key_values=past,
+        use_cache=True,
     )
     logits_dec = out_dec.logits[:, -1, :]
 
@@ -1051,11 +1100,15 @@ def test_generate_stops_on_eos():
         # just confirm the output is no longer than that (sanity, not
         # a strong test of EOS stopping).
     out = model.generate(
-        ctx, max_new_tokens=5, temperature=0.0,
-        eos_token_id=cfg.eos_token_id, repetition_penalty=1.0,
+        ctx,
+        max_new_tokens=5,
+        temperature=0.0,
+        eos_token_id=cfg.eos_token_id,
+        repetition_penalty=1.0,
     )
-    assert out.shape[1] <= ctx.shape[1] + 5, \
+    assert out.shape[1] <= ctx.shape[1] + 5, (
         f"Output too long: {out.shape[1]} > {ctx.shape[1] + 5}"
+    )
 
 
 # ── Checkpoint round-trip and aux-loss gradient flow ───────────────────
@@ -1070,6 +1123,7 @@ def test_checkpoint_roundtrip_preserves_logits(tmp_path):
     keys — we want the round-trip to NOT depend on strict=False to succeed.
     """
     import os
+
     cfg = tiny_config()
     torch.manual_seed(0)
     model_a = NanoOSRTForCausalLM(cfg)
@@ -1089,7 +1143,8 @@ def test_checkpoint_roundtrip_preserves_logits(tmp_path):
     model_b.train(False)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     missing, unexpected = model_b.load_state_dict(
-        ckpt["model_state_dict"], strict=True,
+        ckpt["model_state_dict"],
+        strict=True,
     )
     # strict=True would raise on missing/unexpected, so if we got here the
     # state dict keys line up perfectly. Double-check logits.
@@ -1135,11 +1190,13 @@ def test_balance_loss_pushes_router_weights():
 
     for blk in model.model.blocks:
         grad = blk.moe.router.weight.grad
-        assert grad is not None, \
+        assert grad is not None, (
             "Router weight has no grad after balance_loss.backward()"
+        )
         grad_mag = grad.abs().sum().item()
-        assert grad_mag > 0, \
+        assert grad_mag > 0, (
             "Router grad is all zero — balance loss isn't pushing router"
+        )
 
 
 # ── Reward parsing regressions ─────────────────────────────────────────
@@ -1270,7 +1327,8 @@ def test_generate_pads_finished_rows_until_all_done():
         # so the generate() cache-trim guard is happy.
         past = past_key_values if past_key_values is not None else [None] * 1
         return CausalLMOutputWithPast(
-            loss=None, logits=logits.to(torch.float32),
+            loss=None,
+            logits=logits.to(torch.float32),
             past_key_values=past,
         )
 
@@ -1278,7 +1336,10 @@ def test_generate_pads_finished_rows_until_all_done():
 
     ctx = torch.tensor([[0, 0], [0, 0]], dtype=torch.long)
     out = model.generate(
-        ctx, max_new_tokens=4, temperature=0.0, eos_token_id=eos,
+        ctx,
+        max_new_tokens=4,
+        temperature=0.0,
+        eos_token_id=eos,
     )
 
     # Row 0 finished on decode step 1, so positions 3..end must be eos.
@@ -1287,9 +1348,7 @@ def test_generate_pads_finished_rows_until_all_done():
     assert all(t == eos for t in row0_tail), (
         f"row 0 must be padded with eos after finishing, got {row0_tail}"
     )
-    assert out[1, -1].item() == eos, (
-        f"row 1 should end on eos, got {out[1, -1].item()}"
-    )
+    assert out[1, -1].item() == eos, f"row 1 should end on eos, got {out[1, -1].item()}"
 
 
 # ── Pretrain label alignment ──────────────────────────────────────────
@@ -1363,6 +1422,7 @@ def test_z_loss_populated_and_responsive_to_logit_scale():
     quadratically in the max logit.
     """
     import math
+
     cfg = tiny_config(num_routed_experts=8, top_k_experts=2)
     moe = MoELayer(cfg)
     with torch.no_grad():
@@ -1382,12 +1442,16 @@ def test_z_loss_populated_and_responsive_to_logit_scale():
         def __init__(self, e: int) -> None:
             super().__init__()
             self.e = e
+
         def forward(self, h: torch.Tensor) -> torch.Tensor:
             out = torch.zeros(
-                (h.shape[0], self.e), device=h.device, dtype=h.dtype,
+                (h.shape[0], self.e),
+                device=h.device,
+                dtype=h.dtype,
             )
             out[:, 0] = 5.0
             return out
+
     moe.router = BigLogits(cfg.num_routed_experts)
     _ = moe(x, loop_idx=0)
     assert moe.z_loss.item() > expected * 5, (
@@ -1516,9 +1580,7 @@ def test_moe_gate_softplus_stays_positive_under_negative_raw():
     for blk in model.model.blocks:
         eff = blk.effective_moe_gate().item()
         assert eff >= 0.0, f"softplus output must be >= 0, got {eff}"
-        assert eff < 1e-15, (
-            f"softplus(-50) should be tiny, got {eff} — check init"
-        )
+        assert eff < 1e-15, f"softplus(-50) should be tiny, got {eff} — check init"
 
 
 # ── Muon optimizer ─────────────────────────────────────────────────────
@@ -1536,7 +1598,7 @@ def test_newton_schulz_produces_near_orthogonal_columns():
     torch.manual_seed(0)
     g = torch.randn(64, 32)  # tall, so cols span R^32
     o = newton_schulz5(g, steps=5)
-    gram = (o.float().T @ o.float())
+    gram = o.float().T @ o.float()
     eye = torch.eye(32)
     err = (gram - eye).abs().max().item()
     # Loose bound — CPU bf16 NS5 lands ~0.2-0.4 on random Gaussian.
@@ -1555,7 +1617,7 @@ def test_newton_schulz_handles_fat_matrix():
     torch.manual_seed(0)
     g = torch.randn(32, 64)  # fat
     o = newton_schulz5(g, steps=5)
-    gram = (o.float() @ o.float().T)
+    gram = o.float() @ o.float().T
     eye = torch.eye(32)
     err = (gram - eye).abs().max().item()
     assert err < 0.5, f"Fat-matrix Gram - I max-deviation {err}"
@@ -1565,7 +1627,6 @@ def test_muon_rejects_non_2d_params():
     """Muon must reject 1D / scalar params at construction so the user
     sees the misuse before the first step()."""
     import pytest as _pytest
-
     from nano_osrt.muon import Muon
 
     one_d = torch.nn.Parameter(torch.zeros(8))
@@ -1612,7 +1673,8 @@ def test_build_param_groups_routes_correctly_for_full_model():
     cfg = tiny_config()
     model = NanoOSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
-        model.named_parameters(), weight_decay=0.1,
+        model.named_parameters(),
+        weight_decay=0.1,
     )
 
     # Every Muon param is 2D and not an embedding.
@@ -1623,9 +1685,9 @@ def test_build_param_groups_routes_correctly_for_full_model():
     # explicit 2D allowlist: token embedding, loop_embeddings, router.
     # All other 2D weights belong in Muon.
     adamw_2d_allowlist = {
-        (cfg.vocab_size, cfg.dim),            # token embedding
-        (cfg.recursive_loops, cfg.dim),       # loop_embeddings
-        (cfg.num_routed_experts, cfg.dim),    # router
+        (cfg.vocab_size, cfg.dim),  # token embedding
+        (cfg.recursive_loops, cfg.dim),  # loop_embeddings
+        (cfg.num_routed_experts, cfg.dim),  # router
     }
     adamw_params = [p for g in adamw_groups for p in g["params"]]
     assert len(adamw_params) > 0
@@ -1633,15 +1695,15 @@ def test_build_param_groups_routes_correctly_for_full_model():
         is_norm_or_scalar = p.ndim < 2
         is_allowlisted_2d = p.ndim == 2 and tuple(p.shape) in adamw_2d_allowlist
         assert is_norm_or_scalar or is_allowlisted_2d, (
-            f"AdamW group shouldn't contain matrix weight of shape "
-            f"{tuple(p.shape)}"
+            f"AdamW group shouldn't contain matrix weight of shape {tuple(p.shape)}"
         )
 
     # The wd=0 group should contain at least the router and loop_embedding
     # tensors. Identify them by shape: router is (E, D), loop_embeddings
     # is (recursive_loops, D).
     no_decay_group = next(
-        (g for g in adamw_groups if g["weight_decay"] == 0.0), None,
+        (g for g in adamw_groups if g["weight_decay"] == 0.0),
+        None,
     )
     assert no_decay_group is not None
     no_decay_shapes = {tuple(p.shape) for p in no_decay_group["params"]}
@@ -1661,16 +1723,15 @@ def test_hybrid_optimizer_step_updates_both_kinds_of_params():
     cfg = tiny_config()
     model = NanoOSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
-        model.named_parameters(), weight_decay=0.0,
+        model.named_parameters(),
+        weight_decay=0.0,
     )
     muon = Muon(muon_params, lr=0.01)
     adamw = torch.optim.AdamW(adamw_groups, lr=1e-3)
     hybrid = HybridMuonAdamW(muon, adamw)
 
     # Snapshot one Muon-managed and one AdamW-managed parameter.
-    qkv_weight_before = (
-        model.model.blocks[0].qkv.weight.detach().clone()
-    )
+    qkv_weight_before = model.model.blocks[0].qkv.weight.detach().clone()
     embedding_before = model.model.embedding.weight.detach().clone()
 
     x = torch.randint(0, cfg.vocab_size, (1, 8))
@@ -1680,11 +1741,14 @@ def test_hybrid_optimizer_step_updates_both_kinds_of_params():
     hybrid.step()
 
     qkv_diff = (
-        model.model.blocks[0].qkv.weight.detach() - qkv_weight_before
-    ).abs().max().item()
+        (model.model.blocks[0].qkv.weight.detach() - qkv_weight_before)
+        .abs()
+        .max()
+        .item()
+    )
     emb_diff = (
-        model.model.embedding.weight.detach() - embedding_before
-    ).abs().max().item()
+        (model.model.embedding.weight.detach() - embedding_before).abs().max().item()
+    )
     assert qkv_diff > 0, "Muon should have updated qkv.weight"
     assert emb_diff > 0, "AdamW should have updated embedding.weight"
 
@@ -1696,7 +1760,8 @@ def test_hybrid_optimizer_state_dict_roundtrip():
     cfg = tiny_config()
     model = NanoOSRTForCausalLM(cfg)
     muon_params, adamw_groups = build_param_groups(
-        model.named_parameters(), weight_decay=0.0,
+        model.named_parameters(),
+        weight_decay=0.0,
     )
     hybrid = HybridMuonAdamW(
         Muon(muon_params, lr=0.01),
@@ -1715,7 +1780,8 @@ def test_hybrid_optimizer_state_dict_roundtrip():
     # Build a fresh hybrid and load.
     model2 = NanoOSRTForCausalLM(cfg)
     muon_params2, adamw_groups2 = build_param_groups(
-        model2.named_parameters(), weight_decay=0.0,
+        model2.named_parameters(),
+        weight_decay=0.0,
     )
     hybrid2 = HybridMuonAdamW(
         Muon(muon_params2, lr=0.01),

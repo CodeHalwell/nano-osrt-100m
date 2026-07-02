@@ -24,8 +24,13 @@ image = (
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
     )
     .pip_install(
-        "transformers", "datasets", "tokenizers", "safetensors",
-        "lm-eval", "langdetect", "immutabledict",
+        "transformers",
+        "datasets",
+        "tokenizers",
+        "safetensors",
+        "lm-eval",
+        "langdetect",
+        "immutabledict",
     )
     .add_local_dir("src/nano_osrt", remote_path="/root/nano_osrt")
 )
@@ -48,9 +53,8 @@ def _run_benchmark(
     import torch.nn.functional as F
     from lm_eval import evaluator as lmeval
     from lm_eval.api.model import LM
-    from transformers import AutoTokenizer
-
     from nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
+    from transformers import AutoTokenizer
 
     print("=" * 60, flush=True)
     print(f"v3 BENCHMARK -- Config {config_name}", flush=True)
@@ -75,7 +79,9 @@ def _run_benchmark(
             config = NanoOSRTConfig()
             self.model = NanoOSRTForCausalLM(config)
             ckpt = torch.load(
-                ckpt_path, map_location="cuda", weights_only=True,
+                ckpt_path,
+                map_location="cuda",
+                weights_only=True,
             )
             state_dict = ckpt.get("model_state_dict", ckpt)
             self.model.load_state_dict(state_dict, strict=False)
@@ -130,16 +136,14 @@ def _run_benchmark(
         def _model_call(self, inps):
             with torch.no_grad():
                 out = self.model(inps.to(self._device))
-                return out["logits"][:, :, :self.vocab_size]
+                return out["logits"][:, :, : self.vocab_size]
 
         def _log_ll_progress(self, total):
             self._ll_done += 1
             if self._ll_start is None:
                 self._ll_start = time.time()
             should = (
-                self._ll_done == 1
-                or self._ll_done % 200 == 0
-                or self._ll_done == total
+                self._ll_done == 1 or self._ll_done % 200 == 0 or self._ll_done == total
             )
             if should:
                 elapsed = time.time() - self._ll_start
@@ -180,10 +184,12 @@ def _run_benchmark(
                 ctx_ids = self.tok_encode(context)
                 cont_ids = self.tok_encode(continuation)
                 full_ids = torch.tensor(
-                    [ctx_ids + cont_ids], dtype=torch.long, device=self._device,
+                    [ctx_ids + cont_ids],
+                    dtype=torch.long,
+                    device=self._device,
                 )
                 if full_ids.shape[1] > self.max_length:
-                    full_ids = full_ids[:, -self.max_length:]
+                    full_ids = full_ids[:, -self.max_length :]
                     ctx_len = max(
                         0,
                         len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length),
@@ -192,18 +198,17 @@ def _run_benchmark(
                     ctx_len = len(ctx_ids)
 
                 logits = self._model_call(full_ids)
-                shift_logits = logits[0, ctx_len - 1:-1, :]
+                shift_logits = logits[0, ctx_len - 1 : -1, :]
                 shift_labels = full_ids[0, ctx_len:]
 
                 log_probs = F.log_softmax(shift_logits.float(), dim=-1)
                 token_log_probs = log_probs.gather(
-                    1, shift_labels.unsqueeze(1),
+                    1,
+                    shift_labels.unsqueeze(1),
                 ).squeeze(1)
 
                 total_ll = token_log_probs.sum().item()
-                is_greedy = (
-                    shift_logits.argmax(dim=-1) == shift_labels
-                ).all().item()
+                is_greedy = (shift_logits.argmax(dim=-1) == shift_labels).all().item()
                 results.append((total_ll, is_greedy))
                 self._log_ll_progress(total)
             return results
@@ -217,10 +222,12 @@ def _run_benchmark(
                 (string,) = req.args
                 ids = self.tok_encode(string)
                 full_ids = torch.tensor(
-                    [ids], dtype=torch.long, device=self._device,
+                    [ids],
+                    dtype=torch.long,
+                    device=self._device,
                 )
                 if full_ids.shape[1] > self.max_length:
-                    full_ids = full_ids[:, -self.max_length:]
+                    full_ids = full_ids[:, -self.max_length :]
 
                 logits = self._model_call(full_ids)
                 shift_logits = logits[0, :-1, :]
@@ -228,7 +235,8 @@ def _run_benchmark(
 
                 log_probs = F.log_softmax(shift_logits.float(), dim=-1)
                 token_log_probs = log_probs.gather(
-                    1, shift_labels.unsqueeze(1),
+                    1,
+                    shift_labels.unsqueeze(1),
                 ).squeeze(1)
                 results.append((token_log_probs.sum().item(),))
                 self._log_ll_progress(total)
@@ -248,7 +256,7 @@ def _run_benchmark(
                 ctx_ids = self.tok_encode(context)
                 ctx_tensor = torch.tensor([ctx_ids], dtype=torch.long)
                 if ctx_tensor.shape[1] > self.max_length - max_gen:
-                    ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen):]
+                    ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen) :]
 
                 output = self.model.generate(
                     ctx_tensor.to(self._device),
@@ -260,11 +268,11 @@ def _run_benchmark(
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
 
-                new_tokens = output[0, ctx_tensor.shape[1]:]
+                new_tokens = output[0, ctx_tensor.shape[1] :]
                 response = self.tok_decode(new_tokens.tolist())
                 for stop_seq in until:
                     if stop_seq in response:
-                        response = response[:response.index(stop_seq)]
+                        response = response[: response.index(stop_seq)]
                 results.append(response)
                 self._log_gen_progress(total)
             return results

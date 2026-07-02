@@ -28,18 +28,15 @@ class NanoOSRTv4Config(PretrainedConfig):
         dim: int = 1536,
         heads: int = 24,
         head_dim: int = 64,
-        vocab_size: int = 32768,   # 32K vocab — more of the budget in the transformer body
+        vocab_size: int = 32768,  # 32K vocab — more of the budget in the transformer body
         real_vocab_size: int = 32768,
-
         # Recursive structure
         num_blocks: int = 3,
         recursive_loops: int = 6,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
-
         # Dense FFN
         dense_hidden: int = 4096,
-
         # MoE
         num_experts: int = 12,
         num_shared_experts: int = 1,
@@ -158,15 +155,12 @@ class NanoOSRTv4Config(PretrainedConfig):
         # differentiation at init. At 0.02, loop_emb contribution to router
         # logits is ~0.016 vs ~0.78 from x → effectively invisible.
         loop_embedding_init_std: float = 0.1,
-
         # Sequence length
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
-
         # Training defaults
         initializer_range: float = 0.02,
-
         # Token IDs (must match tokenizer special tokens)
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -182,7 +176,6 @@ class NanoOSRTv4Config(PretrainedConfig):
         user_token_id: int = 11,
         assistant_token_id: int = 12,
         system_token_id: int = 13,
-
         **kwargs,
     ):
         self.dim = dim

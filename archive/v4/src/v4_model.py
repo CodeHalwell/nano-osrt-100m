@@ -28,12 +28,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from nano_osrt.v4_config import NanoOSRTv4Config
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-from nano_osrt.v4_config import NanoOSRTv4Config
 
 # ── RoPE ────────────────────────────────────────────────────────────────
 
@@ -65,14 +64,24 @@ def compute_rope_freqs(
             effective_theta = theta * (factor ** (dim / (dim - 2)))
 
     freqs = 1.0 / (
-        effective_theta ** (
-            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim
+        effective_theta
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
+            / dim
         )
     )
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
+    cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
+    sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
     return cos, sin
 
 
@@ -227,7 +236,10 @@ class MoELayer(nn.Module):
 
         # Routed experts
         self.experts = nn.ModuleList(
-            [ExpertFFN(config.dim, config.expert_hidden) for _ in range(self.num_routed)]
+            [
+                ExpertFFN(config.dim, config.expert_hidden)
+                for _ in range(self.num_routed)
+            ]
         )
 
         # Router: projects hidden state to expert scores. Loop-aware: we
@@ -296,7 +308,9 @@ class MoELayer(nn.Module):
         ]
         # Capacity-capped telemetry
         self.last_overflow_rate: list[float] = [0.0] * config.recursive_loops
-        self.last_assigned_per_token: list[float] = [float(self.top_k)] * config.recursive_loops
+        self.last_assigned_per_token: list[float] = [
+            float(self.top_k)
+        ] * config.recursive_loops
         self.last_candidate_rank_mean: list[float] = [0.0] * config.recursive_loops
 
     def forward(self, x: Tensor, loop_idx: int) -> Tensor:
@@ -328,7 +342,9 @@ class MoELayer(nn.Module):
         # phase jitter only; applying it during soft dispatch would
         # perturb the balance loss targets without any routing benefit.
         if self.training and self.routing_mode == 2:
-            router_logits = router_logits + torch.randn_like(router_logits) * self.noise_std
+            router_logits = (
+                router_logits + torch.randn_like(router_logits) * self.noise_std
+            )
 
         # Differentiable balance losses always use the softmax distribution,
         # regardless of routing mode. We compute soft_probs here so it's
@@ -354,27 +370,39 @@ class MoELayer(nn.Module):
                         )
                         cand_s, cand_i = torch.topk(
                             sig.reshape(N, self.num_routed),
-                            self.candidate_k, dim=-1,
+                            self.candidate_k,
+                            dim=-1,
                         )
                         shadow_assigned, shadow_raw = self._shadow_capped(
-                            cand_i, N, cap, sig, B, S, loop_idx,
+                            cand_i,
+                            N,
+                            cap,
+                            sig,
+                            B,
+                            S,
+                            loop_idx,
                         )
                         self._record_hard_telemetry(
-                            soft_probs, shadow_assigned, shadow_assigned,
-                            shadow_raw, loop_idx,
+                            soft_probs,
+                            shadow_assigned,
+                            shadow_assigned,
+                            shadow_raw,
+                            loop_idx,
                         )
                     else:
                         noisy_idx, clean_biased_idx, clean_raw_idx = (
                             self._shadow_selections(router_logits)
                         )
                         self._record_hard_telemetry(
-                            soft_probs, noisy_idx, clean_biased_idx,
-                            clean_raw_idx, loop_idx,
+                            soft_probs,
+                            noisy_idx,
+                            clean_biased_idx,
+                            clean_raw_idx,
+                            loop_idx,
                         )
                 if self.bias_enabled:
                     self._accumulate_balance_counts(
-                        shadow_assigned if self.capacity_capped
-                        else clean_biased_idx
+                        shadow_assigned if self.capacity_capped else clean_biased_idx
                     )
         elif mode == 2:
             # Pure hard dispatch
@@ -391,12 +419,13 @@ class MoELayer(nn.Module):
                 routed_out = routed_flat.view(B, S, D)
                 if self.training:
                     with torch.no_grad():
-                        raw_idx = torch.topk(
-                            router_logits, self.top_k, dim=-1
-                        ).indices
+                        raw_idx = torch.topk(router_logits, self.top_k, dim=-1).indices
                     self._record_hard_telemetry(
-                        soft_probs, top_k_indices, top_k_indices,
-                        raw_idx, loop_idx,
+                        soft_probs,
+                        top_k_indices,
+                        top_k_indices,
+                        raw_idx,
+                        loop_idx,
                     )
         else:
             # Blend — soft + hard, mixed by alpha.
@@ -436,7 +465,11 @@ class MoELayer(nn.Module):
         Returns (capped_indices, raw_indices) both (B, S, top_k).
         """
         assigned, _, slots_filled, rank_sum = self._assign_with_caps(
-            cand_indices, None, N, capacity, sig.device,
+            cand_indices,
+            None,
+            N,
+            capacity,
+            sig.device,
         )
 
         # Record capacity telemetry from the shadow computation
@@ -444,16 +477,14 @@ class MoELayer(nn.Module):
             self.last_overflow_rate[loop_idx] = (
                 (slots_filled < self.top_k).float().mean().item()
             )
-            self.last_assigned_per_token[loop_idx] = (
-                slots_filled.float().mean().item()
-            )
+            self.last_assigned_per_token[loop_idx] = slots_filled.float().mean().item()
             filled = slots_filled.clamp_min(1).float()
-            self.last_candidate_rank_mean[loop_idx] = (
-                (rank_sum / filled).mean().item()
-            )
+            self.last_candidate_rank_mean[loop_idx] = (rank_sum / filled).mean().item()
 
         raw_idx = torch.topk(
-            sig.reshape(N, self.num_routed), self.top_k, dim=-1,
+            sig.reshape(N, self.num_routed),
+            self.top_k,
+            dim=-1,
         ).indices.view(B, S, self.top_k)
         return assigned.view(B, S, self.top_k), raw_idx
 
@@ -494,17 +525,17 @@ class MoELayer(nn.Module):
             if (slots_filled >= self.top_k).all():
                 break
 
-            eid_col = cand_indices[:, rank]                       # (N,)
-            eligible = slots_filled < self.top_k                  # (N,) bool
+            eid_col = cand_indices[:, rank]  # (N,)
+            eligible = slots_filled < self.top_k  # (N,) bool
 
-            eligible_idx = eligible.nonzero(as_tuple=True)[0]     # (M,)
+            eligible_idx = eligible.nonzero(as_tuple=True)[0]  # (M,)
             if eligible_idx.numel() == 0:
                 break
-            eligible_eid = eid_col[eligible_idx]                  # (M,)
+            eligible_eid = eid_col[eligible_idx]  # (M,)
 
             # Sort eligible tokens by expert ID for grouping
-            sorted_order = eligible_eid.argsort(stable=True)      # (M,)
-            sorted_eid = eligible_eid[sorted_order]               # (M,)
+            sorted_order = eligible_eid.argsort(stable=True)  # (M,)
+            sorted_eid = eligible_eid[sorted_order]  # (M,)
             M = sorted_eid.shape[0]
 
             # Compute within-group position via segment-cumsum trick:
@@ -513,32 +544,32 @@ class MoELayer(nn.Module):
             if M > 1:
                 group_change[1:] = (sorted_eid[1:] != sorted_eid[:-1]).long()
             # group_id per position (0-based)
-            group_id = torch.cumsum(group_change, dim=0) - 1      # (M,)
+            group_id = torch.cumsum(group_change, dim=0) - 1  # (M,)
             # Index of the first element of each group
             group_start_positions = group_change.nonzero(as_tuple=True)[0]  # (G,)
             # Map each position to its group's start index
-            start_of_group = group_start_positions[group_id]      # (M,)
+            start_of_group = group_start_positions[group_id]  # (M,)
             # Within-group position = position - start of group
             arange_M = torch.arange(M, device=device)
-            within_group_pos = arange_M - start_of_group          # (M,)
+            within_group_pos = arange_M - start_of_group  # (M,)
 
             # Remaining capacity per expert, indexed per sorted token
-            remaining = (capacity - expert_load).clamp(min=0)     # (num_routed,)
-            remaining_per_token = remaining[sorted_eid]           # (M,)
+            remaining = (capacity - expert_load).clamp(min=0)  # (num_routed,)
+            remaining_per_token = remaining[sorted_eid]  # (M,)
 
             # Token fits if its within-group position < remaining capacity
-            fits = within_group_pos < remaining_per_token         # (M,) bool
+            fits = within_group_pos < remaining_per_token  # (M,) bool
 
             # Map back from sorted order to eligible-token order
             fits_orig = torch.zeros(M, dtype=torch.bool, device=device)
             fits_orig[sorted_order] = fits
             # Indices into the full N-sized arrays for tokens that get assigned
-            take = eligible_idx[fits_orig]                        # (T,)
+            take = eligible_idx[fits_orig]  # (T,)
 
             if take.numel() == 0:
                 continue
 
-            take_eid = eid_col[take]                              # (T,)
+            take_eid = eid_col[take]  # (T,)
             sidx = slots_filled[take]
             assigned[take, sidx] = take_eid
             if cand_scores is not None:
@@ -548,17 +579,22 @@ class MoELayer(nn.Module):
 
             # Update expert load counts
             assigned_counts = torch.zeros(
-                self.num_routed, dtype=torch.long, device=device,
+                self.num_routed,
+                dtype=torch.long,
+                device=device,
             )
             assigned_counts.scatter_add_(
-                0, take_eid, torch.ones_like(take_eid),
+                0,
+                take_eid,
+                torch.ones_like(take_eid),
             )
             expert_load += assigned_counts
 
         return assigned, assigned_w, slots_filled, rank_sum
 
     def _shadow_selections(
-        self, router_logits: Tensor,
+        self,
+        router_logits: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute three top-k index sets for telemetry + bias update.
 
@@ -679,7 +715,9 @@ class MoELayer(nn.Module):
         # Gather CLEAN sigmoid weights for the selected experts
         clean_sig = torch.sigmoid(router_logits)
         top_k_weights = clean_sig.gather(-1, top_k_indices)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        top_k_weights = top_k_weights / top_k_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
         return top_k_weights, top_k_indices
 
     @torch._dynamo.disable
@@ -703,7 +741,10 @@ class MoELayer(nn.Module):
 
     @torch._dynamo.disable
     def _capped_dispatch(
-        self, x: Tensor, router_logits: Tensor, loop_idx: int,
+        self,
+        x: Tensor,
+        router_logits: Tensor,
+        loop_idx: int,
     ) -> Tensor:
         """Capacity-capped expert dispatch.
 
@@ -727,16 +768,20 @@ class MoELayer(nn.Module):
 
         sig = torch.sigmoid(router_logits)
         cand_scores, cand_indices = torch.topk(
-            sig.reshape(N, self.num_routed), self.candidate_k, dim=-1,
+            sig.reshape(N, self.num_routed),
+            self.candidate_k,
+            dim=-1,
         )
         flat_x = x.reshape(N, D)
 
-        capacity = math.ceil(
-            self.capacity_factor * N * self.top_k / self.num_routed
-        )
+        capacity = math.ceil(self.capacity_factor * N * self.top_k / self.num_routed)
 
         assigned, assigned_w, slots_filled, rank_sum = self._assign_with_caps(
-            cand_indices, cand_scores, N, capacity, x.device,
+            cand_indices,
+            cand_scores,
+            N,
+            capacity,
+            x.device,
         )
 
         # Renormalize weights over actually-assigned experts (unfilled
@@ -748,7 +793,10 @@ class MoELayer(nn.Module):
 
         dispatch_idx = assigned.clamp(min=0)
         routed_out = self._dispatch_experts(
-            flat_x, dispatch_idx, assigned_w, D,
+            flat_x,
+            dispatch_idx,
+            assigned_w,
+            D,
         )
 
         # Record capacity telemetry
@@ -756,13 +804,9 @@ class MoELayer(nn.Module):
             self.last_overflow_rate[loop_idx] = (
                 (slots_filled < self.top_k).float().mean().item()
             )
-            self.last_assigned_per_token[loop_idx] = (
-                slots_filled.float().mean().item()
-            )
+            self.last_assigned_per_token[loop_idx] = slots_filled.float().mean().item()
             filled = slots_filled.clamp_min(1).float()
-            self.last_candidate_rank_mean[loop_idx] = (
-                (rank_sum / filled).mean().item()
-            )
+            self.last_candidate_rank_mean[loop_idx] = (rank_sum / filled).mean().item()
 
         # Record routing histogram telemetry (reuse existing method).
         # Capped assignment is both the training and inference path, so
@@ -771,19 +815,29 @@ class MoELayer(nn.Module):
         if self.training:
             with torch.no_grad():
                 raw_idx = torch.topk(
-                    sig.reshape(N, self.num_routed), self.top_k, dim=-1,
+                    sig.reshape(N, self.num_routed),
+                    self.top_k,
+                    dim=-1,
                 ).indices.view(B, S, self.top_k)
             soft_probs = F.softmax(router_logits / self.temperature, dim=-1)
             capped_idx = assigned.view(B, S, self.top_k)
             self._record_hard_telemetry(
-                soft_probs, capped_idx, capped_idx, raw_idx, loop_idx,
+                soft_probs,
+                capped_idx,
+                capped_idx,
+                raw_idx,
+                loop_idx,
             )
 
         return routed_out.view(B, S, D)
 
     @torch._dynamo.disable
     def _dispatch_experts(
-        self, flat_x: Tensor, flat_indices: Tensor, flat_weights: Tensor, D: int,
+        self,
+        flat_x: Tensor,
+        flat_indices: Tensor,
+        flat_weights: Tensor,
+        D: int,
     ) -> Tensor:
         """Batch tokens by expert, run each expert once, scatter back.
 
@@ -799,9 +853,11 @@ class MoELayer(nn.Module):
         N = flat_x.shape[0]  # B*S
 
         # Expand for top-k: each token appears top_k times
-        x_rep = flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*top_k, D)
-        idx_flat = flat_indices.reshape(-1)        # (N*top_k,)
-        w_flat = flat_weights.reshape(-1, 1)       # (N*top_k, 1)
+        x_rep = (
+            flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
+        )  # (N*top_k, D)
+        idx_flat = flat_indices.reshape(-1)  # (N*top_k,)
+        w_flat = flat_weights.reshape(-1, 1)  # (N*top_k, 1)
 
         # Sort by expert for batched execution
         sorted_order = idx_flat.argsort(stable=True)
@@ -821,7 +877,9 @@ class MoELayer(nn.Module):
             if count == 0:
                 continue
             expert_in = sorted_x[offset : offset + count]
-            sorted_out[offset : offset + count] = self.experts[eid](expert_in) * sorted_w[offset : offset + count]
+            sorted_out[offset : offset + count] = (
+                self.experts[eid](expert_in) * sorted_w[offset : offset + count]
+            )
             offset += count
 
         # Unsort and reduce across top-k
@@ -911,6 +969,7 @@ class MoELayer(nn.Module):
         The decisive health metric is the clean biased view because
         the bias is part of the routing mechanism.
         """
+
         def _hist(indices: Tensor) -> tuple[list[float], float]:
             flat = indices.reshape(-1)
             # Filter out -1 entries (unfilled capacity-capped slots)
@@ -936,7 +995,9 @@ class MoELayer(nn.Module):
             self.last_assignment_entropy[loop_idx] = entropy
 
         # Clean biased (inference path) histogram
-        cb_src = clean_biased_indices if clean_biased_indices is not None else top_k_indices
+        cb_src = (
+            clean_biased_indices if clean_biased_indices is not None else top_k_indices
+        )
         fractions, entropy = _hist(cb_src)
         if 0 <= loop_idx < len(self.last_clean_expert_fraction):
             self.last_clean_expert_fraction[loop_idx] = fractions
@@ -1070,7 +1131,7 @@ class RecursiveBlockV4(nn.Module):
                 q, k, v, attn_mask=attn_mask, is_causal=False
             )
         else:
-            is_causal = (q_len == k_len)
+            is_causal = q_len == k_len
             attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
@@ -1159,12 +1220,16 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         # Per-pass adapters (num_blocks × recursive_loops pairs)
         total_pairs = config.num_blocks * config.recursive_loops
         self.adapters_a = nn.ParameterList(
-            [nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
+                for _ in range(total_pairs)
+            ]
         )
         self.adapters_b = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
-             for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
 
@@ -1188,7 +1253,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> tuple[Tensor, list[Tensor], Tensor, Tensor, Tensor, list[tuple[Tensor, Tensor]] | None]:
+    ) -> tuple[
+        Tensor, list[Tensor], Tensor, Tensor, Tensor, list[tuple[Tensor, Tensor]] | None
+    ]:
         """Forward pass.
 
         Args:
@@ -1235,7 +1302,9 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                 if layer_past is None:
                     continue
                 key, value = layer_past
-                if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+                if not isinstance(key, torch.Tensor) or not isinstance(
+                    value, torch.Tensor
+                ):
                     raise ValueError(
                         f"past_key_values[{idx}] must contain Tensor "
                         f"key/value pairs, got {type(key).__name__}/{type(value).__name__}."
@@ -1289,25 +1358,42 @@ class NanoOSRTv4Model(NanoOSRTv4PreTrainedModel):
                 adapter_a = self.adapters_a[idx]
                 adapter_b = self.adapters_b[idx]
 
-                layer_past = past_key_values[idx] if past_key_values is not None else None
+                layer_past = (
+                    past_key_values[idx] if past_key_values is not None else None
+                )
 
                 if use_ckpt:
                     # Gradient checkpointing (training only, never with cache).
                     # Wrap in closure to capture non-tensor args.
                     def _block_fn(
-                        _x, _a, _b, _cos, _sin,
-                        _block=block, _scale=self.adapter_scale, _loop=loop,
+                        _x,
+                        _a,
+                        _b,
+                        _cos,
+                        _sin,
+                        _block=block,
+                        _scale=self.adapter_scale,
+                        _loop=loop,
                     ):
                         return _block(_x, _a, _b, _scale, _cos, _sin, _loop)[0]
 
                     x = gradient_checkpoint(
-                        _block_fn, x, adapter_a, adapter_b, cos, sin,
+                        _block_fn,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        cos,
+                        sin,
                         use_reentrant=False,
                     )
                 else:
                     x, present_kv = block(
-                        x, adapter_a, adapter_b,
-                        self.adapter_scale, cos, sin,
+                        x,
+                        adapter_a,
+                        adapter_b,
+                        self.adapter_scale,
+                        cos,
+                        sin,
                         loop_idx=loop,
                         past_key_value=layer_past,
                         use_cache=use_cache,
@@ -1368,7 +1454,9 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :self.config.real_vocab_size].contiguous().float()
+            shift_logits = (
+                logits[..., :-1, : self.config.real_vocab_size].contiguous().float()
+            )
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.config.real_vocab_size),
@@ -1426,7 +1514,7 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                 model_input = generated[:, -1:]
             else:
                 # Prefill: full context (capped to max position embeddings)
-                model_input = generated[:, -self.config.max_position_embeddings:]
+                model_input = generated[:, -self.config.max_position_embeddings :]
 
             outputs = self.forward(
                 model_input,
@@ -1450,17 +1538,20 @@ class NanoOSRTv4ForCausalLM(NanoOSRTv4PreTrainedModel):
                     if cached_len > max_len:
                         past_key_values = [
                             (kv[0][:, :, -max_len:, :], kv[1][:, :, -max_len:, :])
-                            if kv is not None else None
+                            if kv is not None
+                            else None
                             for kv in past_key_values
                         ]
 
-            next_logits = outputs.logits[:, -1, :self.config.real_vocab_size].float()
+            next_logits = outputs.logits[:, -1, : self.config.real_vocab_size].float()
 
             if temperature > 0:
                 next_logits = next_logits / temperature
 
                 if top_k > 0:
-                    topk_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    topk_vals, _ = torch.topk(
+                        next_logits, min(top_k, next_logits.size(-1))
+                    )
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)

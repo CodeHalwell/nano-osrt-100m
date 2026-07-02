@@ -34,12 +34,24 @@ def _compute_rope_freqs(
     if dim % 2 != 0:
         raise ValueError(f"RoPE requires even dimension, got dim={dim}")
     freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2] / dim)
+        theta
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
+            / dim
+        )
     )
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(2)
+    cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
+    sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+        .unsqueeze(0)
+        .unsqueeze(2)
+    )
     return cos, sin
 
 
@@ -56,7 +68,14 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class HRALinear(nn.Module):
     """Linear + parallel high-rank adapter: y = W @ x + scale * (x @ A @ B)."""
 
-    def __init__(self, in_features: int, out_features: int, rank: int, scale: float = 1.0, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        scale: float = 1.0,
+        bias: bool = False,
+    ):
         super().__init__()
         self.original = nn.Linear(in_features, out_features, bias=bias)
         self.scale = scale
@@ -137,8 +156,13 @@ class RecursiveBlock(nn.Module):
         self.ffn = SwiGLU(dim)
 
     def forward(
-        self, x: Tensor, adapter_a: Tensor, adapter_b: Tensor,
-        adapter_scale: float, rope_cos: Tensor, rope_sin: Tensor,
+        self,
+        x: Tensor,
+        adapter_a: Tensor,
+        adapter_b: Tensor,
+        adapter_scale: float,
+        rope_cos: Tensor,
+        rope_sin: Tensor,
         past_kv: tuple[Tensor, Tensor] | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
@@ -180,7 +204,7 @@ class RecursiveBlock(nn.Module):
         # Causal only during prefill (q_len == k_len). During decode with
         # cache (q_len=1, k_len>1), a single query attends to all past keys
         # so no mask is needed.
-        is_causal = (q.shape[2] == k.shape[2])
+        is_causal = q.shape[2] == k.shape[2]
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
 
@@ -216,10 +240,16 @@ class NanoOSRTForCausalLM(nn.Module):
 
         total_pairs = config.num_blocks * config.recursive_loops
         self.adapters_a = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.dim, config.adapter_rank)) for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.dim, config.adapter_rank))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapters_b = nn.ParameterList(
-            [nn.Parameter(torch.zeros(config.adapter_rank, config.dim)) for _ in range(total_pairs)]
+            [
+                nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
+                for _ in range(total_pairs)
+            ]
         )
         self.adapter_scale = config.adapter_alpha / config.adapter_rank
         self.norm_loop = nn.RMSNorm(config.dim)
@@ -235,15 +265,21 @@ class NanoOSRTForCausalLM(nn.Module):
             for name in ("qkv", "out_proj"):
                 layer = getattr(block, name)
                 new_layer = HRALinear(
-                    layer.in_features, layer.out_features,
-                    rank=rank, scale=scale, bias=layer.original.bias is not None,
+                    layer.in_features,
+                    layer.out_features,
+                    rank=rank,
+                    scale=scale,
+                    bias=layer.original.bias is not None,
                 )
                 setattr(block, name, new_layer)
             for name in ("w_gate", "w_up", "w_down"):
                 layer = getattr(block.ffn, name)
                 new_layer = HRALinear(
-                    layer.in_features, layer.out_features,
-                    rank=rank, scale=scale, bias=layer.original.bias is not None,
+                    layer.in_features,
+                    layer.out_features,
+                    rank=rank,
+                    scale=scale,
+                    bias=layer.original.bias is not None,
                 )
                 setattr(block.ffn, name, new_layer)
 
@@ -282,12 +318,10 @@ class NanoOSRTForCausalLM(nn.Module):
                     break
 
         # Slice RoPE for positions past_len..past_len+S-1.
-        cos = self.rope_cos[:, past_len:past_len + S, :, :]
-        sin = self.rope_sin[:, past_len:past_len + S, :, :]
+        cos = self.rope_cos[:, past_len : past_len + S, :, :]
+        sin = self.rope_sin[:, past_len : past_len + S, :, :]
 
-        presents: list[tuple[Tensor, Tensor] | None] | None = (
-            [] if use_cache else None
-        )
+        presents: list[tuple[Tensor, Tensor] | None] | None = [] if use_cache else None
 
         for loop in range(self.config.recursive_loops):
             for block_idx, block in enumerate(self.blocks):
@@ -337,10 +371,10 @@ class NanoOSRTForCausalLM(nn.Module):
 
         # Prefill: one full forward over the input prompt, producing the
         # initial KV cache and logits for the last prompt token.
-        context = generated[:, -self.config.seq_len:]
+        context = generated[:, -self.config.seq_len :]
         out = self.forward(context, use_cache=True)
         past_key_values = out["past_key_values"]
-        next_logits = out["logits"][:, -1, :self.config.real_vocab_size].float()
+        next_logits = out["logits"][:, -1, : self.config.real_vocab_size].float()
 
         for step_idx in range(max_new_tokens):
             if step_idx > 0:
@@ -364,9 +398,7 @@ class NanoOSRTForCausalLM(nn.Module):
                             trimmed.append(None)
                         else:
                             k_tr, v_tr = kv
-                            trimmed.append(
-                                (k_tr[:, :, trim:, :], v_tr[:, :, trim:, :])
-                            )
+                            trimmed.append((k_tr[:, :, trim:, :], v_tr[:, :, trim:, :]))
                     past_key_values = trimmed
                 out = self.forward(
                     new_tok,
@@ -374,9 +406,9 @@ class NanoOSRTForCausalLM(nn.Module):
                     use_cache=True,
                 )
                 past_key_values = out["past_key_values"]
-                next_logits = (
-                    out["logits"][:, -1, :self.config.real_vocab_size].float()
-                )
+                next_logits = out["logits"][
+                    :, -1, : self.config.real_vocab_size
+                ].float()
 
             # Repetition penalty: vectorised boolean mask avoids CPU-GPU sync
             # and supports batch sizes > 1 (original loop hardcoded [0]).
@@ -405,7 +437,9 @@ class NanoOSRTForCausalLM(nn.Module):
 
                 # Top-k filtering
                 if top_k > 0:
-                    topk_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    topk_vals, _ = torch.topk(
+                        next_logits, min(top_k, next_logits.size(-1))
+                    )
                     next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
 
                 # Top-p (nucleus) filtering
@@ -436,13 +470,16 @@ class NanoOSRTForCausalLM(nn.Module):
         # Also save as safetensors if available
         try:
             from safetensors.torch import save_file
+
             save_file(self.state_dict(), os.path.join(save_dir, "model.safetensors"))
         except ImportError:
             pass
         print(f"Model saved to {save_dir}")
 
     @classmethod
-    def from_pretrained(cls, path: str, device: str = "cpu", dtype: torch.dtype | None = None) -> "NanoOSRTForCausalLM":
+    def from_pretrained(
+        cls, path: str, device: str = "cpu", dtype: torch.dtype | None = None
+    ) -> "NanoOSRTForCausalLM":
         """Load model from a directory with config.json and model weights."""
         config = NanoOSRTConfig.from_pretrained(path)
         model = cls(config)
@@ -453,6 +490,7 @@ class NanoOSRTForCausalLM(nn.Module):
 
         if os.path.exists(safetensors_path):
             from safetensors.torch import load_file
+
             state_dict = load_file(safetensors_path, device=device)
         elif os.path.exists(pt_path):
             state_dict = torch.load(pt_path, map_location=device, weights_only=True)

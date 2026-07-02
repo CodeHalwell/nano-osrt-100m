@@ -321,7 +321,7 @@ class V4MoERecoverConfig:
     grad_accum_steps: int = 8
     total_steps: int = 2_000
     warmup_steps: int = 100
-    peak_lr: float = 5e-5          # higher than SFT since only MoE bits train
+    peak_lr: float = 5e-5  # higher than SFT since only MoE bits train
     min_lr: float = 5e-6
     grad_clip: float = 1.0
     log_interval: int = 25
@@ -329,9 +329,9 @@ class V4MoERecoverConfig:
     seq_len: int = 2048
 
     # Routing overrides (applied to model_config at runtime)
-    capacity_factor: float = 2.5   # loosened from 1.25 — router actually drives routing
-    gumbel_tau: float = 0.3        # keep some noise so router can explore
-    diversity_coeff: float = 0.1   # push experts apart
+    capacity_factor: float = 2.5  # loosened from 1.25 — router actually drives routing
+    gumbel_tau: float = 0.3  # keep some noise so router can explore
+    diversity_coeff: float = 0.1  # push experts apart
     reinit_noise_std: float = 0.01
     reinit_seed: int = 1337
 

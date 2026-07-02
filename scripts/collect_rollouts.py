@@ -39,7 +39,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Iterator
+from typing import Iterator
 
 # ── env loading (no external dep) ──────────────────────────────────
 _env_path = Path(__file__).parent.parent / ".env"
@@ -55,18 +55,21 @@ if _env_path.exists():
 try:
     from google import genai
     from google.genai import types as gemini_types  # noqa: N812
+
     _HAS_GEMINI = True
 except ImportError:
     _HAS_GEMINI = False
 
 try:
     from openrouter import OpenRouter
+
     _HAS_OPENROUTER = True
 except ImportError:
     _HAS_OPENROUTER = False
 
 try:
     from openai import OpenAI
+
     _HAS_OPENAI = True
 except ImportError:
     _HAS_OPENAI = False
@@ -74,8 +77,7 @@ except ImportError:
 try:
     from datasets import load_dataset
 except ImportError:
-    print("ERROR: datasets not installed. Run: uv add datasets",
-          file=sys.stderr)
+    print("ERROR: datasets not installed. Run: uv add datasets", file=sys.stderr)
     sys.exit(1)
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent / "rollouts" / "mopd_v1.jsonl"
@@ -86,19 +88,31 @@ TEACHERS = {
     "gemini-3.5-flash": ("gemini", "gemini-3.5-flash", 1.50, 9.00),
     "gemini-2.5-flash": ("gemini", "gemini-2.5-flash", 0.075, 0.30),
     "nemotron-3-ultra-free": (
-        "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", 0.0, 0.0,
+        "openrouter",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        0.0,
+        0.0,
     ),
     "deepseek-or-v3.1": (
-        "openrouter", "deepseek/deepseek-chat-v3.1", 0.27, 1.10,
+        "openrouter",
+        "deepseek/deepseek-chat-v3.1",
+        0.27,
+        1.10,
     ),
     # Direct DeepSeek API (api.deepseek.com via openai-compat). Much
     # higher concurrency limit than OpenRouter (2500 vs ~16). v4-flash
     # is the cheapest reasoning teacher available — $0.14/$0.28 per 1M.
     "deepseek-v4-flash": (
-        "deepseek", "deepseek-v4-flash", 0.14, 0.28,
+        "deepseek",
+        "deepseek-v4-flash",
+        0.14,
+        0.28,
     ),
     "deepseek-v4-pro": (
-        "deepseek", "deepseek-v4-pro", 0.435, 0.87,
+        "deepseek",
+        "deepseek-v4-pro",
+        0.435,
+        0.87,
     ),
 }
 
@@ -115,7 +129,7 @@ class Source:
     name: str
     hf_id: str
     split: str
-    prompt_field: str | None     # if None, use a custom extractor
+    prompt_field: str | None  # if None, use a custom extractor
     extractor: callable | None
     hf_config: str | None = None
 
@@ -209,8 +223,7 @@ def iter_prompts(source_key: str, max_n: int) -> Iterator[tuple[str, str]]:
     src = SOURCES[source_key]
     print(f"[{source_key}] Loading {src.hf_id} ({src.split})...", flush=True)
     if src.hf_config is not None:
-        ds = load_dataset(src.hf_id, src.hf_config, split=src.split,
-                          streaming=True)
+        ds = load_dataset(src.hf_id, src.hf_config, split=src.split, streaming=True)
     else:
         ds = load_dataset(src.hf_id, split=src.split, streaming=True)
     n = 0
@@ -296,9 +309,13 @@ def call_gemini(client, prompt: str, model_id: str) -> dict:
 
     input_tokens = getattr(last_usage, "prompt_token_count", 0) if last_usage else 0
     output_tokens = (
-        getattr(last_usage, "candidates_token_count", 0)
-        + getattr(last_usage, "thoughts_token_count", 0)
-    ) if last_usage else 0
+        (
+            getattr(last_usage, "candidates_token_count", 0)
+            + getattr(last_usage, "thoughts_token_count", 0)
+        )
+        if last_usage
+        else 0
+    )
 
     return {
         "thinking": "".join(thinking_parts).strip(),
@@ -362,7 +379,10 @@ _PROVIDER_FNS = {
 
 
 async def call_teacher_async(
-    client, prompt: str, provider: str, model_id: str,
+    client,
+    prompt: str,
+    provider: str,
+    model_id: str,
     max_retries: int = 5,
 ) -> dict:
     """Provider-dispatching async wrapper with exponential backoff."""
@@ -375,9 +395,11 @@ async def call_teacher_async(
             # Retry on rate limits and 5xx; fail fast on auth / 4xx that
             # are not 429.
             if any(s in msg for s in ("429", "rate", "503", "500", "502", "timeout")):
-                wait = 2 ** attempt + random.random()
-                print(f"  [retry {attempt+1}/{max_retries} in {wait:.1f}s]: {e}",
-                      flush=True)
+                wait = 2**attempt + random.random()
+                print(
+                    f"  [retry {attempt + 1}/{max_retries} in {wait:.1f}s]: {e}",
+                    flush=True,
+                )
                 await asyncio.sleep(wait)
                 continue
             raise
@@ -392,8 +414,7 @@ def _build_client(teacher_key: str):
     model_id, price_in, price_out)."""
     if teacher_key not in TEACHERS:
         raise ValueError(
-            f"Unknown teacher '{teacher_key}'. "
-            f"Available: {list(TEACHERS.keys())}"
+            f"Unknown teacher '{teacher_key}'. Available: {list(TEACHERS.keys())}"
         )
     provider, model_id, price_in, price_out = TEACHERS[teacher_key]
     if provider == "gemini":
@@ -406,12 +427,11 @@ def _build_client(teacher_key: str):
     elif provider == "openrouter":
         if not _HAS_OPENROUTER:
             raise ImportError("openrouter not installed. uv add openrouter")
-        api_key = (os.environ.get("OPEN_ROUTER_API_KEY")
-                   or os.environ.get("OPENROUTER_API_KEY"))
+        api_key = os.environ.get("OPEN_ROUTER_API_KEY") or os.environ.get(
+            "OPENROUTER_API_KEY"
+        )
         if not api_key:
-            raise RuntimeError(
-                "OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set"
-            )
+            raise RuntimeError("OPEN_ROUTER_API_KEY (or OPENROUTER_API_KEY) not set")
         client = OpenRouter(api_key=api_key)
     elif provider == "deepseek":
         if not _HAS_OPENAI:
@@ -431,14 +451,14 @@ async def collect(args: argparse.Namespace) -> None:
     # the real bottleneck (workers stack up waiting for a thread slot).
     # Replace it with one sized to the configured concurrency.
     import concurrent.futures as _cf
+
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(
-        _cf.ThreadPoolExecutor(max_workers=args.concurrency + 50)
-    )
+    loop.set_default_executor(_cf.ThreadPoolExecutor(max_workers=args.concurrency + 50))
     # Bump the OS file-descriptor soft limit so we can hold thousands of
     # concurrent HTTPS connections without "too many open files".
     try:
         import resource
+
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         target = max(soft, args.concurrency * 4 + 256)
         if target > soft:
@@ -459,8 +479,10 @@ async def collect(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     done_ids = load_done_ids(output)
     print(f"Teacher: {args.teacher} → {provider}:{model_id}")
-    print(f"Pricing (per 1M tok): input=${price_in}, output=${price_out}"
-          f"{' (FREE TIER — rate limited)' if price_in == 0 else ''}")
+    print(
+        f"Pricing (per 1M tok): input=${price_in}, output=${price_out}"
+        f"{' (FREE TIER — rate limited)' if price_in == 0 else ''}"
+    )
     print(f"Output: {output}")
     print(f"Resume: {len(done_ids)} rollouts already on disk\n", flush=True)
 
@@ -478,8 +500,10 @@ async def collect(args: argparse.Namespace) -> None:
             count_added += 1
         print(f"[{src_key}] queued {count_added} prompts", flush=True)
 
-    print(f"\nTotal queued: {len(queue)} prompts, concurrency={args.concurrency}",
-          flush=True)
+    print(
+        f"\nTotal queued: {len(queue)} prompts, concurrency={args.concurrency}",
+        flush=True,
+    )
     if not queue:
         print("Nothing to do.", flush=True)
         return
@@ -503,8 +527,7 @@ async def collect(args: argparse.Namespace) -> None:
 
     semaphore = asyncio.Semaphore(args.concurrency)
     start = time.time()
-    stats = {"done": 0, "errors": 0, "input_toks": 0, "output_toks": 0,
-             "cost_usd": 0.0}
+    stats = {"done": 0, "errors": 0, "input_toks": 0, "output_toks": 0, "cost_usd": 0.0}
     # Use an event to signal "budget exceeded — stop spawning new work and
     # stop in-flight workers from sending more requests"
     budget_stop = asyncio.Event()
@@ -519,7 +542,10 @@ async def collect(args: argparse.Namespace) -> None:
             try:
                 t0 = time.time()
                 result = await call_teacher_async(
-                    client, prompt, provider, model_id,
+                    client,
+                    prompt,
+                    provider,
+                    model_id,
                 )
                 rec = {
                     "id": rid,
@@ -544,9 +570,11 @@ async def collect(args: argparse.Namespace) -> None:
                 # Hard stop on budget breach
                 if stats["cost_usd"] >= args.budget_usd:
                     if not budget_stop.is_set():
-                        print(f"\n💸 BUDGET CAP HIT (${stats['cost_usd']:.2f} "
-                              f">= ${args.budget_usd:.2f}). Stopping new work.",
-                              flush=True)
+                        print(
+                            f"\n💸 BUDGET CAP HIT (${stats['cost_usd']:.2f} "
+                            f">= ${args.budget_usd:.2f}). Stopping new work.",
+                            flush=True,
+                        )
                         budget_stop.set()
             except Exception as e:
                 stats["errors"] += 1
@@ -558,44 +586,70 @@ async def collect(args: argparse.Namespace) -> None:
             rate = stats["done"] / elapsed
             remaining = (len(queue) - stats["done"]) / max(rate, 1e-6)
             avg_cost = stats["cost_usd"] / stats["done"]
-            print(f"  [{stats['done']}/{len(queue)}] "
-                  f"{rate:.2f} rps  err={stats['errors']}  "
-                  f"in={stats['input_toks']:,} out={stats['output_toks']:,}  "
-                  f"$={stats['cost_usd']:.2f} (~${avg_cost:.3f}/roll)  "
-                  f"ETA={remaining/60:.1f}m", flush=True)
+            print(
+                f"  [{stats['done']}/{len(queue)}] "
+                f"{rate:.2f} rps  err={stats['errors']}  "
+                f"in={stats['input_toks']:,} out={stats['output_toks']:,}  "
+                f"$={stats['cost_usd']:.2f} (~${avg_cost:.3f}/roll)  "
+                f"ETA={remaining / 60:.1f}m",
+                flush=True,
+            )
 
-    workers = [asyncio.create_task(worker(rid, src_key, prompt))
-               for rid, src_key, prompt in queue]
+    workers = [
+        asyncio.create_task(worker(rid, src_key, prompt))
+        for rid, src_key, prompt in queue
+    ]
     await asyncio.gather(*workers)
     await write_q.put(None)
     await writer_task
 
     elapsed = time.time() - start
     avg_cost = stats["cost_usd"] / max(stats["done"], 1)
-    print(f"\n✅ Done in {elapsed/60:.1f}m. "
-          f"completed={stats['done']}, errors={stats['errors']}, "
-          f"input_toks={stats['input_toks']:,}, "
-          f"output_toks={stats['output_toks']:,}, "
-          f"cost=${stats['cost_usd']:.2f} (avg ${avg_cost:.3f}/rollout)",
-          flush=True)
+    print(
+        f"\n✅ Done in {elapsed / 60:.1f}m. "
+        f"completed={stats['done']}, errors={stats['errors']}, "
+        f"input_toks={stats['input_toks']:,}, "
+        f"output_toks={stats['output_toks']:,}, "
+        f"cost=${stats['cost_usd']:.2f} (avg ${avg_cost:.3f}/rollout)",
+        flush=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT))
-    p.add_argument("--teacher", type=str, default=DEFAULT_TEACHER,
-                   choices=list(TEACHERS.keys()),
-                   help=f"Teacher model. Default: {DEFAULT_TEACHER} (free).")
-    p.add_argument("--sources", nargs="+",
-                   default=["math", "reasoning", "code", "chat", "science"],
-                   help="Subset of: math, reasoning, code, chat, science")
-    p.add_argument("--max-per-source", type=int, default=2_000,
-                   help="Per-source rollout cap (default 2K = ~10K total)")
-    p.add_argument("--concurrency", type=int, default=5,
-                   help="Max in-flight teacher calls. Free OpenRouter "
-                        "models are heavily rate-limited — use 1-2.")
-    p.add_argument("--budget-usd", type=float, default=300.0,
-                   help="Hard stop when accumulated cost reaches this USD")
+    p.add_argument(
+        "--teacher",
+        type=str,
+        default=DEFAULT_TEACHER,
+        choices=list(TEACHERS.keys()),
+        help=f"Teacher model. Default: {DEFAULT_TEACHER} (free).",
+    )
+    p.add_argument(
+        "--sources",
+        nargs="+",
+        default=["math", "reasoning", "code", "chat", "science"],
+        help="Subset of: math, reasoning, code, chat, science",
+    )
+    p.add_argument(
+        "--max-per-source",
+        type=int,
+        default=2_000,
+        help="Per-source rollout cap (default 2K = ~10K total)",
+    )
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Max in-flight teacher calls. Free OpenRouter "
+        "models are heavily rate-limited — use 1-2.",
+    )
+    p.add_argument(
+        "--budget-usd",
+        type=float,
+        default=300.0,
+        help="Hard stop when accumulated cost reaches this USD",
+    )
     return p.parse_args()
 
 

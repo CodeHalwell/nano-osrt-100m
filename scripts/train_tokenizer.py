@@ -238,20 +238,20 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
 
     # Special tokens
     special_tokens = [
-        "<|padding|>",        # 0: pad
+        "<|padding|>",  # 0: pad
         "<|begin_of_text|>",  # 1: bos
-        "<|end_of_text|>",    # 2: eos
-        "<|unknown|>",        # 3: unk
-        "<|fim_prefix|>",     # 4: fill-in-middle (code)
-        "<|fim_middle|>",     # 5: fill-in-middle
-        "<|fim_suffix|>",     # 6: fill-in-middle
-        "<|think|>",          # 7: reasoning open
-        "<|/think|>",         # 8: reasoning close
-        "<|answer|>",         # 9: answer open
-        "<|/answer|>",        # 10: answer close
-        "<|user|>",           # 11: user turn
-        "<|assistant|>",      # 12: assistant turn
-        "<|system|>",         # 13: system prompt
+        "<|end_of_text|>",  # 2: eos
+        "<|unknown|>",  # 3: unk
+        "<|fim_prefix|>",  # 4: fill-in-middle (code)
+        "<|fim_middle|>",  # 5: fill-in-middle
+        "<|fim_suffix|>",  # 6: fill-in-middle
+        "<|think|>",  # 7: reasoning open
+        "<|/think|>",  # 8: reasoning close
+        "<|answer|>",  # 9: answer open
+        "<|/answer|>",  # 10: answer close
+        "<|user|>",  # 11: user turn
+        "<|assistant|>",  # 12: assistant turn
+        "<|system|>",  # 13: system prompt
     ]
 
     trainer = trainers.BpeTrainer(
@@ -264,6 +264,7 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
 
     # Report sample size in MB so the user can estimate training time.
     import os as _os
+
     sample_mb = _os.path.getsize(data_path) / 1e6
     print(
         f"  Training on {sample_mb:.0f} MB of text "
@@ -315,11 +316,18 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
 
     os.makedirs(output_dir, exist_ok=True)
     subprocess.run(
-        [sys.executable, "-m", "superbpe.train",
-         "--input", data_path,
-         "--vocab_size", str(subword_vocab),
-         "--output", f"{output_dir}/stage1",
-         "--pretokenize"],
+        [
+            sys.executable,
+            "-m",
+            "superbpe.train",
+            "--input",
+            data_path,
+            "--vocab_size",
+            str(subword_vocab),
+            "--output",
+            f"{output_dir}/stage1",
+            "--pretokenize",
+        ],
         check=True,
     )
     print(f"  Stage 1 done in {time.time() - t0:.0f}s")
@@ -328,20 +336,34 @@ def train_with_superbpe(data_path: str, vocab_size: int, output_dir: str) -> Non
     print(f"  Stage 2: SuperBPE extension to {vocab_size:,}...")
     t0 = time.time()
     subprocess.run(
-        [sys.executable, "-m", "superbpe.extend",
-         "--input", data_path,
-         "--base_tokenizer", f"{output_dir}/stage1",
-         "--vocab_size", str(vocab_size),
-         "--output", f"{output_dir}/final"],
+        [
+            sys.executable,
+            "-m",
+            "superbpe.extend",
+            "--input",
+            data_path,
+            "--base_tokenizer",
+            f"{output_dir}/stage1",
+            "--vocab_size",
+            str(vocab_size),
+            "--output",
+            f"{output_dir}/final",
+        ],
         check=True,
     )
     print(f"  Stage 2 done in {time.time() - t0:.0f}s")
 
     # Convert to HF format
     subprocess.run(
-        [sys.executable, "-m", "superbpe.construct_hf_tokenizer",
-         "--tokenizer_path", f"{output_dir}/final",
-         "--output_path", output_dir],
+        [
+            sys.executable,
+            "-m",
+            "superbpe.construct_hf_tokenizer",
+            "--tokenizer_path",
+            f"{output_dir}/final",
+            "--output_path",
+            output_dir,
+        ],
         check=True,
     )
 

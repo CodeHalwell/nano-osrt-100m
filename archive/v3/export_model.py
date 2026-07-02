@@ -32,15 +32,21 @@ def download_from_modal(remote_path: str, local_path: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Export NanoOSRT to HF format")
     parser.add_argument(
-        "--checkpoint", type=str, default=None,
+        "--checkpoint",
+        type=str,
+        default=None,
         help="Local path to checkpoint. If not provided, downloads from Modal.",
     )
     parser.add_argument(
-        "--remote-path", type=str, default="checkpoints/osrt100m_code_final.pt",
+        "--remote-path",
+        type=str,
+        default="checkpoints/osrt100m_code_final.pt",
         help="Remote path in Modal volume (default: checkpoints/osrt100m_code_final.pt)",
     )
     parser.add_argument(
-        "--output", type=str, default="./nano-osrt-model",
+        "--output",
+        type=str,
+        default="./nano-osrt-model",
         help="Output directory for HF-format model",
     )
     args = parser.parse_args()
@@ -54,7 +60,7 @@ def main():
             download_from_modal(args.remote_path, ckpt_path)
 
     # Export
-    from src.nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
+    from src.nano_osrt.hf_model import NanoOSRTForCausalLM
 
     print(f"\nLoading checkpoint: {ckpt_path}")
     model = NanoOSRTForCausalLM.from_checkpoint(ckpt_path, device="cpu")
@@ -78,9 +84,11 @@ def main():
         size = os.path.getsize(os.path.join(args.output, f))
         print(f"  {f} ({size / 1e6:.1f} MB)")
 
-    print(f"\nUsage:")
-    print(f'  python inference.py --model {args.output} --prompt "Write a Python function to sort a list"')
-    print(f'  python inference.py --model {args.output} --interactive')
+    print("\nUsage:")
+    print(
+        f'  python inference.py --model {args.output} --prompt "Write a Python function to sort a list"'
+    )
+    print(f"  python inference.py --model {args.output} --interactive")
 
 
 if __name__ == "__main__":

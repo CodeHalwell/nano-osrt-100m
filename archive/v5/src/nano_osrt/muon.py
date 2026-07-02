@@ -61,9 +61,7 @@ def newton_schulz5(g: Tensor, steps: int = _DEFAULT_NS_STEPS) -> Tensor:
     (or rows, if g is fat).
     """
     if g.ndim != 2:
-        raise ValueError(
-            f"newton_schulz5 expects 2D input, got shape {tuple(g.shape)}"
-        )
+        raise ValueError(f"newton_schulz5 expects 2D input, got shape {tuple(g.shape)}")
     a, b, c = _NS_COEFFS
     # Cast to bf16 — NS converges fine and bf16 matmuls are ~2× the
     # throughput of fp32 on H100 tensor cores.

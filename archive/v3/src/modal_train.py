@@ -59,7 +59,11 @@ def get_phase(step: int, cfg: ModalConfig) -> tuple[str, str, str | None]:
     for name, p in cfg.phases.items():
         if p["start"] <= step < p["end"]:
             return name, p["dataset"], p.get("config")
-    return "fineweb", cfg.phases["fineweb"]["dataset"], cfg.phases["fineweb"].get("config")
+    return (
+        "fineweb",
+        cfg.phases["fineweb"]["dataset"],
+        cfg.phases["fineweb"].get("config"),
+    )
 
 
 # ------------------------------------------------------------------
@@ -95,8 +99,7 @@ def log_step(
         if b_mats[0].norm() > 1e-6:
             b0_vecs = [b_mats[i] for i in range(0, len(b_mats), cfg.num_blocks)]
             intra_sims = [
-                F.cosine_similarity(b0_vecs[0], v, dim=0).item()
-                for v in b0_vecs[1:]
+                F.cosine_similarity(b0_vecs[0], v, dim=0).item() for v in b0_vecs[1:]
             ]
             intra_str = "[" + ", ".join(f"{s:.2f}" for s in intra_sims) + "]"
             inter_sims = [
@@ -237,9 +240,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     eff_batch = cfg.batch_size * cfg.grad_accum_steps
     tok_per_step = eff_batch * cfg.seq_len
 
-    print(
-        f"Vocab size          : {cfg.real_vocab_size} (padded to {cfg.vocab_size})"
-    )
+    print(f"Vocab size          : {cfg.real_vocab_size} (padded to {cfg.vocab_size})")
     print(f"Physical parameters : {total_params:>12,}")
     print(
         f"  of which adapters : {adapter_params:>12,} "
@@ -260,9 +261,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
     print(f"Tokens per step     : {tok_per_step:,}")
     print(f"Total token budget  : ~{cfg.total_steps * tok_per_step / 1e9:.1f}B")
     print(f"Optimizer           : {cfg.optimizer_name}")
-    print(
-        "Precision           : FP32 master weights, BF16 compute (autocast)"
-    )
+    print("Precision           : FP32 master weights, BF16 compute (autocast)")
     print()
 
     print("Compiling model with torch.compile...")
@@ -392,15 +391,18 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         if phase_name != current_phase:
             current_phase = phase_name
             print(
-                f"\n>>> Phase: {current_phase} | "
-                f"Dataset: {dataset_name} | Step: {step}"
+                f"\n>>> Phase: {current_phase} | Dataset: {dataset_name} | Step: {step}"
             )
             if current_loader is not None:
                 del current_loader
             print(f"Loading dataset {dataset_name} (streaming)...")
             load_t = time.time()
             current_loader = make_loader(
-                dataset_name, cfg.seq_len, tokenizer_name, cfg.batch_size, step,
+                dataset_name,
+                cfg.seq_len,
+                tokenizer_name,
+                cfg.batch_size,
+                step,
                 dataset_config=ds_config,
             )
             loader_iter = iter(current_loader)
@@ -446,9 +448,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits, loop_rms_tensors = model(input_ids)
-                active_logits = (
-                    logits[..., : cfg.real_vocab_size].contiguous().float()
-                )
+                active_logits = logits[..., : cfg.real_vocab_size].contiguous().float()
                 loss = F.cross_entropy(
                     active_logits.view(-1, cfg.real_vocab_size),
                     labels.view(-1),
@@ -474,9 +474,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
         # --- Logging ---
         # Log frequently during warmup so progress is visible immediately
         should_log = (
-            step % cfg.log_interval == 0
-            or step == 1
-            or (step < 100 and step % 10 == 0)
+            step % cfg.log_interval == 0 or step == 1 or (step < 100 and step % 10 == 0)
         )
         if should_log:
             metrics = log_step(
@@ -512,8 +510,7 @@ def run_training(cfg: ModalConfig, vol, tokenizer_name: str) -> None:
             save_checkpoint(model, optimizer, step, rescue_path)
             vol.commit()
             print(
-                f"\n23h boundary. Rescue checkpoint at step {step}. "
-                "Re-run to resume."
+                f"\n23h boundary. Rescue checkpoint at step {step}. Re-run to resume."
             )
             if use_wandb:
                 wandb.finish()

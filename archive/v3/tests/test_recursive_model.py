@@ -4,7 +4,6 @@ import math
 
 import pytest
 import torch
-
 from nano_osrt.modal_config import ModalConfig
 from nano_osrt.recursive_model import RecursiveBlock, RecursiveNanoOSRT, SwiGLU
 from nano_osrt.rope import apply_rope, compute_rope_freqs
@@ -145,9 +144,7 @@ class TestRecursiveNanoOSRT:
 
     def test_adapter_count(self, tiny_modal_config: ModalConfig) -> None:
         model = RecursiveNanoOSRT(tiny_modal_config)
-        expected = (
-            tiny_modal_config.num_blocks * tiny_modal_config.recursive_loops
-        )
+        expected = tiny_modal_config.num_blocks * tiny_modal_config.recursive_loops
         assert len(model.adapters_a) == expected
         assert len(model.adapters_b) == expected
 

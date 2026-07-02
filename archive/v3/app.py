@@ -15,7 +15,6 @@ checkpoint)::
 """
 
 import modal
-
 from nano_osrt.modal_config import ModalConfig
 
 # NOTE: torch imports are deliberately kept INSIDE train() because Modal
@@ -53,14 +52,16 @@ vol = modal.Volume.from_name("osrt-checkpoints", create_if_missing=True)
     gpu="H100",
     image=image,
     volumes={"/vol/checkpoints": vol},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def train():
     """Run the full training loop inside a Modal H100 container."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.modal_train import run_training
+    from transformers import AutoTokenizer
 
     cfg = ModalConfig()
 
@@ -84,15 +85,17 @@ def train():
     gpu="H100",
     image=image,
     volumes={"/vol/checkpoints": vol},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def sft():
     """Run SFT with chain-of-thought reasoning data."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.sft_config import SFTConfig
     from nano_osrt.sft_train import run_sft
+    from transformers import AutoTokenizer
 
     cfg = SFTConfig()
 
@@ -115,15 +118,17 @@ def sft():
     gpu="H100",
     image=image,
     volumes={"/vol/checkpoints": vol},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def grpo():
     """Run GRPO reinforcement learning with verifiable math rewards."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.grpo_config import GRPOConfig
     from nano_osrt.grpo_train import run_grpo
+    from transformers import AutoTokenizer
 
     cfg = GRPOConfig()
 
@@ -146,15 +151,17 @@ def grpo():
     gpu="H100",
     image=image,
     volumes={"/vol/checkpoints": vol},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def general_sft():
     """Run general instruction SFT after GRPO."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.sft_config import GeneralSFTConfig
     from nano_osrt.sft_train import run_sft
+    from transformers import AutoTokenizer
 
     cfg = GeneralSFTConfig()
 
@@ -177,15 +184,17 @@ def general_sft():
     gpu="H100",
     image=image,
     volumes={"/vol/checkpoints": vol},
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
     timeout=86400,
 )
 def code_sft():
     """Run code-focused SFT after GRPO."""
-    from transformers import AutoTokenizer
-
     from nano_osrt.sft_config import CodeSFTConfig
     from nano_osrt.sft_train import run_sft
+    from transformers import AutoTokenizer
 
     cfg = CodeSFTConfig()
 
@@ -217,9 +226,8 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
     import torch.nn.functional as F
     from lm_eval import evaluator
     from lm_eval.api.model import LM
-    from transformers import AutoTokenizer
-
     from nano_osrt.hf_model import NanoOSRTConfig, NanoOSRTForCausalLM
+    from transformers import AutoTokenizer
 
     class NanoOSRTEval(LM):
         def __init__(self):
@@ -231,8 +239,11 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
             config = NanoOSRTConfig()
             self.model = NanoOSRTForCausalLM(config)
 
-            ckpt = torch.load("/vol/checkpoints/osrt100m_code_final.pt",
-                              map_location="cuda", weights_only=True)
+            ckpt = torch.load(
+                "/vol/checkpoints/osrt100m_code_final.pt",
+                map_location="cuda",
+                weights_only=True,
+            )
             state_dict = ckpt.get("model_state_dict", ckpt)
             self.model.load_state_dict(state_dict, strict=False)
             self.model = self.model.to("cuda")
@@ -274,7 +285,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
         def _model_call(self, inps):
             with torch.no_grad():
                 out = self.model(inps.to(self._device))
-                return out["logits"][:, :, :self.vocab_size]
+                return out["logits"][:, :, : self.vocab_size]
 
         def loglikelihood(self, requests, **kwargs):
             results = []
@@ -285,17 +296,22 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 full_ids = torch.tensor([ctx_ids + cont_ids], dtype=torch.long)
 
                 if full_ids.shape[1] > self.max_length:
-                    full_ids = full_ids[:, -self.max_length:]
-                    ctx_len = max(0, len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length))
+                    full_ids = full_ids[:, -self.max_length :]
+                    ctx_len = max(
+                        0,
+                        len(ctx_ids) - (len(ctx_ids) + len(cont_ids) - self.max_length),
+                    )
                 else:
                     ctx_len = len(ctx_ids)
 
                 logits = self._model_call(full_ids)
-                shift_logits = logits[0, ctx_len - 1:-1, :]
+                shift_logits = logits[0, ctx_len - 1 : -1, :]
                 shift_labels = full_ids[0, ctx_len:].to(self._device)
 
                 log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-                token_log_probs = log_probs.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+                token_log_probs = log_probs.gather(
+                    1, shift_labels.unsqueeze(1)
+                ).squeeze(1)
 
                 total_ll = token_log_probs.sum().item()
                 is_greedy = (shift_logits.argmax(dim=-1) == shift_labels).all().item()
@@ -309,14 +325,16 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 ids = self.tok_encode(string)
                 full_ids = torch.tensor([ids], dtype=torch.long)
                 if full_ids.shape[1] > self.max_length:
-                    full_ids = full_ids[:, -self.max_length:]
+                    full_ids = full_ids[:, -self.max_length :]
 
                 logits = self._model_call(full_ids)
                 shift_logits = logits[0, :-1, :]
                 shift_labels = full_ids[0, 1:].to(self._device)
 
                 log_probs = F.log_softmax(shift_logits.float(), dim=-1)
-                token_log_probs = log_probs.gather(1, shift_labels.unsqueeze(1)).squeeze(1)
+                token_log_probs = log_probs.gather(
+                    1, shift_labels.unsqueeze(1)
+                ).squeeze(1)
                 results.append((token_log_probs.sum().item(),))
             return results
 
@@ -331,7 +349,7 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                 ctx_ids = self.tok_encode(context)
                 ctx_tensor = torch.tensor([ctx_ids], dtype=torch.long)
                 if ctx_tensor.shape[1] > self.max_length - max_gen:
-                    ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen):]
+                    ctx_tensor = ctx_tensor[:, -(self.max_length - max_gen) :]
 
                 output = self.model.generate(
                     ctx_tensor.to(self._device),
@@ -340,12 +358,12 @@ def evaluate(tasks: str = "ifeval", limit: int = 0):
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
 
-                new_tokens = output[0, ctx_tensor.shape[1]:]
+                new_tokens = output[0, ctx_tensor.shape[1] :]
                 response = self.tok_decode(new_tokens.tolist())
 
                 for stop_seq in until:
                     if stop_seq in response:
-                        response = response[:response.index(stop_seq)]
+                        response = response[: response.index(stop_seq)]
 
                 results.append(response)
 
@@ -412,7 +430,7 @@ def main(stage: str = "pretrain"):
             print(f"\n{task}:")
             for k, v in sorted(metrics.items()):
                 if isinstance(v, float):
-                    print(f"  {k}: {v:.4f} ({v*100:.2f}%)")
+                    print(f"  {k}: {v:.4f} ({v * 100:.2f}%)")
                 else:
                     print(f"  {k}: {v}")
     else:

@@ -132,12 +132,12 @@ def inject_hra(
 
     n_hra = sum(p.numel() for p in hra_params)
     n_layers = len(replacements)
-    print(f"  HRA injected: {n_layers} layers, rank {rank}, "
-          f"+{n_hra:,} params ({n_hra / 1e6:.1f}M)")
+    print(
+        f"  HRA injected: {n_layers} layers, rank {rank}, "
+        f"+{n_hra:,} params ({n_hra / 1e6:.1f}M)"
+    )
     if freeze_pretrained:
-        n_frozen = sum(
-            p.numel() for p in model.parameters() if not p.requires_grad
-        )
+        n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
         print(f"  Pretrained weights frozen: {n_frozen:,} params")
 
     return hra_params
@@ -164,26 +164,31 @@ def get_param_groups(
     """
     hra_ids = {id(p) for p in hra_params}
     base_params = [
-        p for p in model.parameters()
-        if p.requires_grad and id(p) not in hra_ids
+        p for p in model.parameters() if p.requires_grad and id(p) not in hra_ids
     ]
 
     groups = []
     if base_params:
-        groups.append({
-            "params": base_params,
-            "lr": base_lr,
+        groups.append(
+            {
+                "params": base_params,
+                "lr": base_lr,
+                "weight_decay": weight_decay,
+                "group_name": "pretrained",
+            }
+        )
+    groups.append(
+        {
+            "params": hra_params,
+            "lr": hra_lr,
             "weight_decay": weight_decay,
-            "group_name": "pretrained",
-        })
-    groups.append({
-        "params": hra_params,
-        "lr": hra_lr,
-        "weight_decay": weight_decay,
-        "group_name": "hra",
-    })
+            "group_name": "hra",
+        }
+    )
 
-    print(f"  Optimizer groups: pretrained ({len(base_params)} tensors, lr={base_lr}) "
-          f"+ HRA ({len(hra_params)} tensors, lr={hra_lr})")
+    print(
+        f"  Optimizer groups: pretrained ({len(base_params)} tensors, lr={base_lr}) "
+        f"+ HRA ({len(hra_params)} tensors, lr={hra_lr})"
+    )
 
     return groups

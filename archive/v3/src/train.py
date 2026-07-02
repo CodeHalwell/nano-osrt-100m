@@ -112,9 +112,7 @@ def train(cfg: TrainConfig) -> NanoOSRT:
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
         for micro_step in range(cfg.grad_accumulation_steps):
-            x, y = get_batch(
-                train_data, cfg.block_size, cfg.batch_size, device
-            )
+            x, y = get_batch(train_data, cfg.block_size, cfg.batch_size, device)
             with ctx:
                 _, loss = model(x, y)
                 loss = loss / cfg.grad_accumulation_steps
@@ -132,7 +130,9 @@ def train(cfg: TrainConfig) -> NanoOSRT:
             dt = time.time() - t0
             t0 = time.time()
             lossf = loss.item() * cfg.grad_accumulation_steps
-            print(f"iter {iter_num}: loss {lossf:.4f}, lr {lr:.2e}, dt {dt*1000:.0f}ms")
+            print(
+                f"iter {iter_num}: loss {lossf:.4f}, lr {lr:.2e}, dt {dt * 1000:.0f}ms"
+            )
             if cfg.wandb_log:
                 wandb.log({"train/loss": lossf, "lr": lr}, step=iter_num)
 
