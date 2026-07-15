@@ -1293,6 +1293,15 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=input_ids.device,
         )
+
+        # Pre-allocate stop_tensor outside the generation loop to avoid host-device
+        # memory transfers on every token generation step.
+        stop_tensor = None
+        if stop_token_ids:
+            valid_stop_ids = [sid for sid in stop_token_ids if sid is not None]
+            if valid_stop_ids:
+                stop_tensor = torch.tensor(valid_stop_ids, device=input_ids.device)
+
         logits_tensor = cast(Tensor, out.logits)
         logits_last = (
             logits_tensor[:, -1, :self.config.real_vocab_size].float()
@@ -1402,9 +1411,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             nt = next_token.squeeze(-1)
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
+            if stop_tensor is not None:
+                # ⚡ Bolt: Vectorize stop checks with torch.isin to eliminate loop overhead.
+                finished = finished | torch.isin(nt, stop_tensor)
             if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
                 break
 
