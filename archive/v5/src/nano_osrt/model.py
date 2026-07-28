@@ -1299,6 +1299,12 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         )
         generated = input_ids.clone()
 
+        stop_tensor = None
+        if stop_token_ids:
+            clean_stop_ids = [s for s in stop_token_ids if s is not None]
+            if clean_stop_ids:
+                stop_tensor = torch.tensor(clean_stop_ids, device=input_ids.device)
+
         for step_idx in range(max_new_tokens):
             if step_idx > 0:
                 # Decode: pass only the newest token + existing cache.
@@ -1324,9 +1330,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 )
                 past_key_values = cast("PastKV | None", out.past_key_values)
                 logits_tensor = cast(Tensor, out.logits)
-                logits_last = (
-                    logits_tensor[:, -1, :self.config.real_vocab_size].float()
-                )
+                logits_last = logits_tensor[
+                    :, -1, : self.config.real_vocab_size
+                ].float()
 
             # Repetition penalty (disabled by default). Vectorised so the
             # cost stays O(B*T) on-device instead of O(B*|set|) Python-loop
@@ -1340,7 +1346,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 vocab = logits_last.shape[-1]
                 # Mask out-of-vocab tokens so gather doesn't touch them.
                 gen_clamped = generated.clamp(max=vocab - 1)
-                in_vocab = (generated < vocab)
+                in_vocab = generated < vocab
                 score = torch.gather(logits_last, 1, gen_clamped)
                 penalised = torch.where(
                     score > 0,
@@ -1357,14 +1363,14 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
                 next_logits = logits_last / temperature
                 if top_k > 0:
                     topk_vals, _ = torch.topk(
-                        next_logits, min(top_k, next_logits.size(-1)),
+                        next_logits,
+                        min(top_k, next_logits.size(-1)),
                     )
-                    next_logits[
-                        next_logits < topk_vals[:, -1:]
-                    ] = float("-inf")
+                    next_logits[next_logits < topk_vals[:, -1:]] = float("-inf")
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(
-                        next_logits, descending=True,
+                        next_logits,
+                        descending=True,
                     )
                     sorted_probs = F.softmax(sorted_logits, dim=-1)
                     cumprobs = torch.cumsum(sorted_probs, dim=-1)
@@ -1402,9 +1408,8 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             nt = next_token.squeeze(-1)
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
             if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
                 break
 
