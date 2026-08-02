@@ -84,9 +84,10 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     if sin.dtype != x.dtype or sin.device != x.device:
         sin = sin.to(device=x.device, dtype=x.dtype)
     d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    x_rot = torch.cat([-x2, x1], dim=-1)
-    return x * cos + x_rot * sin
+    return torch.cat([
+        x[..., :d] * cos[..., :d] - x[..., d:] * sin[..., :d],
+        x[..., d:] * cos[..., d:] + x[..., :d] * sin[..., d:]
+    ], dim=-1)
 
 
 # ── Expert FFN ──────────────────────────────────────────────────────────
@@ -1299,6 +1300,14 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         )
         generated = input_ids.clone()
 
+        # Pre-allocate stop tokens tensor on device to avoid CPU-GPU sync in the generation loop
+        all_stops = []
+        if eos_token_id is not None:
+            all_stops.append(eos_token_id)
+        if stop_token_ids:
+            all_stops.extend([s for s in stop_token_ids if s is not None])
+        stop_tensor = torch.tensor(all_stops, device=input_ids.device) if all_stops else None
+
         for step_idx in range(max_new_tokens):
             if step_idx > 0:
                 # Decode: pass only the newest token + existing cache.
@@ -1400,12 +1409,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             # answer blocks after the first one or try to start a new
             # user turn — stopping on those keeps inference output clean.
             nt = next_token.squeeze(-1)
-            if eos_token_id is not None:
-                finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
-                break
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
+                if bool(finished.all()):
+                    break
 
         return generated
