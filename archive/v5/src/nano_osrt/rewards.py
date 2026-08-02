@@ -1000,7 +1000,7 @@ def mbpp_test_reward(
         return 0.0, {"verdict": "exec_disabled_set_allow_unsafe_exec"}
 
     # Pull a python code block out of the answer if fenced
-    fence = re.search(r"```python\s*\n(.*?)```", answer, re.DOTALL)
+    fence = re.search(r"```python[ \t\r]*\n(.*?)```", answer, re.DOTALL)
     code = fence.group(1) if fence else answer
 
     # Build a test program: model code + all assertions
