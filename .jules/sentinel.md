@@ -22,3 +22,7 @@
 **Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
 **Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
 **Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
+## 2024-06-30 - ReDoS via overlapping trailing character classes
+**Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping adjacent quantifiers at the end of a pattern (`\s*[.\s]*$`).
+**Learning:** Overlapping character classes at the end of a pattern without a matching terminal character causes exponential O(2^N) or O(N^2) backtracking.
+**Prevention:** Remove the redundant overlapping class (e.g., simplify to `[.\s]*$`).
