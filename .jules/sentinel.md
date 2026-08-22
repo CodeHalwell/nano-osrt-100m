@@ -22,3 +22,13 @@
 **Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
 **Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
 **Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
+
+## 2024-06-25 - ReDoS Overlapping Quantifiers at Terminal Boundaries
+**Vulnerability:** The regex `\s*[.\s]*$` contained overlapping adjacent quantifiers at the end of the pattern, creating a ReDoS vulnerability due to catastrophic backtracking (O(N^2)) on adversarial input strings.
+**Learning:** Combining overlapping character classes like `\s*` and `[.\s]*` at the end of a pattern prevents the regex engine from matching efficiently, leading to exponential backtracking when encountering long sequences of the shared character class without a matching terminal character.
+**Prevention:** Remove redundant overlapping classes (e.g., simplify to `[.\s]*$`) to prevent catastrophic overlapping backtracking.
+
+## 2024-06-25 - CRLF Regressions in ReDoS Mitigations
+**Vulnerability:** Replacing `\s*` with `[ \t]*` to prevent ReDoS near `(?:^|\n)` caused functional regressions when the text contained Windows CRLF (`\r\n`) line endings.
+**Learning:** The `[ \t]` character class does not match `\r`. When a ReDoS fix replaces `\s*` with `[ \t]*` next to a newline, it inadvertently fails to match the carriage return in CRLF environments.
+**Prevention:** Use `[ \t\r]*` or `[^\S\n]*` instead of `[ \t]*` when replacing `\s*` near newline boundaries to prevent ReDoS while preserving CRLF compatibility.
