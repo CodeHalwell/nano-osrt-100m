@@ -124,7 +124,7 @@ def extract_numeric_answer_strict(
     concluding = re.search(
         r"(?:answer\s+is|=\s*|therefore[,:]?\s*|so\s+the\s+answer\s+is\s*|"
         r"final\s+answer[\s:]*|=\s*\\boxed\{)"
-        r"\s*\$?(-?\d+(?:[,.]\d+)*)\$?\s*[.\s]*$",
+        r"\s*\$?(-?\d+(?:[,.]\d+)*)\$?[.\s]*$",
         inside,
         flags=re.IGNORECASE,
     )
@@ -530,9 +530,10 @@ def count_reasoning_steps(thinking: str) -> int:
         return 0
 
     # Count numbered steps (1. 2. 3. or Step 1, Step 2)
-    # Prevent ReDoS: use [ \t]* instead of \s* to avoid overlapping \n matches
+    # Prevent ReDoS: use [ \t\r]* instead of \s* to avoid overlapping \n matches
+    # while correctly handling Windows CRLF line endings.
     numbered = re.findall(
-        r"(?:^|\n)[ \t]*(?:\d+[\.\):]|step\s+\d+)",
+        r"(?:^|\n)[ \t\r]*(?:\d+[\.\):]|step\s+\d+)",
         thinking,
         re.IGNORECASE,
     )
