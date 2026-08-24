@@ -85,8 +85,10 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         sin = sin.to(device=x.device, dtype=x.dtype)
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    x_rot = torch.cat([-x2, x1], dim=-1)
-    return x * cos + x_rot * sin
+    # Calculate mathematically on slices directly to avoid large x_rot intermediate
+    part1 = x1 * cos[..., :d] - x2 * sin[..., :d]
+    part2 = x2 * cos[..., d:] + x1 * sin[..., d:]
+    return torch.cat([part1, part2], dim=-1)
 
 
 # ── Expert FFN ──────────────────────────────────────────────────────────
