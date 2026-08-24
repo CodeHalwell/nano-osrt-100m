@@ -17,3 +17,7 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+
+## $(date +%Y-%m-%d) - RoPE Intermediate Tensor Allocation Bottleneck
+**Learning:** In the Rotary Positional Embedding (RoPE) implementation, constructing a rotated tensor via `x_rot = torch.cat([-x2, x1], dim=-1)` followed by `x * cos + x_rot * sin` incurs a massive memory allocation and bandwidth penalty, essentially allocating a full-sized hidden state tensor just for intermediate operations.
+**Action:** Always compute RoPE directly on slice references. Restructuring the math to `torch.cat([x1 * cos1 - x2 * sin1, x2 * cos2 + x1 * sin2], dim=-1)` entirely avoids the intermediate full-size tensor allocation, significantly reducing memory bandwidth bottlenecks and resulting in faster execution on both CPU and GPU environments without changing mathematical output.
