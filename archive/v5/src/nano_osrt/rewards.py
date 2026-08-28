@@ -124,7 +124,7 @@ def extract_numeric_answer_strict(
     concluding = re.search(
         r"(?:answer\s+is|=\s*|therefore[,:]?\s*|so\s+the\s+answer\s+is\s*|"
         r"final\s+answer[\s:]*|=\s*\\boxed\{)"
-        r"\s*\$?(-?\d+(?:[,.]\d+)*)\$?\s*[.\s]*$",
+        r"\s*\$?(-?\d+(?:[,.]\d+)*)\$?[\.\s]*$",
         inside,
         flags=re.IGNORECASE,
     )
