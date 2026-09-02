@@ -22,3 +22,7 @@
 **Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
 **Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
 **Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
+## 2024-06-25 - ReDoS in Concluding Phrase Regex
+**Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches at the end of the `concluding` phrase regex pattern in `archive/v5/src/nano_osrt/rewards.py`.
+**Learning:** Using `\s*` adjacent to `[.\s]*$` causes overlapping backtracking paths (O(N^2) complexity) because `\s` is included in the `[.\s]` character class. This makes parsing vulnerable to crafted inputs with a long sequence of whitespace characters.
+**Prevention:** Remove the redundant adjacent `\s*` quantifier before the terminal `[.\s]*$` to prevent exponential backtracking while maintaining correct functionality.
