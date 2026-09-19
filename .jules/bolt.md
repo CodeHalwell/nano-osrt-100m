@@ -17,3 +17,6 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+## 2025-05-30 - Avoid implicit CPU-GPU syncs in loops with PyTorch
+**Learning:** Checking for stop tokens with explicit loops like `for sid in stop_token_ids: finished = finished | (nt == sid)` in PyTorch generation loops or using list comprehensions like `[t.item() in stop_set for t in comp_region]` causes implicit CPU-GPU syncs on every step/row, causing significant slowdowns in the autoregressive generation loop. Allocating `torch.tensor` inside a hot loop similarly bottlenecks execution due to host-to-device transfers.
+**Action:** Replace explicit loop checks with `torch.isin(tensor, stop_tensor)`. To avoid the host-to-device transfer bottleneck, pre-allocate the `stop_tensor` *outside* of the hot loop using `device=target_device` and filter out any `None` values beforehand.
