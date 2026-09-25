@@ -17,3 +17,7 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+
+## 2025-05-29 - Avoid manually unrolling RoPE equations in eagerness
+**Learning:** Manual unrolling of `torch.cat([-x2, x1], dim=-1)` into `x1 * c1 - x2 * s1` in RoPE increases PyTorch kernel dispatches and makes eager-mode slower. Additionally, `torch.compile` fuses both approaches identically, yielding zero net benefit while making the code brittle.
+**Action:** Do not manually unroll element-wise equations if it increases the number of distinct tensor operations unless there is a verified, reproducible reduction in peak memory. Prefer standard idiomatic RoPE implementations.
