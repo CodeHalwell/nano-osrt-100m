@@ -1011,6 +1011,7 @@ def mbpp_test_reward(
     import signal
     import subprocess
     import tempfile
+    import resource
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1025,6 +1026,20 @@ def mbpp_test_reward(
     }
 
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
+
+    def set_limits():
+        # Limit CPU time to 2 seconds
+        resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+        # Limit memory (address space) to 256MB
+        resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+        # Limit file size to 0 to prevent writing any files
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        # Prevent fork bomb and system calls
+        try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+        except ValueError:
+            pass
+
     proc: subprocess.Popen | None = None
     try:
         # start_new_session=True puts the child into a new process group
@@ -1036,6 +1051,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
