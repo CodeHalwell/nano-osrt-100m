@@ -1011,6 +1011,7 @@ def mbpp_test_reward(
     import signal
     import subprocess
     import tempfile
+    import resource
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1024,6 +1025,15 @@ def mbpp_test_reward(
         # No HOME / TMP — let Python use defaults inside the tempdir cwd.
     }
 
+    # SECURITY: Prevent untrusted code from causing Denial of Service (DoS).
+    # Setting OS-level resource limits prevents malicious or buggy generated code
+    # from exhaustively consuming CPU, RAM (OOM), disk space, or spawning fork bombs.
+    def _set_limits():
+        resource.setrlimit(resource.RLIMIT_CPU, (1, 1))
+        resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NPROC, (10, 10))
+
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
     try:
@@ -1036,6 +1046,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=_set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
