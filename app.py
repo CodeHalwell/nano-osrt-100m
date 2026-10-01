@@ -2933,14 +2933,14 @@ def _run_grpo_multi(sanity: bool = False) -> None:
                 )
 
             # Truncate at first EOS / stop token in completion region.
-            stop_set = {tok.eos_token_id, *cfg.stop_token_ids}
+            # ⚡ Bolt: Pre-allocate stop_tensor outside the loop and use vectorized
+            # torch.isin() to eliminate O(N) host-to-device syncs from .item()
+            valid_stop_ids = [tok.eos_token_id] + [i for i in cfg.stop_token_ids if i is not None]
+            stop_tensor = torch.tensor(valid_stop_ids, dtype=torch.long, device=generated_batch.device)
             completions = []
             for row in generated_batch:
                 comp_region = row[prompt_len:]
-                stop_hits = torch.tensor(
-                    [t.item() in stop_set for t in comp_region],
-                    device=row.device,
-                )
+                stop_hits = torch.isin(comp_region, stop_tensor)
                 hit_pos = stop_hits.nonzero(as_tuple=False)
                 if hit_pos.numel() > 0:
                     first = int(hit_pos[0].item())
