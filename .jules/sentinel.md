@@ -22,3 +22,7 @@
 **Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
 **Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
 **Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
+## 2025-03-05 - Mitigate DoS in Subprocess Execution
+**Vulnerability:** Untrusted code executed via subprocess.Popen in mbpp_test_reward lacked resource limits, allowing potential DoS through CPU/memory exhaustion or fork bombs.
+**Learning:** While the subprocess used start_new_session to kill child process trees and captured stdout with a timeout, the lack of OS-level limits meant malicious code could exhaust system resources before the timeout occurred.
+**Prevention:** Always use a preexec_fn with resource.setrlimit to strictly enforce RLIMIT_CPU, RLIMIT_AS, RLIMIT_FSIZE, and RLIMIT_NPROC bounds on untrusted subprocess executions.

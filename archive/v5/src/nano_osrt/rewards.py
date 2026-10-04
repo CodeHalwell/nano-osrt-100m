@@ -1027,6 +1027,16 @@ def mbpp_test_reward(
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
     try:
+        def set_limits() -> None:
+            import resource
+            mb = 256 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mb, mb))
+            cpu_time = int(timeout_sec) + 2
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_time, cpu_time))
+            fsize = 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
+            resource.setrlimit(resource.RLIMIT_NPROC, (10, 10))
+
         # start_new_session=True puts the child into a new process group
         # so a timeout kill takes down forks too.
         proc = subprocess.Popen(
@@ -1036,6 +1046,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
