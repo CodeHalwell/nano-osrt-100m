@@ -17,3 +17,6 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+## 2024-10-09 - Vectorize PyTorch device-side checks during generation
+**Learning:** In PyTorch generation loops, explicit loops over stop tokens or list comprehensions with `.item()` calls cause implicit device-to-host synchronization, creating massive CPU bottleneck. `torch.isin()` must be used instead, and `stop_tensor` must be allocated *outside* the generation loop to prevent repeated host-to-device transfers on every step.
+**Action:** When implementing stop logic in PyTorch generation, always vectorize checks with `torch.isin` and pre-allocate the stop tensor outside the generation loop. Ensure truthiness checks (`if stop_tensor is not None:`) are used safely.
