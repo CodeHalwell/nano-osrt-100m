@@ -1025,6 +1025,13 @@ def mbpp_test_reward(
     }
 
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
+
+    import resource
+    def set_limits():
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+        resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024, 1024 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+
     proc: subprocess.Popen | None = None
     try:
         # start_new_session=True puts the child into a new process group
@@ -1036,6 +1043,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
