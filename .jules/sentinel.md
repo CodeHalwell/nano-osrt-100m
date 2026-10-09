@@ -22,3 +22,7 @@
 **Vulnerability:** Regular Expression Denial of Service (ReDoS) due to overlapping whitespace matches.
 **Learning:** Using `\s*` adjacent to `(?:^|\n)` causes overlapping backtracking paths (O(N^2) complexity) because `\s` includes `\n`. This makes parsing vulnerable to crafted inputs with alternating spaces and newlines.
 **Prevention:** Use `[ \t]*` or `[^\S\n]*` instead of `\s*` when you only want to match horizontal whitespace next to a newline boundary.
+## 2024-06-25 - Subprocess Resource Exhaustion (DoS)
+**Vulnerability:** The sandboxed `subprocess.Popen` in `mbpp_test_reward` lacks resource limits, allowing untrusted code to exhaust CPU time, memory, or disk space before the timeout occurs.
+**Learning:** Even with an empty environment and short timeouts, a malicious subprocess can fork-bomb or allocate gigabytes of memory, impacting the parent process and triggering Out-Of-Memory (OOM) kills on the host.
+**Prevention:** When executing untrusted Python code via `subprocess.Popen`, always pass a `preexec_fn` callback that uses `resource.setrlimit` to strictly constrain `RLIMIT_CPU`, `RLIMIT_AS` (address space), and `RLIMIT_FSIZE` (file size).
