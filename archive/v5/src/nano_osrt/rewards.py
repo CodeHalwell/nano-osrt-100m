@@ -1011,6 +1011,25 @@ def mbpp_test_reward(
     import signal
     import subprocess
     import tempfile
+    import resource
+
+    def set_limits():
+        try:
+            # Prevent fork bombs / process limits.
+            # Avoid setting RLIMIT_NPROC too low as it might prevent python startup.
+
+            # Limit CPU time (seconds)
+            resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+
+            # Limit memory (Address Space) to ~512 MB
+            mem_limit = 512 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+
+            # Limit file size to ~1 MB to prevent disk exhaustion
+            file_limit = 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        except Exception:
+            pass
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1036,6 +1055,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
