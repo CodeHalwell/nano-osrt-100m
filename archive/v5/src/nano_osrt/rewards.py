@@ -1011,6 +1011,12 @@ def mbpp_test_reward(
     import signal
     import subprocess
     import tempfile
+    import resource
+
+    def set_limits() -> None:
+        resource.setrlimit(resource.RLIMIT_CPU, (int(timeout_sec) + 2, int(timeout_sec) + 2))
+        resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1036,6 +1042,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=set_limits,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
