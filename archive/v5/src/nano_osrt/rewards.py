@@ -1012,6 +1012,12 @@ def mbpp_test_reward(
     import subprocess
     import tempfile
 
+    try:
+        import resource
+        has_resource = True
+    except ImportError:
+        has_resource = False
+
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
     sandbox_env = {
@@ -1026,16 +1032,33 @@ def mbpp_test_reward(
 
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
+
+    def set_limits():
+        # Do not import inside preexec_fn to avoid deadlock risk after fork()
+        if has_resource:
+            resource.setrlimit(resource.RLIMIT_CPU, (int(timeout_sec) + 1, int(timeout_sec) + 1))
+            # Increase memory limit to 2GB to allow modern Python environments
+            resource.setrlimit(resource.RLIMIT_AS, (2048 * 1024 * 1024, 2048 * 1024 * 1024))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
+
     try:
         # start_new_session=True puts the child into a new process group
         # so a timeout kill takes down forks too.
+
+        # Only use preexec_fn if we are on a Unix system (where resource and preexec_fn are supported)
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "cwd": tmpdir,
+            "env": sandbox_env,
+            "start_new_session": True,
+        }
+        if os.name == 'posix' and has_resource:
+            popen_kwargs["preexec_fn"] = set_limits
+
         proc = subprocess.Popen(
             [python_executable, "-c", test_program],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=tmpdir,
-            env=sandbox_env,
-            start_new_session=True,
+            **popen_kwargs
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
