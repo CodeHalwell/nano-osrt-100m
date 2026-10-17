@@ -1024,6 +1024,14 @@ def mbpp_test_reward(
         # No HOME / TMP — let Python use defaults inside the tempdir cwd.
     }
 
+    import sys
+
+    def limit_resources():
+        import resource
+        # Limit to 4GB memory and 10 seconds CPU time to prevent DoS
+        resource.setrlimit(resource.RLIMIT_AS, (4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
     try:
@@ -1036,6 +1044,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=limit_resources if sys.platform != "win32" else None,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
