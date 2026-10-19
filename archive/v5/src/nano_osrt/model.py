@@ -1285,6 +1285,16 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         out = self.forward(context, use_cache=True)
         past_key_values = cast("PastKV | None", out.past_key_values)
 
+        # Pre-allocate stop tensor on device to avoid transferring list
+        # elements one-by-one or creating tensors inside the decode loop.
+        stop_tensor = None
+        if stop_token_ids:
+            valid_stops = [s for s in stop_token_ids if s is not None]
+            if valid_stops:
+                stop_tensor = torch.tensor(
+                    valid_stops, dtype=torch.long, device=input_ids.device
+                )
+
         # Per-row finished mask. A row is "finished" once it has ever
         # emitted eos_token_id on any decode step. Once finished, we
         # overwrite its next-token with EOS so downstream callers can
@@ -1402,10 +1412,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             nt = next_token.squeeze(-1)
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
+            if (eos_token_id is not None or stop_tensor is not None) and bool(finished.all()):
                 break
 
         return generated
