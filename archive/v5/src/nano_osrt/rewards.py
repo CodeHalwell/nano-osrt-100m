@@ -1010,7 +1010,21 @@ def mbpp_test_reward(
     import os
     import signal
     import subprocess
+    import sys
     import tempfile
+
+    if sys.platform != "win32":
+        import resource
+
+    def _set_limits():
+        # Prevent memory exhaustion (4GB limit) and unbounded disk usage (10MB limit)
+        try:
+            mem_limit = 4 * 1024 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+            file_limit = 10 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        except (ValueError, OSError):
+            pass
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1036,6 +1050,7 @@ def mbpp_test_reward(
             cwd=tmpdir,
             env=sandbox_env,
             start_new_session=True,
+            preexec_fn=_set_limits if sys.platform != "win32" else None,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
