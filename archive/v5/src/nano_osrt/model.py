@@ -1293,6 +1293,16 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=input_ids.device,
         )
+
+        active_stops = []
+        if eos_token_id is not None:
+            active_stops.append(eos_token_id)
+        if stop_token_ids:
+            active_stops.extend([s for s in stop_token_ids if s is not None])
+        stop_tensor = torch.tensor(
+            active_stops, dtype=torch.long, device=input_ids.device
+        ) if active_stops else None
+
         logits_tensor = cast(Tensor, out.logits)
         logits_last = (
             logits_tensor[:, -1, :self.config.real_vocab_size].float()
@@ -1400,12 +1410,10 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             # answer blocks after the first one or try to start a new
             # user turn — stopping on those keeps inference output clean.
             nt = next_token.squeeze(-1)
-            if eos_token_id is not None:
-                finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
-                break
+            if stop_tensor is not None:
+                # Vectorized stop check; avoids O(N) Python loop overhead per decode step
+                finished = finished | torch.isin(nt, stop_tensor)
+                if bool(finished.all()):
+                    break
 
         return generated
