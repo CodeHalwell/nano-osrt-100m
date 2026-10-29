@@ -1299,6 +1299,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         )
         generated = input_ids.clone()
 
+        if stop_token_ids:
+            stop_tensor = torch.tensor(stop_token_ids, dtype=torch.long, device=input_ids.device)
+
         for step_idx in range(max_new_tokens):
             if step_idx > 0:
                 # Decode: pass only the newest token + existing cache.
@@ -1403,8 +1406,10 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
             if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
+                # ⚡ Bolt: Vectorise stop token checks instead of looping
+                # over list elements to avoid device-to-host synchronization
+                # and Python loop overhead on every generated token.
+                finished = finished | torch.isin(nt, stop_tensor)
             if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
                 break
 
