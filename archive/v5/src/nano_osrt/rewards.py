@@ -1008,9 +1008,23 @@ def mbpp_test_reward(
 
     # ── sandboxed exec ──
     import os
+    import sys
     import signal
     import subprocess
     import tempfile
+
+    if sys.platform != "win32":
+        import resource
+
+    def limit_resources():
+        os.setsid()
+        if sys.platform != "win32":
+            # 4GB memory
+            resource.setrlimit(resource.RLIMIT_AS, (4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024))
+            # 60s CPU time
+            resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
+            # 10MB file size
+            resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1027,15 +1041,14 @@ def mbpp_test_reward(
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
     try:
-        # start_new_session=True puts the child into a new process group
-        # so a timeout kill takes down forks too.
         proc = subprocess.Popen(
             [python_executable, "-c", test_program],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=tmpdir,
             env=sandbox_env,
-            start_new_session=True,
+            preexec_fn=limit_resources if sys.platform != "win32" else None,
+            start_new_session=True if sys.platform == "win32" else False,
         )
         try:
             stdout_bytes, stderr_bytes = proc.communicate(
