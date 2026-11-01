@@ -1276,6 +1276,16 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
 
+        _all_stops = []
+        if eos_token_id is not None:
+            _all_stops.append(eos_token_id)
+        if stop_token_ids:
+            _all_stops.extend(stop_token_ids)
+        stop_tensor = (
+            torch.tensor(_all_stops, dtype=torch.long, device=input_ids.device)
+            if _all_stops else None
+        )
+
         # Prefill over the prompt, keeping KV cache for decode.
         # HF's CausalLMOutputWithPast types past_key_values as
         # `Cache | None`, but our forward returns a plain list of
@@ -1400,12 +1410,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             # answer blocks after the first one or try to start a new
             # user turn — stopping on those keeps inference output clean.
             nt = next_token.squeeze(-1)
-            if eos_token_id is not None:
-                finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
+            if stop_tensor is not None and bool(finished.all()):
                 break
 
         return generated
