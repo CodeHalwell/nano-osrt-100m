@@ -1010,7 +1010,12 @@ def mbpp_test_reward(
     import os
     import signal
     import subprocess
+    import sys
     import tempfile
+
+    # Conditional import to avoid issues on windows or preexec deadlock
+    if sys.platform != "win32":
+        import resource
 
     # Minimal env. Strip all secrets — explicit allowlist is safer than
     # a blocklist (we'd inevitably miss some var name in a blocklist).
@@ -1024,6 +1029,18 @@ def mbpp_test_reward(
         # No HOME / TMP — let Python use defaults inside the tempdir cwd.
     }
 
+    def set_rlimits():
+        if sys.platform != "win32":
+            # Cap CPU time to timeout + a small buffer so it's killed hard if it spins
+            cpu_limit = int(timeout_sec) + 2
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+            # Cap address space to ~4GB (generous for most tests, but stops OOM bombs)
+            mem_limit = int(4 * 1024 * 1024 * 1024)
+            resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+            # Cap file sizes to stop disk filling
+            fsize_limit = int(10 * 1024 * 1024)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
+
     tmpdir = tempfile.mkdtemp(prefix="mbpp_eval_")
     proc: subprocess.Popen | None = None
     try:
@@ -1035,6 +1052,7 @@ def mbpp_test_reward(
             stderr=subprocess.PIPE,
             cwd=tmpdir,
             env=sandbox_env,
+            preexec_fn=set_rlimits if sys.platform != "win32" else None,
             start_new_session=True,
         )
         try:
