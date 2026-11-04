@@ -86,7 +86,7 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     x_rot = torch.cat([-x2, x1], dim=-1)
-    return x * cos + x_rot * sin
+    return torch.addcmul(x * cos, x_rot, sin)
 
 
 # ── Expert FFN ──────────────────────────────────────────────────────────
@@ -1293,6 +1293,12 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=input_ids.device,
         )
+        if stop_token_ids:
+            stop_tensor = torch.tensor(
+                [sid for sid in stop_token_ids if sid is not None],
+                dtype=torch.long,
+                device=input_ids.device
+            )
         logits_tensor = cast(Tensor, out.logits)
         logits_last = (
             logits_tensor[:, -1, :self.config.real_vocab_size].float()
@@ -1403,8 +1409,7 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
             if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
+                finished = finished | torch.isin(nt, stop_tensor)
             if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
                 break
 
