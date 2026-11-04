@@ -17,3 +17,9 @@
 ## 2025-05-29 - Avoid one_hot for 2D aggregation
 **Learning:** Using `F.one_hot(...).sum()` to count occurrences where a 2D grouping (like per batch item) is needed creates a large 4D intermediate tensor.
 **Action:** Initialize a zero tensor (`torch.zeros(B, E)`) and use `scatter_add_` with a tensor of ones to accumulate counts. This provides a significant speedup and prevents out-of-memory bottlenecks.
+## 2024-11-04 - PyTorch Device Synchronization and Generation Loops
+**Learning:** Checking for stop tokens in a generation loop using explicit Python loops (e.g., `for sid in stop_token_ids`) or `.item()` operations causes severe CPU-GPU synchronization bottlenecks, drastically reducing decoding speed. Additionally, allocating the check tensor (`torch.tensor(stop_token_ids)`) inside the loop causes repeated host-to-device transfers.
+**Action:** Always vectorize termination checks in PyTorch generation loops using `torch.isin`. Crucially, allocate the comparison tensor (e.g., `stop_tensor`) exactly once outside the loop on the correct device.
+## 2024-11-04 - Fusing RoPE Operations
+**Learning:** In PyTorch, applying RoPE via `x * cos + x_rot * sin` allocates an intermediate tensor for the `x_rot * sin` multiplication before the addition.
+**Action:** Replace separate multiplication and addition steps with `torch.addcmul(x * cos, x_rot, sin)` to fuse the operations, reducing kernel launches and memory allocations for a measurable speedup.
