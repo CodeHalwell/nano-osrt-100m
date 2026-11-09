@@ -86,7 +86,7 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     x_rot = torch.cat([-x2, x1], dim=-1)
-    return x * cos + x_rot * sin
+    return torch.addcmul(x * cos, x_rot, sin)
 
 
 # ── Expert FFN ──────────────────────────────────────────────────────────
@@ -1293,6 +1293,15 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=input_ids.device,
         )
+        stop_tensor = None
+        if stop_token_ids or eos_token_id is not None:
+            stop_list = []
+            if stop_token_ids:
+                stop_list.extend(stop_token_ids)
+            if eos_token_id is not None:
+                stop_list.append(eos_token_id)
+            stop_tensor = torch.tensor(stop_list, dtype=torch.long, device=input_ids.device)
+
         logits_tensor = cast(Tensor, out.logits)
         logits_last = (
             logits_tensor[:, -1, :self.config.real_vocab_size].float()
@@ -1400,12 +1409,9 @@ class NanoOSRTForCausalLM(NanoOSRTPreTrainedModel):
             # answer blocks after the first one or try to start a new
             # user turn — stopping on those keeps inference output clean.
             nt = next_token.squeeze(-1)
-            if eos_token_id is not None:
-                finished = finished | (nt == eos_token_id)
-            if stop_token_ids:
-                for sid in stop_token_ids:
-                    finished = finished | (nt == sid)
-            if (eos_token_id is not None or stop_token_ids) and bool(finished.all()):
-                break
+            if stop_tensor is not None:
+                finished = finished | torch.isin(nt, stop_tensor)
+                if bool(finished.all()):
+                    break
 
         return generated
